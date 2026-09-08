@@ -33,8 +33,8 @@ or
 git clone https://github.com/xywjohn/A-TDOM --recursive
 ```
 
-After that, please manually decompress the diff-gaussian-rasterization.zip, 
-fused-ssim.zip and simple-knn.zip archive located under the `submodules` directory.
+The required CUDA dependencies are preserved as offline archives in
+`third_party/archives/` and as clean build sources in `third_party/src/`.
 
 # Windows Env Setting
 
@@ -53,9 +53,9 @@ pip install opencv-python
 pip install lpips
 pip install scikit-image
 
-pip install submodules/diff-gaussian-rasterization
-pip install submodules/simple-knn
-pip install submodules/fused-ssim
+pip install third_party/src/diff-gaussian-rasterization
+pip install third_party/src/simple-knn
+pip install third_party/src/fused-ssim
 ```
 
 Since **PyTorch3D** does not provide precompiled binaries for **Windows**, you need to manually download and build it from source.

@@ -13,6 +13,6 @@ dependencies:
   - torchvision=0.13.1
   - tqdm
   - pip:
-    - submodules/diff-gaussian-rasterization
-    - submodules/simple-knn
-    - submodules/fused-ssim
+    - third_party/src/diff-gaussian-rasterization
+    - third_party/src/simple-knn
+    - third_party/src/fused-ssim

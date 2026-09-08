@@ -15,7 +15,7 @@
 ## 仓库边界
 
 - 只修改 `code/Semantic-A-TDOM/Semantic-A-TDOM/`。
-- `code/Semantic-A-TDOM/A-TDOM/` 是原版对照基线，必须保持完全不变。
+- `code/Semantic-A-TDOM/ref/A-TDOM/` 是原版对照基线，必须保持完全不变。
 - `A-TDOM_Online` 只说明过去的课题工作，不用于本次目录设计或代码迁移。
 - 原始 A-TDOM 状态由 Git 历史和新仓库中的 `baseline-atdom-e50a5f7` tag 保留，新仓库内不建立第二份 `legacy/atdom` 源码副本。
 
@@ -211,8 +211,8 @@ from semantic_atdom.utils.loss_utils import l1_loss
 
 ### 原版保护
 
-- 记录并比较 `A-TDOM/` 迁移前后的 HEAD、tracked diff 和工作区状态。
-- 新仓库不从 `A-TDOM/` 再次复制文件。
+- 记录并比较 `ref/A-TDOM/` 迁移前后的 HEAD、tracked diff 和工作区状态。
+- 新仓库不从 `ref/A-TDOM/` 再次复制文件。
 
 ### 迁移完整性
 

@@ -224,8 +224,10 @@ from semantic_atdom.utils.loss_utils import l1_loss
 
 ```bash
 python -m compileall src tools
-git diff --check
+git diff --check -- . ':(exclude)third_party/src/**'
 ```
+
+`third_party/src/` 中的 vendored 源码保留上游格式，不为满足本仓库的空白规范而批量改写；其生成物、缓存和嵌套 Git 元数据由下方独立的第三方洁净性检查负责验证。
 
 搜索并消除项目内部的旧顶层 import：
 

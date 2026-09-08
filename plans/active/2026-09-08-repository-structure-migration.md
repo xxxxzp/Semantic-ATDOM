@@ -44,6 +44,8 @@
 - Consumes: existing dependency ZIP files and the original `environment.yml` local pip entries.
 - Produces: clean, offline-installable source directories at `third_party/src/{diff-gaussian-rasterization,fused-ssim,simple-knn}` and preserved archives at `third_party/archives/`.
 
+Vendored sources under `third_party/src/` retain their upstream formatting, including any existing whitespace. Task 1 therefore excludes that tree from Git whitespace checks instead of rewriting third-party code; the structural test and explicit artifact searches separately enforce third-party cleanliness.
+
 - [ ] **Step 1: Verify and tag the inherited baseline**
 
 Run:
@@ -216,10 +218,10 @@ Run:
 
 ```bash
 python -m unittest discover -s tests -p 'test_repository_layout.py' -v
-git diff --check
+git diff --check -- . ':(exclude)third_party/src/**'
 ```
 
-Expected: both dependency tests PASS and `git diff --check` produces no output.
+Expected: both dependency tests PASS and the scoped whitespace check produces no output.
 
 - [ ] **Step 10: Commit the third-party layout**
 
@@ -228,7 +230,7 @@ Run:
 ```bash
 git add .gitignore tests/test_repository_layout.py environment.yml README.md
 git add -A -- third_party submodules lpipsPyTorch
-git diff --cached --check
+git diff --cached --check -- . ':(exclude)third_party/src/**'
 git commit -m "build: organize offline dependencies"
 ```
 

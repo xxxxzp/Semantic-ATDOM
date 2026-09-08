@@ -9,8 +9,8 @@ build/
 dist/
 *.egg-info/
 
-outputs/
-runs/
-checkpoints/
-data/
-semantic_labels/
+/outputs/
+/runs/
+/checkpoints/
+/data/
+/semantic_labels/

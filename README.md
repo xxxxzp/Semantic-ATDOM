@@ -39,6 +39,28 @@ The required CUDA dependencies are preserved as offline archives in
 Both environment setup flows below install the project in editable mode. This
 step is required before running any command under `tools/`.
 
+## Command layout
+
+Project entry points live under `tools/`. The directory migration renamed the
+original scripts as follows:
+
+| Original name | Current path |
+|---|---|
+| `ContinuosProgressiveTrain4.py` | `tools/train_progressive.py` |
+| `WindowsTrain.py` | `tools/train_windowed.py` |
+| `Window-On-the-Fly-Train.py` | `tools/train_gui.py` |
+| `render.py` | `tools/render.py` |
+| `convert.py` | `tools/convert_colmap.py` |
+| `metrics.py` | `tools/evaluate_metrics.py` |
+| `DatasetPrepare.py` | `tools/legacy/prepare_dataset.py` |
+| `DownSample.py` | `tools/legacy/downsample_images.py` |
+| `GetDemo.py` | `tools/legacy/create_demo_video.py` |
+| `Test.py` | `tools/legacy/export_colmap_stages.py` |
+| `full_eval.py` | `tools/legacy/full_eval.py` |
+
+The scripts under `tools/legacy/` are retained for traceability and are not
+supported command interfaces.
+
 # Windows Env Setting
 
 If you are configuring the Python environment for **A-TDOM** on **Windows**,
@@ -142,7 +164,7 @@ If you would like to output the results of **3DGS training** to `Model_Path_Dir`
 please run the following command to perform 3DGS training:
 
 ```shell
-python Window-On-the-Fly-Train.py 
+python tools/train_gui.py
   --Source_Path_Dir .../your_path 
   --Model_Path_Dir .../your_path 
   --Image_Folder_Path .../your_path 
@@ -157,7 +179,7 @@ If you would like to generate **TDOM** simultaneously during training,
 please run the following command:
 
 ```shell
-python Window-On-the-Fly-Train.py 
+python tools/train_gui.py
   --Source_Path_Dir .../your_path 
   --Model_Path_Dir .../your_path 
   --Image_Folder_Path .../your_path 
@@ -173,7 +195,7 @@ python Window-On-the-Fly-Train.py
 ```
 
 <details>
-<summary><span style="font-weight: bold;">Necessary command Line Arguments for ContinuosProgressiveTrain4.py</span></summary>
+<summary><span style="font-weight: bold;">Necessary command Line Arguments for tools/train_gui.py</span></summary>
 
   #### --Source_Path_Dir {str}
   Path to the source directory containing all camera pose information and sparse point cloud.
@@ -221,7 +243,7 @@ We use the **phantom3-ieu** dataset
 as an example. The following command demonstrates how to perform 3DGS training with simultaneous TDOM generation:
 
 ```shell
-python Window-On-the-Fly-Train.py 
+python tools/train_gui.py
   --Source_Path_Dir .../phantom3-ieu 
   --Model_Path_Dir .../phantom3-ieu 
   --Image_Folder_Path .../images 
@@ -300,7 +322,7 @@ If you would like to output the results of **3DGS training** to `Model_Path_Dir`
 please run the following command to perform 3DGS training:
 
 ```shell
-python ContinuosProgressiveTrain4.py 
+python tools/train_progressive.py
   --Source_Path_Dir .../your_path 
   --Model_Path_Dir .../your_path 
   --Image_Folder_Path .../your_path 
@@ -315,7 +337,7 @@ If you would like to generate **TDOM** simultaneously during training,
 please run the following command:
 
 ```shell
-python ContinuosProgressiveTrain4.py 
+python tools/train_progressive.py
   --Source_Path_Dir .../your_path 
   --Model_Path_Dir .../your_path 
   --Image_Folder_Path .../your_path 
@@ -330,7 +352,7 @@ python ContinuosProgressiveTrain4.py
 ```
 
 <details>
-<summary><span style="font-weight: bold;">Necessary command Line Arguments for ContinuosProgressiveTrain4.py</span></summary>
+<summary><span style="font-weight: bold;">Necessary command Line Arguments for tools/train_progressive.py</span></summary>
 
   #### --Source_Path_Dir {str}
   Path to the source directory containing all camera pose information and sparse point cloud.
@@ -376,7 +398,7 @@ We use the **phantom3-ieu** dataset
 as an example. The following command demonstrates how to perform 3DGS training with simultaneous TDOM generation:
 
 ```shell
-python ContinuosProgressiveTrain4.py 
+python tools/train_progressive.py
   --Source_Path_Dir .../phantom3-ieu 
   --Model_Path_Dir .../phantom3-ieu 
   --Image_Folder_Path .../images 

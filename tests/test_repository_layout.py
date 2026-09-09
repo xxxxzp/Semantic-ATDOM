@@ -70,6 +70,30 @@ class RepositoryLayoutTests(unittest.TestCase):
         for name in ("arguments", "scene", "gaussian_renderer", "utils", "lpipsPyTorch"):
             self.assertFalse((ROOT / name).exists())
 
+    def test_supported_tools_have_explicit_names(self):
+        supported = {
+            "train_progressive.py",
+            "train_windowed.py",
+            "train_gui.py",
+            "render.py",
+            "convert_colmap.py",
+            "evaluate_metrics.py",
+        }
+        self.assertEqual(supported, {path.name for path in (ROOT / "tools").glob("*.py")})
+
+    def test_historical_helpers_are_isolated(self):
+        historical = {
+            "prepare_dataset.py",
+            "downsample_images.py",
+            "create_demo_video.py",
+            "export_colmap_stages.py",
+            "full_eval.py",
+        }
+        self.assertEqual(historical, {path.name for path in (ROOT / "tools" / "legacy").glob("*.py")})
+
+    def test_repository_root_has_no_python_entry_scripts(self):
+        self.assertEqual([], list(ROOT.glob("*.py")))
+
 
 if __name__ == "__main__":
     unittest.main()

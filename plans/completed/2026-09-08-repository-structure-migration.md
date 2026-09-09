@@ -1,5 +1,7 @@
 # Repository Structure Migration Implementation Plan
 
+**Status:** Completed on 2026-09-09 at commit `cfd0970c804f2bab63adb2caff0d889c4064977f`.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Reorganize the inherited A-TDOM files into a clean `src/semantic_atdom` repository layout without changing training, rendering, dataset, or checkpoint behavior.
@@ -46,7 +48,7 @@
 
 Vendored sources under `third_party/src/` retain their upstream formatting, including any existing whitespace. Task 1 therefore excludes that tree from Git whitespace checks instead of rewriting third-party code; the structural test and explicit artifact searches separately enforce third-party cleanliness.
 
-- [ ] **Step 1: Verify and tag the inherited baseline**
+- [x] **Step 1: Verify and tag the inherited baseline**
 
 Run:
 
@@ -66,7 +68,7 @@ Expected:
 - Status shows only the three pre-existing untracked `__pycache__/` directories under `arguments/`, `scene/`, and `utils/`.
 - The tag resolves to the inherited A-TDOM commit `e50a5f7` in the Semantic-A-TDOM repository.
 
-- [ ] **Step 2: Add a failing structural test for third-party dependencies**
+- [x] **Step 2: Add a failing structural test for third-party dependencies**
 
 Create `tests/test_repository_layout.py` with:
 
@@ -110,7 +112,7 @@ if __name__ == "__main__":
     unittest.main()
 ```
 
-- [ ] **Step 3: Run the structural test and verify it fails before migration**
+- [x] **Step 3: Run the structural test and verify it fails before migration**
 
 Run:
 
@@ -120,7 +122,7 @@ python -m unittest discover -s tests -p 'test_repository_layout.py' -v
 
 Expected: FAIL because `third_party/archives/` and the clean extracted dependency directories do not exist yet.
 
-- [ ] **Step 4: Add repository-wide ignore rules**
+- [x] **Step 4: Add repository-wide ignore rules**
 
 Create `.gitignore` with:
 
@@ -143,7 +145,7 @@ data/
 semantic_labels/
 ```
 
-- [ ] **Step 5: Move the offline archives and vendored LPIPS source**
+- [x] **Step 5: Move the offline archives and vendored LPIPS source**
 
 Run these explicit relocations:
 
@@ -157,7 +159,7 @@ git mv lpipsPyTorch third_party/src/lpipsPyTorch
 
 Do not move or delete `submodules/1` in this task; all one-byte placeholders are removed together in Task 4.
 
-- [ ] **Step 6: Extract each archive and inspect removal targets**
+- [x] **Step 6: Extract each archive and inspect removal targets**
 
 Run:
 
@@ -174,7 +176,7 @@ find third_party/src/diff-gaussian-rasterization third_party/src/fused-ssim thir
 
 Expected: the commands print the stale build, package metadata, nested Git, compiled-library, and cache paths that came from the archives. Confirm every printed path is inside one of the three explicit dependency roots before continuing.
 
-- [ ] **Step 7: Remove only the inspected generated artifacts**
+- [x] **Step 7: Remove only the inspected generated artifacts**
 
 Run against the three explicit dependency roots:
 
@@ -187,7 +189,7 @@ find third_party/src/diff-gaussian-rasterization third_party/src/fused-ssim thir
 
 The three ZIP files are not removal targets and must remain untouched in `third_party/archives/`.
 
-- [ ] **Step 8: Update local dependency paths**
+- [x] **Step 8: Update local dependency paths**
 
 In `environment.yml`, replace exactly:
 
@@ -212,7 +214,7 @@ The required CUDA dependencies are preserved as offline archives in
 `third_party/archives/` and as clean build sources in `third_party/src/`.
 ```
 
-- [ ] **Step 9: Run the third-party structural test**
+- [x] **Step 9: Run the third-party structural test**
 
 Run:
 
@@ -223,7 +225,7 @@ git diff --check -- . ':(exclude)third_party/src/**'
 
 Expected: both dependency tests PASS and the scoped whitespace check produces no output.
 
-- [ ] **Step 10: Commit the third-party layout**
+- [x] **Step 10: Commit the third-party layout**
 
 Run:
 
@@ -255,7 +257,7 @@ Expected: the commit preserves all three ZIPs, adds clean source trees, moves `l
 - Consumes: the original `arguments`, `scene`, `gaussian_renderer`, and `utils` packages without changing their public classes or functions.
 - Produces: importable modules named `semantic_atdom.arguments`, `semantic_atdom.scene`, `semantic_atdom.gaussian_renderer`, and `semantic_atdom.utils`; preserves the third-party import name `lpipsPyTorch`.
 
-- [ ] **Step 1: Extend the structural test with the required package layout**
+- [x] **Step 1: Extend the structural test with the required package layout**
 
 Add these methods to `RepositoryLayoutTests` in `tests/test_repository_layout.py`:
 
@@ -271,7 +273,7 @@ Add these methods to `RepositoryLayoutTests` in `tests/test_repository_layout.py
             self.assertFalse((ROOT / name).exists())
 ```
 
-- [ ] **Step 2: Run the new tests and verify they fail before migration**
+- [x] **Step 2: Run the new tests and verify they fail before migration**
 
 Run:
 
@@ -281,7 +283,7 @@ python -m unittest discover -s tests -p 'test_repository_layout.py' -v
 
 Expected: the two new tests FAIL because the first-party packages are still at repository root and `src/semantic_atdom` does not exist.
 
-- [ ] **Step 3: Create the minimal project package metadata**
+- [x] **Step 3: Create the minimal project package metadata**
 
 Create `pyproject.toml` with:
 
@@ -316,7 +318,7 @@ Create `src/semantic_atdom/__init__.py` with:
 """Semantic-A-TDOM project package."""
 ```
 
-- [ ] **Step 4: Move the four first-party packages without splitting files**
+- [x] **Step 4: Move the four first-party packages without splitting files**
 
 Run:
 
@@ -330,7 +332,7 @@ git mv utils src/semantic_atdom/utils
 
 Do not rename internal files or classes.
 
-- [ ] **Step 5: Apply the exact namespace-only import conversion**
+- [x] **Step 5: Apply the exact namespace-only import conversion**
 
 Use `apply_patch` to apply these replacements everywhere they occur in the moved packages and the five listed root scripts:
 
@@ -371,7 +373,7 @@ Keep this third-party import unchanged:
 from lpipsPyTorch import lpips
 ```
 
-- [ ] **Step 6: Verify no old first-party imports remain**
+- [x] **Step 6: Verify no old first-party imports remain**
 
 Run:
 
@@ -381,7 +383,7 @@ rg -n '^(from|import) (arguments|scene|gaussian_renderer|utils)(\.|\s|$)' src *.
 
 Expected: no matches. An `rg` exit code of 1 is the expected no-match result.
 
-- [ ] **Step 7: Install the editable package and run package checks**
+- [x] **Step 7: Install the editable package and run package checks**
 
 Run:
 
@@ -395,7 +397,7 @@ git diff --check
 
 Expected: installation succeeds; compilation is silent; all current tests PASS; all three package specs are found; whitespace check is silent.
 
-- [ ] **Step 8: Commit the project package migration**
+- [x] **Step 8: Commit the project package migration**
 
 Run:
 
@@ -430,7 +432,7 @@ Expected: Git reports package-directory renames plus import-only changes; no fun
 - Consumes: the package imports created in Task 2.
 - Produces: the supported entry paths `tools/train_progressive.py`, `tools/train_windowed.py`, `tools/train_gui.py`, `tools/render.py`, `tools/convert_colmap.py`, and `tools/evaluate_metrics.py`; historical helpers remain available only under `tools/legacy/`.
 
-- [ ] **Step 1: Extend the structural test with exact tool expectations**
+- [x] **Step 1: Extend the structural test with exact tool expectations**
 
 Add these methods to `RepositoryLayoutTests`:
 
@@ -460,7 +462,7 @@ Add these methods to `RepositoryLayoutTests`:
         self.assertEqual([], list(ROOT.glob("*.py")))
 ```
 
-- [ ] **Step 2: Run the new tool tests and verify they fail before migration**
+- [x] **Step 2: Run the new tool tests and verify they fail before migration**
 
 Run:
 
@@ -470,7 +472,7 @@ python -m unittest discover -s tests -p 'test_repository_layout.py' -v
 
 Expected: the three new tests FAIL because the executable scripts are still at repository root.
 
-- [ ] **Step 3: Move each executable to its approved location**
+- [x] **Step 3: Move each executable to its approved location**
 
 Run:
 
@@ -489,7 +491,7 @@ git mv Test.py tools/legacy/export_colmap_stages.py
 git mv full_eval.py tools/legacy/full_eval.py
 ```
 
-- [ ] **Step 4: Update only path references made stale by the moves**
+- [x] **Step 4: Update only path references made stale by the moves**
 
 In `tools/legacy/full_eval.py`, replace:
 
@@ -509,7 +511,7 @@ os.system("python tools/evaluate_metrics.py -m " + scenes_string)
 
 Leave its existing `python train.py` calls unchanged and document the file as historical; creating or guessing a replacement training command would be a behavior fix outside this migration.
 
-- [ ] **Step 5: Update README command names and add the migration map**
+- [x] **Step 5: Update README command names and add the migration map**
 
 Replace every README occurrence as follows:
 
@@ -541,7 +543,7 @@ The scripts under `tools/legacy/` are retained for traceability and are not
 supported command interfaces.
 ```
 
-- [ ] **Step 6: Verify the tool layout and syntax**
+- [x] **Step 6: Verify the tool layout and syntax**
 
 Run:
 
@@ -561,7 +563,7 @@ Expected:
 - The old-name search finds only the intentional migration table in `README.md`; it must not find executable files or live command examples.
 - Whitespace check is silent.
 
-- [ ] **Step 7: Commit the executable layout**
+- [x] **Step 7: Commit the executable layout**
 
 Run:
 
@@ -593,7 +595,7 @@ Expected: all eleven root scripts are represented by one renamed file each, and 
 - Consumes: the approved semantic design documents already present in the worktree and the existing README image assets.
 - Produces: canonical design and decision documentation under `docs/`, documentation-only images under `assets/docs/`, and a placeholder-free repository.
 
-- [ ] **Step 1: Extend the structural test with documentation, asset, and placeholder rules**
+- [x] **Step 1: Extend the structural test with documentation, asset, and placeholder rules**
 
 Add these methods to `RepositoryLayoutTests`:
 
@@ -619,7 +621,7 @@ Add these methods to `RepositoryLayoutTests`:
         self.assertEqual([], placeholders)
 ```
 
-- [ ] **Step 2: Run the new tests and verify they fail before migration**
+- [x] **Step 2: Run the new tests and verify they fail before migration**
 
 Run:
 
@@ -629,7 +631,7 @@ python -m unittest discover -s tests -p 'test_repository_layout.py' -v
 
 Expected: the three new tests FAIL because the documents, images, and placeholder files still use their old locations.
 
-- [ ] **Step 3: Move the semantic design material into its canonical documentation directories**
+- [x] **Step 3: Move the semantic design material into its canonical documentation directories**
 
 Run:
 
@@ -657,7 +659,7 @@ to:
 
 Do not alter the confirmed semantic definitions or decisions.
 
-- [ ] **Step 4: Move every real documentation image without deleting content**
+- [x] **Step 4: Move every real documentation image without deleting content**
 
 Run:
 
@@ -682,7 +684,7 @@ Update the README image reference exactly:
 ![image](0.png) → ![image](assets/docs/overview.png)
 ```
 
-- [ ] **Step 5: Remove the known one-byte placeholders from their post-migration paths**
+- [x] **Step 5: Remove the known one-byte placeholders from their post-migration paths**
 
 Run only these explicit removals:
 
@@ -702,7 +704,7 @@ git rm third_party/src/lpipsPyTorch/modules/1
 
 After these files are removed, Git will not retain their now-empty parent directories. Do not add `.gitkeep` replacements.
 
-- [ ] **Step 6: Run the complete required verification suite**
+- [x] **Step 6: Run the complete required verification suite**
 
 Run:
 
@@ -727,7 +729,7 @@ Expected:
 - Both `find` commands produce no output.
 - `git diff --check` produces no output.
 
-- [ ] **Step 7: Verify forbidden legacy imports and generated third-party artifacts are absent**
+- [x] **Step 7: Verify forbidden legacy imports and generated third-party artifacts are absent**
 
 Run:
 
@@ -741,7 +743,7 @@ find third_party/src/diff-gaussian-rasterization third_party/src/fused-ssim thir
 
 Expected: all three searches produce no matches. `rg` exit code 1 is the expected no-match result.
 
-- [ ] **Step 8: Attempt environment-dependent entry-point smoke tests**
+- [x] **Step 8: Attempt environment-dependent entry-point smoke tests**
 
 Run each command separately so one missing optional dependency does not hide the remaining results:
 
@@ -755,7 +757,7 @@ python tools/train_gui.py --help
 
 Expected when the existing CUDA/PyTorch/PyQt dependencies are installed: each command prints help and exits with code 0. If a command cannot import an existing external dependency, record that exact command and exception in the final handoff as **not verified**; do not modify training or rendering logic to solve environment setup during this migration.
 
-- [ ] **Step 9: Recheck the read-only baseline repository**
+- [x] **Step 9: Recheck the read-only baseline repository**
 
 Run:
 
@@ -772,7 +774,7 @@ Expected:
 - Both tracked-diff commands return exit code 0.
 - The same three pre-existing untracked `__pycache__/` entries remain; no additional path appears.
 
-- [ ] **Step 10: Review the staged migration and commit it**
+- [x] **Step 10: Review the staged migration and commit it**
 
 Run:
 

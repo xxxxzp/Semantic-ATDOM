@@ -10,16 +10,16 @@
 #
 
 import torch
-from scene import Scene
+from semantic_atdom.scene import Scene
 import os
 from tqdm import tqdm
 from os import makedirs
-from gaussian_renderer import render
+from semantic_atdom.gaussian_renderer import render
 import torchvision
-from utils.general_utils import safe_state
+from semantic_atdom.utils.general_utils import safe_state
 from argparse import ArgumentParser
-from arguments import ModelParams, PipelineParams, get_combined_args
-from gaussian_renderer import GaussianModel
+from semantic_atdom.arguments import ModelParams, PipelineParams, get_combined_args
+from semantic_atdom.gaussian_renderer import GaussianModel
 
 def render_set(model_path, name, iteration, views, gaussians, pipeline, background):
     render_path = os.path.join(model_path, name, "ours_{}".format(iteration), "renders")

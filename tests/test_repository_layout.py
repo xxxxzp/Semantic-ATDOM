@@ -42,7 +42,12 @@ class RepositoryLayoutTests(unittest.TestCase):
     def test_dependency_sources_are_clean(self):
         source_dir = ROOT / "third_party" / "src"
         forbidden_directory_names = {".git", "build", "__pycache__"}
-        forbidden_file_names = {".ninja_deps", ".ninja_log"}
+        forbidden_file_names = {
+            ".git",
+            ".gitmodules",
+            ".ninja_deps",
+            ".ninja_log",
+        }
 
         for name in DEPENDENCIES:
             dependency = source_dir / name
@@ -54,6 +59,16 @@ class RepositoryLayoutTests(unittest.TestCase):
                 elif path.is_file():
                     self.assertNotIn(path.name, forbidden_file_names)
                     self.assertNotIn(path.suffix, {".o", ".pyc", ".so"})
+
+    def test_first_party_packages_live_under_semantic_atdom(self):
+        package_root = ROOT / "src" / "semantic_atdom"
+        self.assertTrue((package_root / "__init__.py").is_file())
+        for name in ("arguments", "scene", "gaussian_renderer", "utils"):
+            self.assertTrue((package_root / name / "__init__.py").is_file())
+
+    def test_old_top_level_package_directories_are_absent(self):
+        for name in ("arguments", "scene", "gaussian_renderer", "utils", "lpipsPyTorch"):
+            self.assertFalse((ROOT / name).exists())
 
 
 if __name__ == "__main__":

@@ -2,26 +2,26 @@ import os
 import random
 import torch
 from random import randint
-from utils.loss_utils import l1_loss
-from gaussian_renderer import render
+from semantic_atdom.utils.loss_utils import l1_loss
+from semantic_atdom.gaussian_renderer import render
 import sys
-from scene import Scene, GaussianModel
+from semantic_atdom.scene import Scene, GaussianModel
 from fused_ssim import fused_ssim
-from utils.general_utils import safe_state
+from semantic_atdom.utils.general_utils import safe_state
 from tqdm import tqdm
-from utils.image_utils import psnr
+from semantic_atdom.utils.image_utils import psnr
 from argparse import ArgumentParser, Namespace
-from arguments import ModelParams, PipelineParams, OptimizationParams
+from semantic_atdom.arguments import ModelParams, PipelineParams, OptimizationParams
 from PIL import Image
 import torchvision.transforms as transforms
 from scipy.spatial import cKDTree
 import math
 import time
-from scene.cameras import Camera, DummyCamera, DummyPipeline
-from utils.camera_utils import camera_to_JSON
+from semantic_atdom.scene.cameras import Camera, DummyCamera, DummyPipeline
+from semantic_atdom.utils.camera_utils import camera_to_JSON
 import json
-from scene.dataset_readers import sceneLoadTypeCallbacks
-from utils.general_utils import PILtoTorch
+from semantic_atdom.scene.dataset_readers import sceneLoadTypeCallbacks
+from semantic_atdom.utils.general_utils import PILtoTorch
 import numpy as np
 import shutil
 import glob
@@ -29,7 +29,7 @@ import cv2
 import gc
 import statistics
 import copy
-from utils.graphics_utils import getWorld2View2, getProjectionMatrix
+from semantic_atdom.utils.graphics_utils import getWorld2View2, getProjectionMatrix
 import torchvision
 import torch.multiprocessing as mp
 from skimage.metrics import structural_similarity as ssim

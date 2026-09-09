@@ -12,13 +12,13 @@
 import os
 import random
 import json
-from utils.system_utils import searchForMaxIteration
-from scene.dataset_readers import sceneLoadTypeCallbacks
-from scene.gaussian_model import GaussianModel
-from utils.general_utils import PILtoTorch
-from scene.cameras import Camera
-from arguments import ModelParams
-from utils.camera_utils import cameraList_from_camInfos, camera_to_JSON
+from semantic_atdom.utils.system_utils import searchForMaxIteration
+from semantic_atdom.scene.dataset_readers import sceneLoadTypeCallbacks
+from semantic_atdom.scene.gaussian_model import GaussianModel
+from semantic_atdom.utils.general_utils import PILtoTorch
+from semantic_atdom.scene.cameras import Camera
+from semantic_atdom.arguments import ModelParams
+from semantic_atdom.utils.camera_utils import cameraList_from_camInfos, camera_to_JSON
 import torch
 from PIL import Image
 import numpy as np

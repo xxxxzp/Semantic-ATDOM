@@ -36,6 +36,9 @@ git clone https://github.com/xywjohn/A-TDOM --recursive
 The required CUDA dependencies are preserved as offline archives in
 `third_party/archives/` and as clean build sources in `third_party/src/`.
 
+Both environment setup flows below install the project in editable mode. This
+step is required before running any command under `tools/`.
+
 # Windows Env Setting
 
 If you are configuring the Python environment for **A-TDOM** on **Windows**,
@@ -56,6 +59,7 @@ pip install scikit-image
 pip install third_party/src/diff-gaussian-rasterization
 pip install third_party/src/simple-knn
 pip install third_party/src/fused-ssim
+python -m pip install --no-deps -e .
 ```
 
 Since **PyTorch3D** does not provide precompiled binaries for **Windows**, you need to manually download and build it from source.
@@ -255,6 +259,7 @@ pip install pytorch3d
 pip install opencv-python
 pip install lpips
 pip install scikit-image
+python -m pip install --no-deps -e .
 ```
 
 # Linux Run

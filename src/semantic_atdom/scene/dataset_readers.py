@@ -15,15 +15,15 @@ import os
 import sys
 from PIL import Image
 from typing import NamedTuple
-from scene.colmap_loader import read_extrinsics_text, read_intrinsics_text, qvec2rotmat, \
+from semantic_atdom.scene.colmap_loader import read_extrinsics_text, read_intrinsics_text, qvec2rotmat, \
     read_extrinsics_binary, read_intrinsics_binary, read_points3D_binary, read_points3D_text, read_points3D_ID_binary
-from utils.graphics_utils import getWorld2View2, focal2fov, fov2focal
+from semantic_atdom.utils.graphics_utils import getWorld2View2, focal2fov, fov2focal
 import numpy as np
 import json
 from pathlib import Path
 from plyfile import PlyData, PlyElement
-from utils.sh_utils import SH2RGB
-from scene.gaussian_model import BasicPointCloud
+from semantic_atdom.utils.sh_utils import SH2RGB
+from semantic_atdom.scene.gaussian_model import BasicPointCloud
 import time
 from scipy.spatial import Delaunay
 import cv2

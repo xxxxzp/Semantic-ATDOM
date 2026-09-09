@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=61,<68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "semantic-atdom"
+version = "0.1.0"
+description = "Semantic extension of A-TDOM for progressive orthophoto generation"
+readme = "README.md"
+requires-python = ">=3.7"
+
+[tool.setuptools]
+packages = [
+    "semantic_atdom",
+    "semantic_atdom.arguments",
+    "semantic_atdom.scene",
+    "semantic_atdom.gaussian_renderer",
+    "semantic_atdom.utils",
+    "lpipsPyTorch",
+    "lpipsPyTorch.modules",
+]
+package-dir = {semantic_atdom = "src/semantic_atdom", lpipsPyTorch = "third_party/src/lpipsPyTorch"}

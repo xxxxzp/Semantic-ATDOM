@@ -94,6 +94,73 @@ class RepositoryLayoutTests(unittest.TestCase):
     def test_repository_root_has_no_python_entry_scripts(self):
         self.assertEqual([], list(ROOT.glob("*.py")))
 
+    def test_semantic_documents_have_canonical_locations(self):
+        self.assertTrue((ROOT / "docs" / "design" / "semantic-tdom-v1.md").is_file())
+        self.assertTrue(
+            (ROOT / "docs" / "design" / "semantic-tdom-glossary.md").is_file()
+        )
+        decisions = ROOT / "docs" / "decisions"
+        self.assertEqual(
+            {
+                "0001-one-way-semantic-dependency.md",
+                "0002-dirichlet-semantic-field.md",
+                "0003-stage-synchronous-semantics.md",
+                "0004-clean-atdom-lineage.md",
+            },
+            {path.name for path in decisions.glob("*.md")},
+        )
+        self.assertFalse((ROOT / "tasks").exists())
+
+    def test_documentation_assets_are_grouped(self):
+        asset_dir = ROOT / "assets" / "docs"
+        self.assertEqual(
+            {
+                "overview.png",
+                "better.png",
+                "select.png",
+                "teaser.png",
+                "times_compare.png",
+                "worse.png",
+            },
+            {path.name for path in asset_dir.glob("*") if path.is_file()},
+        )
+        self.assertEqual(
+            {
+                "logo_graphdeco.png",
+                "logo_inria.png",
+                "logo_mpi.png",
+                "logo_mpi.svg",
+                "logo_uca.png",
+            },
+            {
+                path.name
+                for path in (asset_dir / "logos").glob("*")
+                if path.is_file()
+            },
+        )
+        self.assertFalse((ROOT / "0.png").exists())
+        for old_path in (
+            "assets/better.png",
+            "assets/select.png",
+            "assets/teaser.png",
+            "assets/times_compare.png",
+            "assets/worse.png",
+            "assets/logo_graphdeco.png",
+            "assets/logo_inria.png",
+            "assets/logo_mpi.png",
+            "assets/logo_mpi.svg",
+            "assets/logo_uca.png",
+        ):
+            self.assertFalse((ROOT / old_path).exists())
+
+    def test_one_byte_placeholder_files_are_absent(self):
+        placeholders = [
+            path.relative_to(ROOT)
+            for path in ROOT.rglob("1")
+            if path.is_file() and path.stat().st_size == 1 and ".git" not in path.parts
+        ]
+        self.assertEqual([], placeholders)
+
 
 if __name__ == "__main__":
     unittest.main()

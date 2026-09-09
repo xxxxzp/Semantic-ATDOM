@@ -4,7 +4,7 @@ Yiwei Xu, Xiang Wang, Yifei Yu, Wentian Gan, Luca Morelli, Giulio Perda, Xin Wan
 
 [![arxiv](https://img.shields.io/badge/arxiv-2406.15643-red)](https://arxiv.org/abs/2509.12759)
 
-![image](0.png)
+![image](assets/docs/overview.png)
 
 # Important Notice (Please Read before Start!!!)
 

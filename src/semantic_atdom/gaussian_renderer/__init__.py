@@ -33,6 +33,9 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     tanfovx = math.tan(viewpoint_camera.FoVx * 0.5)
     tanfovy = math.tan(viewpoint_camera.FoVy * 0.5)
 
+    if Render_Mask is None:
+        Render_Mask = torch.ones(1, dtype=torch.bool, device=bg_color.device)
+
     if len(Render_Mask.shape) == 1:
         Use_Render_Mask = False
         # Render_Mask = torch.ones(1, int(viewpoint_camera.image_height), int(viewpoint_camera.image_width), dtype=torch.bool).cuda()

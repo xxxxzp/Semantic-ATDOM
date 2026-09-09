@@ -53,6 +53,7 @@ class ModelParams(ParamGroup):
         self.model_path_second = ""  # 训练得到的模型存储的位置
         self.depth_map_path = ""
         self.normal_map_path = ""
+        self.Image_Folder_Path = ""
         self._images = "images"
         self._resolution = -1
         self.depth_scale = 1.0
@@ -144,7 +145,6 @@ class OptimizationParams(ParamGroup):
         self.GlobalOptimizationIteration = 100
         self.Source_Path_Dir = ""
         self.Model_Path_Dir = ""
-        self.Image_Folder_Path = ""
         self.IterationFirstScene = 2000
         self.IterationPerMergeScene = 100
         self.FinalOptimizationIterations = 4000

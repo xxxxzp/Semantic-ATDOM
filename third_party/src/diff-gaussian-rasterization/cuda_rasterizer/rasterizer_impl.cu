@@ -128,7 +128,9 @@ __global__ void duplicateWithKeys(
 	uint32_t* gaussian_values_unsorted,
 	int* radii,
 	dim3 grid,
-	int2* rects)
+	int2* rects,
+	const uint32_t tile_y_min,
+	const uint32_t tile_y_max)
 {
 	auto idx = cg::this_grid().thread_rank();
 	if (idx >= P)
@@ -146,6 +148,8 @@ __global__ void duplicateWithKeys(
 			getRect(points_xy[idx], radii[idx], rect_min, rect_max, grid);
 		else
 			getRect(points_xy[idx], rects[idx], rect_min, rect_max, grid);
+		rect_min.y = max(rect_min.y, tile_y_min);
+		rect_max.y = min(rect_max.y, tile_y_max);
 
 		const float2 xy = points_xy[idx];
 		const float4 co = conic_opacity[idx];
@@ -188,6 +192,35 @@ __global__ void duplicateWithKeys(
 			gaussian_keys_unsorted[off] = key;
 		}
 	}
+}
+
+// Restrict the prefix-scan counts to one horizontal output stripe. Projection
+// remains global, while the expensive Gaussian/tile list contains only tiles
+// that the stripe can consume.
+__global__ void restrictTileCountsToRows(
+	int P,
+	const float2* points_xy,
+	const int* radii,
+	dim3 grid,
+	const uint32_t tile_y_min,
+	const uint32_t tile_y_max,
+	uint32_t* tiles_touched)
+{
+	auto idx = cg::this_grid().thread_rank();
+	if (idx >= P)
+		return;
+	if (radii[idx] <= 0)
+	{
+		tiles_touched[idx] = 0;
+		return;
+	}
+	uint2 rect_min, rect_max;
+	getRect(points_xy[idx], radii[idx], rect_min, rect_max, grid);
+	rect_min.y = max(rect_min.y, tile_y_min);
+	rect_max.y = min(rect_max.y, tile_y_max);
+	tiles_touched[idx] = rect_max.y > rect_min.y
+		? (rect_max.x - rect_min.x) * (rect_max.y - rect_min.y)
+		: 0;
 }
 
 // Check keys to see if it is at the start/end of one tile's range in 
@@ -502,7 +535,9 @@ std::tuple<int,int> CudaRasterizer::Rasterizer::forward(
 		binningState.point_list_unsorted,
 		radii,
 		tile_grid,
-		nullptr)
+		nullptr,
+		0,
+		tile_grid.y)
 	CHECK_CUDA(, debug)
 
 	int bit = getHigherMsb(tile_grid.x * tile_grid.y);
@@ -678,7 +713,9 @@ int CudaRasterizer::Rasterizer::semanticObservation(
 		binningState.point_list_unsorted,
 		radii,
 		tile_grid,
-		nullptr);
+		nullptr,
+		0,
+		tile_grid.y);
 	CHECK_CUDA(, debug)
 
 	const int bit = getHigherMsb(tile_grid.x * tile_grid.y);
@@ -734,7 +771,7 @@ int CudaRasterizer::Rasterizer::semanticTdom(
 	const int width,
 	const int height,
 	const float* means3D,
-	const float* dummy_colors,
+	const float* feature_sentinel,
 	const float* opacities,
 	const float* scales,
 	const float scale_modifier,
@@ -788,7 +825,7 @@ int CudaRasterizer::Rasterizer::semanticTdom(
 		nullptr,
 		nullptr,
 		cov3D_precomp,
-		dummy_colors,
+		feature_sentinel,
 		viewmatrix,
 		projmatrix,
 		(glm::vec3*)cam_pos,
@@ -810,6 +847,19 @@ int CudaRasterizer::Rasterizer::semanticTdom(
 		false,
 		nullptr,
 		false), debug)
+
+	const uint32_t tile_y_min = output_y_start / BLOCK_Y;
+	const uint32_t tile_y_max =
+		(output_y_start + output_height + BLOCK_Y - 1) / BLOCK_Y;
+	restrictTileCountsToRows<<<(P + 255) / 256, 256>>>(
+		P,
+		geomState.means2D,
+		radii,
+		tile_grid,
+		tile_y_min,
+		tile_y_max,
+		geomState.tiles_touched);
+	CHECK_CUDA(, debug)
 
 	CHECK_CUDA(cub::DeviceScan::InclusiveSum(
 		geomState.scanning_space,
@@ -845,7 +895,9 @@ int CudaRasterizer::Rasterizer::semanticTdom(
 		binningState.point_list_unsorted,
 		radii,
 		tile_grid,
-		nullptr);
+		nullptr,
+		tile_y_min,
+		tile_y_max);
 	CHECK_CUDA(, debug)
 
 	const int bit = getHigherMsb(tile_grid.x * tile_grid.y);

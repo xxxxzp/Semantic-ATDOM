@@ -10,7 +10,7 @@ from semantic_atdom.scene import Scene, GaussianModel
 from fused_ssim import fused_ssim
 from semantic_atdom.utils.general_utils import safe_state
 from tqdm import tqdm
-from semantic_atdom.utils.image_utils import psnr
+from semantic_atdom.utils.image_utils import psnr, tdom_to_uint8
 from argparse import ArgumentParser, Namespace
 from semantic_atdom.arguments import ModelParams, PipelineParams, OptimizationParams
 from PIL import Image
@@ -979,6 +979,9 @@ class GaussianTrainer(mp.Process):
                 finalize_tile_rows=(
                     self.args.semantic_tdom_finalize_tile_rows
                 ),
+                save_diagnostics=(
+                    self.args.semantic_tdom_save_diagnostics
+                ),
                 save_probabilities=(
                     self.args.semantic_tdom_save_probabilities
                 ),
@@ -1561,16 +1564,7 @@ class GaussianTrainer(mp.Process):
                 }
 
                 TDOM = render(self.TDOM_Cam, self.gaussians, self.TDOM_pipeline, self.background, Render_Mask=torch.ones(1, dtype=torch.bool).cuda(), TDOM=True)["render"]
-                tdom_min = TDOM.min()
-                tdom_range = (TDOM.max() - tdom_min).clamp_min(1e-8)
-                TDOM_output = (
-                    ((TDOM - tdom_min) / tdom_range)
-                    .permute(1, 2, 0)
-                    .mul(255)
-                    .to(dtype=torch.uint8)
-                    .cpu()
-                    .numpy()
-                )
+                TDOM_output = tdom_to_uint8(TDOM)
                 del TDOM
 
                 time2 = time.time()
@@ -1987,16 +1981,7 @@ class DataSaver(mp.Process):
             # rendering_filepath = os.path.join(self.Intermediate_TDOM_Render_Path, f"{self.SaveTDOMNumber}.jpg")
             # torchvision.utils.save_image(tdom, rendering_filepath)
             if isinstance(tdom, torch.Tensor):
-                minimum = tdom.min()
-                value_range = (tdom.max() - minimum).clamp_min(1e-8)
-                ImageOutput = (
-                    ((tdom - minimum) / value_range)
-                    .permute(1, 2, 0)
-                    .mul(255)
-                    .to(dtype=torch.uint8)
-                    .cpu()
-                    .numpy()
-                )
+                ImageOutput = tdom_to_uint8(tdom)
             else:
                 ImageOutput = np.asarray(tdom)
                 if ImageOutput.ndim != 3 or ImageOutput.shape[2] != 3:

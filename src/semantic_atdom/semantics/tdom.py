@@ -40,10 +40,10 @@ class SemanticTdomConfig:
     min_margin: float = 0.05
     min_top1_probability: float = 0.0
     max_normalized_entropy: float = 1.0
-    max_group_disagreement: float = 1.0
+    max_group_disagreement: float = 2.0
     eps: float = 1e-8
     save_probabilities: bool = False
-    save_diagnostics: bool = True
+    save_diagnostics: bool = False
     quantize_diagnostics: bool = True
     render_tile_rows: int = 0
     finalize_tile_rows: int = 256
@@ -59,11 +59,16 @@ class SemanticTdomConfig:
             "min_margin",
             "min_top1_probability",
             "max_normalized_entropy",
-            "max_group_disagreement",
         ):
             value = getattr(self, name)
             if not math.isfinite(value) or value < 0 or value > 1:
                 raise ValueError("{} must be in [0, 1]".format(name))
+        if (
+            not math.isfinite(self.max_group_disagreement)
+            or self.max_group_disagreement < 0
+            or self.max_group_disagreement > 2
+        ):
+            raise ValueError("max_group_disagreement must be in [0, 2]")
         if not math.isfinite(self.eps) or self.eps <= 0:
             raise ValueError("eps must be positive")
         if (
@@ -96,16 +101,16 @@ class SemanticTdomResult(NamedTuple):
     unknown_mask: torch.Tensor
     unknown_reason: torch.Tensor
     probabilities: Optional[torch.Tensor]
-    coverage: torch.Tensor
+    coverage: Optional[torch.Tensor]
     absolute_support: torch.Tensor
-    support_ratio: torch.Tensor
-    top1_probability: torch.Tensor
+    support_ratio: Optional[torch.Tensor]
+    top1_probability: Optional[torch.Tensor]
     entropy: torch.Tensor
-    normalized_entropy: torch.Tensor
-    margin: torch.Tensor
-    mixture_disagreement: torch.Tensor
-    group_disagreement: torch.Tensor
-    posterior_variance: torch.Tensor
+    normalized_entropy: Optional[torch.Tensor]
+    margin: Optional[torch.Tensor]
+    mixture_disagreement: Optional[torch.Tensor]
+    group_disagreement: Optional[torch.Tensor]
+    posterior_variance: Optional[torch.Tensor]
     radii: Optional[torch.Tensor]
     metrics: Mapping[str, object]
 
@@ -161,7 +166,12 @@ def finalize_semantic_tdom(
     # A view would retain the complete K+4 allocation after finalization.
     absolute_support = rendered_features[class_count].clone()
     probabilities = numerator / (absolute_support.unsqueeze(0) + config.eps)
-    probabilities = probabilities.clamp(min=0.0, max=1.0)
+    probability_sum = probabilities.sum(dim=0, keepdim=True)
+    probabilities = torch.where(
+        probability_sum > config.eps,
+        probabilities / (probability_sum + config.eps),
+        torch.zeros_like(probabilities),
+    ).clamp(min=0.0, max=1.0)
     support_ratio = absolute_support / (coverage + config.eps)
     entropy = -(
         probabilities * torch.log(probabilities.clamp_min(config.eps))
@@ -186,7 +196,7 @@ def finalize_semantic_tdom(
         group_disagreement = (
             rendered_features[class_count + 2]
             / (absolute_support + config.eps)
-        ).clamp(min=0.0, max=1.0)
+        ).clamp(min=0.0, max=2.0)
         posterior_variance = (
             rendered_features[class_count + 3]
             / (absolute_support.square() + config.eps)
@@ -244,6 +254,17 @@ def finalize_semantic_tdom(
         normalized_entropy,
         torch.full_like(normalized_entropy, float("nan")),
     )
+    if enhanced:
+        undefined = torch.full_like(absolute_support, float("nan"))
+        mixture_disagreement = torch.where(
+            semantic_evidence, mixture_disagreement, undefined
+        )
+        group_disagreement = torch.where(
+            semantic_evidence, group_disagreement, undefined
+        )
+        posterior_variance = torch.where(
+            semantic_evidence, posterior_variance, undefined
+        )
     colors = None
     if create_colors:
         palette = torch.tensor(
@@ -291,17 +312,22 @@ def _finalize_semantic_tdom_in_tiles(
 ) -> SemanticTdomResult:
     """Finalize row tiles and immediately transfer compact products to CPU."""
     height, width = coverage.shape
-    float_names = (
-        "coverage",
+    core_float_names = (
         "absolute_support",
+        "entropy",
+    )
+    diagnostic_float_names = (
+        "coverage",
         "support_ratio",
         "top1_probability",
-        "entropy",
         "normalized_entropy",
         "margin",
         "mixture_disagreement",
         "group_disagreement",
         "posterior_variance",
+    )
+    float_names = core_float_names + (
+        diagnostic_float_names if config.save_diagnostics else ()
     )
     if outputs is None:
         output_height = height if total_height is None else total_height
@@ -357,16 +383,16 @@ def _finalize_semantic_tdom_in_tiles(
         unknown_mask=outputs["unknown_mask"],
         unknown_reason=outputs["unknown_reason"],
         probabilities=probabilities,
-        coverage=outputs["coverage"],
+        coverage=outputs.get("coverage"),
         absolute_support=outputs["absolute_support"],
-        support_ratio=outputs["support_ratio"],
-        top1_probability=outputs["top1_probability"],
+        support_ratio=outputs.get("support_ratio"),
+        top1_probability=outputs.get("top1_probability"),
         entropy=outputs["entropy"],
-        normalized_entropy=outputs["normalized_entropy"],
-        margin=outputs["margin"],
-        mixture_disagreement=outputs["mixture_disagreement"],
-        group_disagreement=outputs["group_disagreement"],
-        posterior_variance=outputs["posterior_variance"],
+        normalized_entropy=outputs.get("normalized_entropy"),
+        margin=outputs.get("margin"),
+        mixture_disagreement=outputs.get("mixture_disagreement"),
+        group_disagreement=outputs.get("group_disagreement"),
+        posterior_variance=outputs.get("posterior_variance"),
         radii=None if radii is None else radii.detach().cpu(),
         metrics=dict(metrics),
     )
@@ -779,7 +805,7 @@ def write_semantic_tdom(
         maximum = (
             math.log(class_spec.num_classes)
             if name == "semantic_entropy.tif" and class_spec.num_classes > 1
-            else 1.0
+            else (2.0 if name == "group_disagreement.tif" else 1.0)
         )
         encoded, encoding = _encode_diagnostic(
             array, maximum, config.quantize_diagnostics

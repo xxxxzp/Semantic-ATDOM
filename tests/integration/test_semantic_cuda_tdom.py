@@ -111,7 +111,9 @@ class SemanticCudaTdomTests(unittest.TestCase):
             state,
             camera,
             self._two_class_spec(),
-            config=SemanticTdomConfig(min_free_cuda_bytes=0),
+            config=SemanticTdomConfig(
+                min_free_cuda_bytes=0, save_diagnostics=True
+            ),
         )
         striped = rasterize_semantic_tdom(
             Gaussians(),
@@ -119,7 +121,9 @@ class SemanticCudaTdomTests(unittest.TestCase):
             camera,
             self._two_class_spec(),
             config=SemanticTdomConfig(
-                render_tile_rows=16, min_free_cuda_bytes=0
+                render_tile_rows=16,
+                min_free_cuda_bytes=0,
+                save_diagnostics=True,
             ),
         )
 

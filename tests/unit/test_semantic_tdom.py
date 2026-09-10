@@ -32,6 +32,8 @@ class SemanticTdomTests(unittest.TestCase):
             SemanticTdomConfig(max_output_bytes=0)
         with self.assertRaisesRegex(ValueError, "min_free_cuda_bytes"):
             SemanticTdomConfig(min_free_cuda_bytes=-1)
+        with self.assertRaisesRegex(ValueError, "max_group_disagreement"):
+            SemanticTdomConfig(max_group_disagreement=2.01)
 
     def test_soft_probabilities_are_mixed_before_unknown_gate(self):
         rendered = torch.tensor(
@@ -118,8 +120,43 @@ class SemanticTdomTests(unittest.TestCase):
             result.posterior_variance, torch.tensor([[0.125]])
         )
 
-    def test_writer_publishes_default_products_and_manifest(self):
-        config = SemanticTdomConfig(save_probabilities=True)
+    def test_group_disagreement_keeps_full_trace_range(self):
+        rendered = torch.tensor(
+            [
+                [[0.50]],
+                [[0.50]],
+                [[1.00]],
+                [[0.50]],
+                [[1.60]],
+                [[0.10]],
+            ]
+        )
+        result = finalize_semantic_tdom(
+            rendered, torch.tensor([[1.0]]), CLASS_SPEC
+        )
+        torch.testing.assert_close(
+            result.group_disagreement, torch.tensor([[1.60]])
+        )
+
+    def test_uncertainty_is_undefined_without_semantic_evidence(self):
+        result = finalize_semantic_tdom(
+            torch.zeros((CLASS_SPEC.num_classes + 4, 1, 1)),
+            torch.ones((1, 1)),
+            CLASS_SPEC,
+        )
+        for name in (
+            "entropy",
+            "normalized_entropy",
+            "mixture_disagreement",
+            "group_disagreement",
+            "posterior_variance",
+        ):
+            self.assertTrue(torch.isnan(getattr(result, name)).all(), name)
+
+    def test_writer_publishes_full_products_and_manifest(self):
+        config = SemanticTdomConfig(
+            save_probabilities=True, save_diagnostics=True
+        )
         result = finalize_semantic_tdom(
             torch.tensor([[[0.8]], [[0.1]], [[0.9]]]),
             torch.tensor([[0.95]]),
@@ -169,6 +206,10 @@ class SemanticTdomTests(unittest.TestCase):
                 payload["raster_encodings"]["semantic_support.tif"]["dtype"],
                 "uint16",
             )
+            self.assertEqual(
+                payload["raster_encodings"]["group_disagreement.tif"]["scale"],
+                2.0 / 65534.0,
+            )
 
             second_manifest = write_semantic_tdom(
                 result,
@@ -186,6 +227,25 @@ class SemanticTdomTests(unittest.TestCase):
             self.assertEqual(second["geometry_stage"], 32)
             self.assertFalse(root.with_name(root.name + ".publishing").exists())
             self.assertFalse(root.with_name(root.name + ".previous").exists())
+
+    def test_writer_defaults_to_core_product_without_full_diagnostics(self):
+        config = SemanticTdomConfig()
+        result = finalize_semantic_tdom(
+            torch.tensor([[[0.8]], [[0.1]], [[0.9]]]),
+            torch.tensor([[0.95]]),
+            CLASS_SPEC,
+            config,
+        )
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest_path = write_semantic_tdom(
+                result, root, CLASS_SPEC, {}, config
+            )
+            payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                set(payload["raster_encodings"]),
+                {"semantic_support.tif", "semantic_entropy.tif"},
+            )
 
     def test_channel_count_must_match_class_spec(self):
         with self.assertRaisesRegex(ValueError, "num_classes"):

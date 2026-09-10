@@ -127,7 +127,7 @@ namespace FORWARD
 		float* valid_mass,
 		float* dense_contributions);
 
-	// Forward-only TDOM rendering for 1..16 semantic feature channels.
+	// Forward-only TDOM rendering for 1..20 semantic feature channels.
 	void semanticTdom(
 		const dim3 grid, dim3 block,
 		const uint2* ranges,
@@ -137,8 +137,12 @@ namespace FORWARD
 		const float4* conic_opacity,
 		const float* features,
 		int num_channels,
+		int output_y_start,
+		int output_height,
+		int squared_feature_channel,
 		float* rendered_features,
-		float* coverage);
+		float* coverage,
+		float* squared_moment);
 }
 
 

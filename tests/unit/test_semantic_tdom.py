@@ -8,6 +8,7 @@ import torch
 from semantic_atdom.semantics.schema import SemanticClassSpec, sha256_file
 from semantic_atdom.semantics.tdom import (
     SemanticTdomConfig,
+    UnknownReason,
     finalize_semantic_tdom,
     write_semantic_tdom,
 )
@@ -58,7 +59,64 @@ class SemanticTdomTests(unittest.TestCase):
         )
         self.assertEqual(result.colors[:, 0, 0].tolist(), [10, 20, 30])
         self.assertEqual(result.colors[:, 0, 1].tolist(), [0, 0, 0])
+        self.assertFalse(torch.isnan(result.entropy[0, 1]))
+        self.assertEqual(
+            int(result.unknown_reason[0, 1]), int(UnknownReason.LOW_MARGIN)
+        )
+
+    def test_entropy_and_unknown_reasons_remain_explainable(self):
+        rendered = torch.tensor(
+            [
+                [[0.45, 0.0]],
+                [[0.35, 0.0]],
+                [[0.80, 0.0]],
+            ]
+        )
+        coverage = torch.tensor([[0.90, 0.0]])
+        result = finalize_semantic_tdom(
+            rendered,
+            coverage,
+            CLASS_SPEC,
+            SemanticTdomConfig(min_margin=0.2),
+        )
+
+        self.assertTrue(result.unknown_mask[0, 0])
+        self.assertFalse(torch.isnan(result.entropy[0, 0]))
+        self.assertTrue(
+            int(result.unknown_reason[0, 0]) & int(UnknownReason.LOW_MARGIN)
+        )
         self.assertTrue(torch.isnan(result.entropy[0, 1]))
+        self.assertTrue(
+            int(result.unknown_reason[0, 1])
+            & int(UnknownReason.NO_SEMANTIC_EVIDENCE)
+        )
+
+    def test_enhanced_features_produce_separate_uncertainty_maps(self):
+        # K class numerators, support, E[||mu||^2], group variance and
+        # Dirichlet trace variance.
+        rendered = torch.tensor(
+            [
+                [[0.60]],
+                [[0.20]],
+                [[0.80]],
+                [[0.68]],
+                [[0.16]],
+                [[0.08]],
+            ]
+        )
+        result = finalize_semantic_tdom(
+            rendered, torch.tensor([[0.90]]), CLASS_SPEC
+        )
+
+        torch.testing.assert_close(
+            result.mixture_disagreement, torch.tensor([[0.225]])
+        )
+        torch.testing.assert_close(
+            result.group_disagreement, torch.tensor([[0.20]])
+        )
+        torch.testing.assert_close(
+            result.posterior_variance, torch.tensor([[0.125]])
+        )
 
     def test_writer_publishes_default_products_and_manifest(self):
         config = SemanticTdomConfig(save_probabilities=True)
@@ -88,15 +146,29 @@ class SemanticTdomTests(unittest.TestCase):
                 "semantic_id.png",
                 "semantic_color.png",
                 "unknown_mask.png",
+                "unknown_reason.png",
                 "semantic_support.tif",
                 "semantic_entropy.tif",
+                "coverage.tif",
+                "support_ratio.tif",
+                "top1_probability.tif",
+                "margin.tif",
+                "mixture_disagreement.tif",
+                "group_disagreement.tif",
+                "posterior_variance.tif",
                 "semantic_probabilities.npy",
+                "class_spec.json",
             }
             self.assertEqual(set(payload["files"]), expected)
             for name in expected:
                 self.assertEqual(payload["files"][name], sha256_file(root / name))
             self.assertEqual(payload["geometry_stage"], 31)
             self.assertEqual(payload["class_spec_sha256"], CLASS_SPEC.fingerprint)
+            self.assertEqual(payload["class_spec"], CLASS_SPEC.to_dict())
+            self.assertEqual(
+                payload["raster_encodings"]["semantic_support.tif"]["dtype"],
+                "uint16",
+            )
 
             second_manifest = write_semantic_tdom(
                 result,

@@ -1,12 +1,14 @@
 """Forward-only Semantic TDOM rendering and product serialization."""
 
 from dataclasses import asdict, dataclass
+from enum import IntFlag
 import json
 import math
 import os
 from pathlib import Path
 import shutil
-from typing import Mapping, NamedTuple, Optional
+import time
+from typing import Dict, Mapping, NamedTuple, Optional
 
 import numpy as np
 from PIL import Image
@@ -15,16 +17,37 @@ import torch
 from semantic_atdom.semantics.schema import SemanticClassSpec, sha256_file
 
 
+class UnknownReason(IntFlag):
+    """Independent reasons why a pixel is withheld from the hard class map."""
+
+    LOW_COVERAGE = 1
+    LOW_ABSOLUTE_SUPPORT = 2
+    LOW_SUPPORT_RATIO = 4
+    LOW_MARGIN = 8
+    LOW_TOP1_PROBABILITY = 16
+    HIGH_NORMALIZED_ENTROPY = 32
+    HIGH_GROUP_DISAGREEMENT = 64
+    NO_SEMANTIC_EVIDENCE = 128
+
+
 @dataclass(frozen=True)
 class SemanticTdomConfig:
-    """Configurable unknown gate; defaults are conservative, not calibrated."""
+    """Configurable unknown gate; defaults preserve the V1 hard-map behavior."""
 
     min_coverage: float = 0.05
     min_absolute_support: float = 0.01
     min_support_ratio: float = 0.05
     min_margin: float = 0.05
+    min_top1_probability: float = 0.0
+    max_normalized_entropy: float = 1.0
+    max_group_disagreement: float = 1.0
     eps: float = 1e-8
     save_probabilities: bool = False
+    save_diagnostics: bool = True
+    quantize_diagnostics: bool = True
+    render_tile_rows: int = 0
+    finalize_tile_rows: int = 256
+    validate_rendered_inputs: bool = False
     max_output_bytes: int = 8 * 1024**3
     min_free_cuda_bytes: int = 512 * 1024**2
 
@@ -34,12 +57,27 @@ class SemanticTdomConfig:
             "min_absolute_support",
             "min_support_ratio",
             "min_margin",
+            "min_top1_probability",
+            "max_normalized_entropy",
+            "max_group_disagreement",
         ):
             value = getattr(self, name)
             if not math.isfinite(value) or value < 0 or value > 1:
                 raise ValueError("{} must be in [0, 1]".format(name))
         if not math.isfinite(self.eps) or self.eps <= 0:
             raise ValueError("eps must be positive")
+        if (
+            not isinstance(self.render_tile_rows, int)
+            or self.render_tile_rows < 0
+        ):
+            raise ValueError("render_tile_rows must be a non-negative integer")
+        if self.render_tile_rows and self.render_tile_rows % 16:
+            raise ValueError("render_tile_rows must be a multiple of 16")
+        if (
+            not isinstance(self.finalize_tile_rows, int)
+            or self.finalize_tile_rows <= 0
+        ):
+            raise ValueError("finalize_tile_rows must be a positive integer")
         if not isinstance(self.max_output_bytes, int) or self.max_output_bytes <= 0:
             raise ValueError("max_output_bytes must be a positive integer")
         if (
@@ -54,15 +92,26 @@ class SemanticTdomConfig:
 
 class SemanticTdomResult(NamedTuple):
     class_ids: torch.Tensor
-    colors: torch.Tensor
+    colors: Optional[torch.Tensor]
     unknown_mask: torch.Tensor
-    probabilities: torch.Tensor
+    unknown_reason: torch.Tensor
+    probabilities: Optional[torch.Tensor]
     coverage: torch.Tensor
     absolute_support: torch.Tensor
     support_ratio: torch.Tensor
+    top1_probability: torch.Tensor
     entropy: torch.Tensor
+    normalized_entropy: torch.Tensor
     margin: torch.Tensor
+    mixture_disagreement: torch.Tensor
+    group_disagreement: torch.Tensor
+    posterior_variance: torch.Tensor
     radii: Optional[torch.Tensor]
+    metrics: Mapping[str, object]
+
+
+def _empty_uncertainty(reference: torch.Tensor) -> torch.Tensor:
+    return torch.full_like(reference, float("nan"))
 
 
 def finalize_semantic_tdom(
@@ -71,82 +120,255 @@ def finalize_semantic_tdom(
     class_spec: SemanticClassSpec,
     config: Optional[SemanticTdomConfig] = None,
     radii: Optional[torch.Tensor] = None,
+    retain_probabilities: bool = True,
+    create_colors: bool = True,
 ) -> SemanticTdomResult:
-    """Normalize composited soft evidence and apply the pixel unknown gate."""
+    """Normalize composited evidence and apply an explainable unknown gate.
+
+    ``rendered_features`` accepts the legacy ``K + 1`` layout or the enhanced
+    ``K + 4`` layout. Enhanced scalar channels contain the weighted probability
+    second moment, flight-group disagreement and the squared-weight propagated
+    Dirichlet trace-variance numerator, respectively.
+    """
     config = config or SemanticTdomConfig()
     rendered_features = rendered_features.detach()
     coverage = coverage.detach().to(
         device=rendered_features.device, dtype=rendered_features.dtype
     )
-    expected_channels = class_spec.num_classes + 1
-    if rendered_features.ndim != 3 or rendered_features.shape[0] != expected_channels:
+    class_count = class_spec.num_classes
+    valid_channel_counts = (class_count + 1, class_count + 4)
+    if (
+        rendered_features.ndim != 3
+        or rendered_features.shape[0] not in valid_channel_counts
+    ):
         raise ValueError(
-            "rendered_features must have shape [num_classes + 1, H, W]"
+            "rendered_features must have shape [num_classes + 1, H, W] "
+            "or [num_classes + 4, H, W]"
         )
     if coverage.shape != rendered_features.shape[1:]:
         raise ValueError("coverage must have shape [H, W]")
-    if not bool(torch.isfinite(rendered_features).all()) or bool(
-        (rendered_features < 0).any()
-    ):
-        raise ValueError("rendered semantic features must be finite and non-negative")
-    if not bool(torch.isfinite(coverage).all()) or bool((coverage < 0).any()):
-        raise ValueError("coverage must be finite and non-negative")
+    if config.validate_rendered_inputs:
+        if not bool(torch.isfinite(rendered_features).all()) or bool(
+            (rendered_features < 0).any()
+        ):
+            raise ValueError(
+                "rendered semantic features must be finite and non-negative"
+            )
+        if not bool(torch.isfinite(coverage).all()) or bool((coverage < 0).any()):
+            raise ValueError("coverage must be finite and non-negative")
 
-    numerator = rendered_features[:-1]
-    absolute_support = rendered_features[-1]
+    numerator = rendered_features[:class_count]
+    # A view would retain the complete K+4 allocation after finalization.
+    absolute_support = rendered_features[class_count].clone()
     probabilities = numerator / (absolute_support.unsqueeze(0) + config.eps)
-    probability_sum = probabilities.sum(dim=0, keepdim=True)
-    probabilities = torch.where(
-        probability_sum > config.eps,
-        probabilities / (probability_sum + config.eps),
-        torch.zeros_like(probabilities),
-    )
+    probabilities = probabilities.clamp(min=0.0, max=1.0)
     support_ratio = absolute_support / (coverage + config.eps)
     entropy = -(
         probabilities * torch.log(probabilities.clamp_min(config.eps))
     ).sum(dim=0)
-    if class_spec.num_classes > 1:
+    if class_count > 1:
         top_two = torch.topk(probabilities, k=2, dim=0).values
+        top1_probability = top_two[0]
         margin = top_two[0] - top_two[1]
     else:
+        top1_probability = probabilities[0]
         margin = probabilities[0]
-    valid = (
-        (coverage >= config.min_coverage)
-        & (absolute_support >= config.min_absolute_support)
-        & (support_ratio >= config.min_support_ratio)
-        & (margin >= config.min_margin)
-        & (absolute_support > config.eps)
+    entropy_scale = math.log(class_count) if class_count > 1 else 1.0
+    normalized_entropy = entropy / entropy_scale
+
+    enhanced = rendered_features.shape[0] == class_count + 4
+    if enhanced:
+        weighted_second_moment = rendered_features[class_count + 1]
+        mixture_disagreement = (
+            weighted_second_moment / (absolute_support + config.eps)
+            - probabilities.square().sum(dim=0)
+        ).clamp(min=0.0, max=1.0)
+        group_disagreement = (
+            rendered_features[class_count + 2]
+            / (absolute_support + config.eps)
+        ).clamp(min=0.0, max=1.0)
+        posterior_variance = (
+            rendered_features[class_count + 3]
+            / (absolute_support.square() + config.eps)
+        ).clamp(min=0.0, max=1.0)
+    else:
+        mixture_disagreement = _empty_uncertainty(absolute_support)
+        group_disagreement = _empty_uncertainty(absolute_support)
+        posterior_variance = _empty_uncertainty(absolute_support)
+
+    reason = torch.zeros_like(absolute_support, dtype=torch.uint8)
+
+    def add_reason(mask: torch.Tensor, flag: UnknownReason) -> None:
+        reason.bitwise_or_(mask.to(dtype=torch.uint8) * int(flag))
+
+    semantic_evidence = absolute_support > config.eps
+    add_reason(~semantic_evidence, UnknownReason.NO_SEMANTIC_EVIDENCE)
+    add_reason(coverage < config.min_coverage, UnknownReason.LOW_COVERAGE)
+    add_reason(
+        absolute_support < config.min_absolute_support,
+        UnknownReason.LOW_ABSOLUTE_SUPPORT,
     )
+    add_reason(
+        support_ratio < config.min_support_ratio,
+        UnknownReason.LOW_SUPPORT_RATIO,
+    )
+    add_reason(margin < config.min_margin, UnknownReason.LOW_MARGIN)
+    add_reason(
+        top1_probability < config.min_top1_probability,
+        UnknownReason.LOW_TOP1_PROBABILITY,
+    )
+    add_reason(
+        normalized_entropy > config.max_normalized_entropy,
+        UnknownReason.HIGH_NORMALIZED_ENTROPY,
+    )
+    if enhanced:
+        add_reason(
+            group_disagreement > config.max_group_disagreement,
+            UnknownReason.HIGH_GROUP_DISAGREEMENT,
+        )
+
+    valid = reason == 0
     class_ids = probabilities.argmax(dim=0).to(dtype=torch.uint8)
     class_ids = torch.where(
         valid,
         class_ids,
         torch.full_like(class_ids, class_spec.ignore_id),
     )
+    # Entropy describes ambiguity, including supported pixels rejected by the
+    # hard gate. It is undefined only where no semantic evidence exists.
     entropy = torch.where(
-        valid, entropy, torch.full_like(entropy, float("nan"))
+        semantic_evidence, entropy, torch.full_like(entropy, float("nan"))
     )
-    palette = torch.tensor(
-        [item.color for item in class_spec.classes],
-        dtype=torch.uint8,
-        device=class_ids.device,
+    normalized_entropy = torch.where(
+        semantic_evidence,
+        normalized_entropy,
+        torch.full_like(normalized_entropy, float("nan")),
     )
-    safe_ids = class_ids.long().clamp(max=class_spec.num_classes - 1)
-    colors = palette[safe_ids]
-    colors = torch.where(
-        valid.unsqueeze(2), colors, torch.zeros_like(colors)
-    ).permute(2, 0, 1)
+    colors = None
+    if create_colors:
+        palette = torch.tensor(
+            [item.color for item in class_spec.classes],
+            dtype=torch.uint8,
+            device=class_ids.device,
+        )
+        safe_ids = class_ids.long().clamp(max=class_count - 1)
+        colors = palette[safe_ids]
+        colors = torch.where(
+            valid.unsqueeze(2), colors, torch.zeros_like(colors)
+        ).permute(2, 0, 1)
+    returned_probabilities = probabilities if retain_probabilities else None
     return SemanticTdomResult(
-        class_ids,
-        colors,
-        ~valid,
-        probabilities,
-        coverage,
-        absolute_support,
-        support_ratio,
-        entropy,
-        margin,
-        radii,
+        class_ids=class_ids,
+        colors=colors,
+        unknown_mask=~valid,
+        unknown_reason=reason,
+        probabilities=returned_probabilities,
+        coverage=coverage,
+        absolute_support=absolute_support,
+        support_ratio=support_ratio,
+        top1_probability=top1_probability,
+        entropy=entropy,
+        normalized_entropy=normalized_entropy,
+        margin=margin,
+        mixture_disagreement=mixture_disagreement,
+        group_disagreement=group_disagreement,
+        posterior_variance=posterior_variance,
+        radii=radii,
+        metrics={},
+    )
+
+
+def _finalize_semantic_tdom_in_tiles(
+    rendered_features: torch.Tensor,
+    coverage: torch.Tensor,
+    class_spec: SemanticClassSpec,
+    config: SemanticTdomConfig,
+    radii: Optional[torch.Tensor],
+    metrics: Mapping[str, object],
+    outputs: Optional[Dict[str, torch.Tensor]] = None,
+    output_row_start: int = 0,
+    total_height: Optional[int] = None,
+) -> SemanticTdomResult:
+    """Finalize row tiles and immediately transfer compact products to CPU."""
+    height, width = coverage.shape
+    float_names = (
+        "coverage",
+        "absolute_support",
+        "support_ratio",
+        "top1_probability",
+        "entropy",
+        "normalized_entropy",
+        "margin",
+        "mixture_disagreement",
+        "group_disagreement",
+        "posterior_variance",
+    )
+    if outputs is None:
+        output_height = height if total_height is None else total_height
+        outputs = {
+            "class_ids": torch.empty((output_height, width), dtype=torch.uint8),
+            "unknown_mask": torch.empty((output_height, width), dtype=torch.bool),
+            "unknown_reason": torch.empty((output_height, width), dtype=torch.uint8),
+        }
+        for name in float_names:
+            outputs[name] = torch.empty(
+                (output_height, width), dtype=torch.float32
+            )
+        if config.save_probabilities:
+            outputs["probabilities"] = torch.empty(
+                (class_spec.num_classes, output_height, width),
+                dtype=torch.float16,
+            )
+    probabilities = outputs.get("probabilities")
+
+    for row_start in range(0, height, config.finalize_tile_rows):
+        row_end = min(row_start + config.finalize_tile_rows, height)
+        tile = finalize_semantic_tdom(
+            rendered_features[:, row_start:row_end],
+            coverage[row_start:row_end],
+            class_spec,
+            config=config,
+            retain_probabilities=config.save_probabilities,
+            create_colors=False,
+        )
+        destination_start = output_row_start + row_start
+        destination_end = output_row_start + row_end
+        outputs["class_ids"][destination_start:destination_end].copy_(
+            tile.class_ids.cpu()
+        )
+        outputs["unknown_mask"][destination_start:destination_end].copy_(
+            tile.unknown_mask.cpu()
+        )
+        outputs["unknown_reason"][destination_start:destination_end].copy_(
+            tile.unknown_reason.cpu()
+        )
+        for name in float_names:
+            outputs[name][destination_start:destination_end].copy_(
+                getattr(tile, name).cpu()
+            )
+        if probabilities is not None:
+            probabilities[:, destination_start:destination_end].copy_(
+                tile.probabilities.cpu().to(dtype=torch.float16)
+            )
+
+    return SemanticTdomResult(
+        class_ids=outputs["class_ids"],
+        colors=None,
+        unknown_mask=outputs["unknown_mask"],
+        unknown_reason=outputs["unknown_reason"],
+        probabilities=probabilities,
+        coverage=outputs["coverage"],
+        absolute_support=outputs["absolute_support"],
+        support_ratio=outputs["support_ratio"],
+        top1_probability=outputs["top1_probability"],
+        entropy=outputs["entropy"],
+        normalized_entropy=outputs["normalized_entropy"],
+        margin=outputs["margin"],
+        mixture_disagreement=outputs["mixture_disagreement"],
+        group_disagreement=outputs["group_disagreement"],
+        posterior_variance=outputs["posterior_variance"],
+        radii=None if radii is None else radii.detach().cpu(),
+        metrics=dict(metrics),
     )
 
 
@@ -161,7 +383,7 @@ def rasterize_semantic_tdom(
     scale_modifier: float = 1.0,
     debug: bool = False,
 ) -> SemanticTdomResult:
-    """Render K-channel semantics with the orthographic RGB TDOM camera."""
+    """Render soft semantics with the orthographic RGB TDOM camera."""
     from diff_gaussian_rasterization import _C
 
     config = config or SemanticTdomConfig()
@@ -178,37 +400,64 @@ def rasterize_semantic_tdom(
         raise ValueError("semantic state and geometry Gaussian counts differ")
     if semantic_state.num_classes != class_spec.num_classes:
         raise ValueError("semantic state and class spec widths differ")
-    if class_spec.num_classes + 1 > 16:
-        raise ValueError("Semantic TDOM currently supports at most 15 classes")
-    # The forward result, normalization intermediates and serialization copies
-    # coexist briefly.  Reject unsafe requests explicitly until tiled rendering
-    # is implemented instead of relying on an opaque CUDA OOM.
-    estimated_bytes = (
-        (3 * class_spec.num_classes + 10)
-        * int(camera.image_height)
-        * int(camera.image_width)
-        * 4
-    ) + means3d.shape[0] * (class_spec.num_classes + 32) * 4
-    if estimated_bytes > config.max_output_bytes:
-        raise ValueError(
-            "Semantic TDOM requires an estimated {} bytes, exceeding the "
-            "configured {} byte budget".format(
-                estimated_bytes, config.max_output_bytes
-            )
-        )
+    # K class numerators plus support and three scalar uncertainty moments.
+    feature_channels = class_spec.num_classes + 4
+    if feature_channels > 20:
+        raise ValueError("Semantic TDOM currently supports at most 16 classes")
+    image_height = int(camera.image_height)
+    image_width = int(camera.image_width)
+    pixel_count = image_height * image_width
+    tile_pixel_count = min(
+        pixel_count,
+        int(config.finalize_tile_rows) * image_width,
+    )
     with torch.cuda.device(means3d.device):
-        free_cuda_bytes, _ = torch.cuda.mem_get_info()
-    if estimated_bytes + config.min_free_cuda_bytes > free_cuda_bytes:
+        free_cuda_bytes, total_cuda_bytes = torch.cuda.mem_get_info()
+        allocated_before = torch.cuda.memory_allocated()
+    capacity_bytes = min(
+        config.max_output_bytes,
+        free_cuda_bytes - config.min_free_cuda_bytes,
+    )
+    gaussian_bytes = means3d.shape[0] * (feature_channels + 32) * 4
+    finalize_bytes = (
+        (2 * class_spec.num_classes + 14) * tile_pixel_count * 4
+    )
+    # Binning scales with the number of Gaussian/tile intersections rather
+    # than just image dimensions. Keep an explicit reserve and let C++ reject
+    # an unexpectedly larger list with a descriptive error.
+    binning_reserve_bytes = max(128 * 1024**2, means3d.shape[0] * 128)
+    fixed_bytes = gaussian_bytes + finalize_bytes + binning_reserve_bytes
+    if capacity_bytes <= fixed_bytes:
         raise ValueError(
-            "Semantic TDOM estimated allocation plus headroom is {} bytes, "
-            "but only {} CUDA bytes are free".format(
-                estimated_bytes + config.min_free_cuda_bytes,
-                free_cuda_bytes,
+            "Semantic TDOM fixed working set is {} bytes, but the byte budget "
+            "or CUDA capacity after headroom is {} bytes".format(
+                fixed_bytes, capacity_bytes
             )
         )
+    max_rows_by_budget = int(
+        (capacity_bytes - fixed_bytes)
+        // (feature_channels * image_width * 4)
+    )
+    max_rows_by_budget = (max_rows_by_budget // 16) * 16
+    if config.render_tile_rows:
+        render_tile_rows = min(
+            config.render_tile_rows, image_height, max_rows_by_budget
+        )
+    elif max_rows_by_budget >= image_height:
+        render_tile_rows = image_height
+    else:
+        render_tile_rows = max_rows_by_budget
+    if render_tile_rows <= 0:
+        raise ValueError(
+            "Semantic TDOM has insufficient memory for one 16-row render tile"
+        )
+    render_pixel_count = min(render_tile_rows, image_height) * image_width
+    estimated_bytes = fixed_bytes + feature_channels * render_pixel_count * 4
     max_binning_bytes = min(
-        config.max_output_bytes - estimated_bytes,
-        free_cuda_bytes - config.min_free_cuda_bytes - estimated_bytes,
+        config.max_output_bytes - gaussian_bytes - finalize_bytes
+        - feature_channels * render_pixel_count * 4,
+        free_cuda_bytes - config.min_free_cuda_bytes - gaussian_bytes
+        - finalize_bytes - feature_channels * render_pixel_count * 4,
     )
 
     alpha = semantic_state.alpha_robust if use_robust else semantic_state.alpha_raw
@@ -219,9 +468,25 @@ def rasterize_semantic_tdom(
         (concentration - semantic_state.prior_total)
         / (concentration + config.eps)
     ).clamp(min=0.0, max=1.0)
-    features = torch.cat(
-        (means * evidence_ratio.unsqueeze(1), evidence_ratio.unsqueeze(1)),
+    probability_second_moment = means.square().sum(dim=1)
+    group_disagreement = semantic_state.group_variance.detach().to(
+        device=means3d.device, dtype=torch.float32
+    ).sum(dim=1).clamp(min=0.0, max=1.0)
+    posterior_variance = (
+        (1.0 - probability_second_moment).clamp_min(0.0)
+        / (concentration + 1.0)
+    )
+    auxiliary = torch.stack(
+        (
+            evidence_ratio,
+            evidence_ratio * probability_second_moment,
+            evidence_ratio * group_disagreement,
+            evidence_ratio.square() * posterior_variance,
+        ),
         dim=1,
+    )
+    features = torch.cat(
+        (means * evidence_ratio.unsqueeze(1), auxiliary), dim=1
     ).contiguous()
     opacities = gaussians.get_opacity.detach().to(dtype=torch.float32).contiguous()
     scales = gaussians.get_scaling.detach().to(dtype=torch.float32).contiguous()
@@ -236,28 +501,204 @@ def rasterize_semantic_tdom(
     campos = camera.camera_center.detach().to(
         device=means3d.device, dtype=torch.float32
     ).contiguous()
-    with torch.cuda.device(means3d.device):
-        rendered, coverage, radii = _C.semantic_tdom(
-            means3d,
-            opacities,
-            scales,
-            rotations,
-            float(scale_modifier),
-            empty,
-            features,
-            viewmatrix,
-            projmatrix,
-            float(math.tan(camera.FoVx * 0.5)),
-            float(math.tan(camera.FoVy * 0.5)),
-            campos,
-            int(camera.image_height),
-            int(camera.image_width),
-            int(max_binning_bytes),
-            bool(debug),
+    if not hasattr(_C, "semantic_tdom_tile"):
+        raise RuntimeError(
+            "diff_gaussian_rasterization must be rebuilt with exact tiled "
+            "Semantic TDOM and uncertainty-moment support"
         )
-    return finalize_semantic_tdom(
-        rendered, coverage, class_spec, config=config, radii=radii
+    pipeline_start = time.perf_counter()
+    raster_cuda_seconds = 0.0
+    raster_wall_seconds = 0.0
+    finalize_seconds = 0.0
+    allocated_after_raster = allocated_before
+    result = None
+    output_buffers = None
+    render_calls = 0
+    for output_y_start in range(0, image_height, render_tile_rows):
+        output_height = min(
+            render_tile_rows, image_height - output_y_start
+        )
+        raster_call_start = time.perf_counter()
+        with torch.cuda.device(means3d.device):
+            start_event = torch.cuda.Event(enable_timing=True)
+            end_event = torch.cuda.Event(enable_timing=True)
+            start_event.record()
+            arguments = (
+                means3d,
+                opacities,
+                scales,
+                rotations,
+                float(scale_modifier),
+                empty,
+                features,
+                viewmatrix,
+                projmatrix,
+                float(math.tan(camera.FoVx * 0.5)),
+                float(math.tan(camera.FoVy * 0.5)),
+                campos,
+                image_height,
+                image_width,
+            )
+            rendered, coverage, radii, variance_numerator = (
+                _C.semantic_tdom_tile(
+                    *arguments,
+                    int(output_y_start),
+                    int(output_height),
+                    int(class_spec.num_classes + 3),
+                    int(max_binning_bytes),
+                    bool(debug),
+                )
+            )
+            rendered[class_spec.num_classes + 3].copy_(variance_numerator)
+            end_event.record()
+            end_event.synchronize()
+            raster_cuda_seconds += (
+                start_event.elapsed_time(end_event) / 1000.0
+            )
+            allocated_after_raster = max(
+                allocated_after_raster, torch.cuda.memory_allocated()
+            )
+        raster_wall_seconds += time.perf_counter() - raster_call_start
+        render_calls += 1
+        finalize_start = time.perf_counter()
+        result = _finalize_semantic_tdom_in_tiles(
+            rendered,
+            coverage,
+            class_spec,
+            config,
+            radii,
+            {},
+            outputs=output_buffers,
+            output_row_start=output_y_start,
+            total_height=image_height,
+        )
+        if output_buffers is None:
+            output_buffers = {
+                name: getattr(result, name)
+                for name in (
+                    "class_ids",
+                    "unknown_mask",
+                    "unknown_reason",
+                    "coverage",
+                    "absolute_support",
+                    "support_ratio",
+                    "top1_probability",
+                    "entropy",
+                    "normalized_entropy",
+                    "margin",
+                    "mixture_disagreement",
+                    "group_disagreement",
+                    "posterior_variance",
+                    "probabilities",
+                )
+                if getattr(result, name) is not None
+            }
+        finalize_seconds += time.perf_counter() - finalize_start
+        del rendered, coverage, variance_numerator
+    pipeline_seconds = time.perf_counter() - pipeline_start
+    metrics = {
+        "estimated_cuda_bytes": int(estimated_bytes),
+        "cuda_free_bytes_before": int(free_cuda_bytes),
+        "cuda_total_bytes": int(total_cuda_bytes),
+        "cuda_allocated_bytes_before": int(allocated_before),
+        "cuda_allocated_bytes_after_raster": int(allocated_after_raster),
+        "process_cuda_peak_allocated_bytes": int(
+            torch.cuda.max_memory_allocated(means3d.device)
+        ),
+        "raster_cuda_seconds": float(raster_cuda_seconds),
+        "raster_wall_seconds": float(raster_wall_seconds),
+        "render_finalize_transfer_seconds": float(pipeline_seconds),
+        "render_calls": int(render_calls),
+        "render_tile_rows": int(render_tile_rows),
+        "render_mode": (
+            "full_frame" if render_tile_rows >= image_height else "exact_striped"
+        ),
+        "feature_channels": int(feature_channels),
+        "finalize_tile_rows": int(config.finalize_tile_rows),
+    }
+    del features, means, auxiliary
+    with torch.cuda.device(means3d.device):
+        allocated_after_finalize = torch.cuda.memory_allocated()
+    updated_metrics = dict(metrics)
+    updated_metrics.update(
+        {
+            "finalize_and_transfer_seconds": float(finalize_seconds),
+            "cuda_allocated_bytes_after_finalize": int(
+                allocated_after_finalize
+            ),
+        }
     )
+    return result._replace(metrics=updated_metrics)
+
+
+def _save_image_atomic(path: Path, array: np.ndarray, image_format: str) -> None:
+    temporary = path.with_name(path.name + ".tmp")
+    Image.fromarray(array).save(str(temporary), format=image_format)
+    os.replace(str(temporary), str(path))
+
+
+def _save_tiff_atomic(path: Path, array: np.ndarray) -> str:
+    """Write a lossless tiled TIFF when tifffile is available."""
+    temporary = path.with_name(path.name + ".tmp")
+    writer = "pillow-deflate"
+    try:
+        import tifffile
+
+        tifffile.imwrite(
+            str(temporary),
+            array,
+            dtype=array.dtype,
+            tile=(256, 256),
+            compression="zlib",
+            metadata=None,
+        )
+        writer = "tifffile-tiled-zlib"
+    except ImportError:
+        Image.fromarray(array).save(
+            str(temporary), format="TIFF", compression="tiff_adobe_deflate"
+        )
+    os.replace(str(temporary), str(path))
+    return writer
+
+
+def _encode_diagnostic(
+    array: np.ndarray,
+    maximum: float,
+    quantize: bool,
+):
+    if not quantize:
+        return array.astype(np.float32, copy=False), {
+            "dtype": "float32",
+            "scale": 1.0,
+            "offset": 0.0,
+            "nodata": "NaN",
+        }
+    nodata = np.uint16(65535)
+    finite = np.isfinite(array)
+    encoded = np.full(array.shape, nodata, dtype=np.uint16)
+    normalized = np.clip(array[finite] / maximum, 0.0, 1.0)
+    encoded[finite] = np.rint(normalized * 65534.0).astype(np.uint16)
+    return encoded, {
+        "dtype": "uint16",
+        "scale": float(maximum / 65534.0),
+        "offset": 0.0,
+        "nodata": int(nodata),
+        "decode": "value = encoded * scale; encoded == nodata is NaN",
+    }
+
+
+def _unknown_reason_counts(reason: torch.Tensor) -> Dict[str, int]:
+    histogram = torch.bincount(
+        reason.detach().cpu().long().reshape(-1), minlength=256
+    )
+    counts = {}
+    for item in UnknownReason:
+        counts[item.name.lower()] = sum(
+            int(histogram[value].item())
+            for value in range(256)
+            if value & int(item)
+        )
+    return counts
 
 
 def write_semantic_tdom(
@@ -267,8 +708,9 @@ def write_semantic_tdom(
     manifest: Mapping[str, object],
     config: Optional[SemanticTdomConfig] = None,
 ) -> Path:
-    """Atomically publish one aligned Semantic TDOM product directory."""
+    """Atomically publish one aligned, self-describing Semantic TDOM."""
     config = config or SemanticTdomConfig()
+    write_start = time.perf_counter()
     output_root = Path(output_root)
     output_root.parent.mkdir(parents=True, exist_ok=True)
     staging = output_root.with_name(output_root.name + ".publishing")
@@ -280,49 +722,150 @@ def write_semantic_tdom(
     if backup.exists():
         shutil.rmtree(str(backup))
     staging.mkdir()
-    arrays = {
-        "semantic_id.png": result.class_ids.detach().cpu().numpy().astype(np.uint8),
-        "semantic_color.png": result.colors.permute(1, 2, 0).detach().cpu().numpy().astype(np.uint8),
-        "unknown_mask.png": (result.unknown_mask.detach().cpu().numpy().astype(np.uint8) * 255),
-        "semantic_support.tif": result.absolute_support.detach().cpu().numpy().astype(np.float32),
-        "semantic_entropy.tif": result.entropy.detach().cpu().numpy().astype(np.float32),
-    }
-    formats = {
-        "semantic_id.png": "PNG",
-        "semantic_color.png": "PNG",
-        "unknown_mask.png": "PNG",
-        "semantic_support.tif": "TIFF",
-        "semantic_entropy.tif": "TIFF",
-    }
-    for name, array in arrays.items():
-        path = staging / name
-        temporary = path.with_name(path.name + ".tmp")
-        Image.fromarray(array).save(str(temporary), format=formats[name])
-        os.replace(str(temporary), str(path))
 
-    files = {name: sha256_file(staging / name) for name in arrays}
+    files = {}
+
+    def record(path: Path) -> None:
+        files[path.name] = sha256_file(path)
+
+    class_ids = result.class_ids.detach().cpu().contiguous().numpy()
+    id_path = staging / "semantic_id.png"
+    _save_image_atomic(id_path, class_ids, "PNG")
+    record(id_path)
+
+    palette = np.asarray(
+        [item.color for item in class_spec.classes], dtype=np.uint8
+    )
+    safe_ids = np.minimum(class_ids, class_spec.num_classes - 1)
+    color = palette[safe_ids]
+    color[class_ids == class_spec.ignore_id] = 0
+    color_path = staging / "semantic_color.png"
+    _save_image_atomic(color_path, color, "PNG")
+    record(color_path)
+    del color, safe_ids
+
+    unknown = result.unknown_mask.detach().cpu().contiguous().numpy()
+    unknown_path = staging / "unknown_mask.png"
+    _save_image_atomic(unknown_path, unknown.astype(np.uint8) * 255, "PNG")
+    record(unknown_path)
+    del unknown
+
+    reason = result.unknown_reason.detach().cpu().contiguous()
+    reason_path = staging / "unknown_reason.png"
+    _save_image_atomic(reason_path, reason.numpy(), "PNG")
+    record(reason_path)
+
+    tiff_writer = None
+    diagnostic_tensors = {
+        "semantic_support.tif": result.absolute_support,
+        "semantic_entropy.tif": result.entropy,
+    }
+    if config.save_diagnostics:
+        diagnostic_tensors.update(
+            {
+                "coverage.tif": result.coverage,
+                "support_ratio.tif": result.support_ratio,
+                "top1_probability.tif": result.top1_probability,
+                "margin.tif": result.margin,
+                "mixture_disagreement.tif": result.mixture_disagreement,
+                "group_disagreement.tif": result.group_disagreement,
+                "posterior_variance.tif": result.posterior_variance,
+            }
+        )
+    raster_encodings = {}
+    for name, tensor in diagnostic_tensors.items():
+        path = staging / name
+        array = tensor.detach().cpu().contiguous().numpy()
+        maximum = (
+            math.log(class_spec.num_classes)
+            if name == "semantic_entropy.tif" and class_spec.num_classes > 1
+            else 1.0
+        )
+        encoded, encoding = _encode_diagnostic(
+            array, maximum, config.quantize_diagnostics
+        )
+        tiff_writer = _save_tiff_atomic(path, encoded)
+        raster_encodings[name] = encoding
+        record(path)
+        del array, encoded
+
+    class_spec_path = staging / "class_spec.json"
+    with class_spec_path.open("w", encoding="utf-8") as stream:
+        json.dump(
+            class_spec.to_dict(),
+            stream,
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        )
+        stream.write("\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+    record(class_spec_path)
+
     if config.save_probabilities:
+        if result.probabilities is None:
+            raise ValueError(
+                "save_probabilities requires retained probability values"
+            )
         probability_path = staging / "semantic_probabilities.npy"
         temporary = probability_path.with_name(probability_path.name + ".tmp")
         with temporary.open("wb") as stream:
             np.save(
                 stream,
-                result.probabilities.detach().cpu().numpy().astype(np.float16),
+                result.probabilities.detach().cpu().numpy().astype(
+                    np.float16, copy=False
+                ),
                 allow_pickle=False,
             )
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(str(temporary), str(probability_path))
-        files[probability_path.name] = sha256_file(probability_path)
+        record(probability_path)
 
+    write_seconds = time.perf_counter() - write_start
+    class_counts = torch.bincount(
+        result.class_ids.detach().cpu().long().reshape(-1), minlength=256
+    )
     payload = dict(manifest)
+    render_metrics = dict(result.metrics)
+    render_metrics["product_files_write_and_hash_seconds"] = float(
+        write_seconds
+    )
     payload.update(
         {
-            "schema_version": 1,
+            "schema_version": 2,
             "width": int(result.class_ids.shape[1]),
             "height": int(result.class_ids.shape[0]),
             "class_spec_sha256": class_spec.fingerprint,
+            "class_spec": class_spec.to_dict(),
             "unknown_gate": config.to_dict(),
+            "unknown_reason_bits": {
+                item.name.lower(): int(item) for item in UnknownReason
+            },
+            "uncertainty_definitions": {
+                "semantic_entropy": "categorical entropy in nats; range [0, ln(K)]",
+                "normalized_entropy": "semantic_entropy / ln(K); range [0, 1]",
+                "mixture_disagreement": "weighted E[||mu_g||^2] - ||E[mu_g]||^2",
+                "group_disagreement": "weighted mean trace of per-Gaussian flight-group variance",
+                "posterior_variance": "squared semantic-weight propagation of independent Dirichlet trace variance",
+            },
+            "product_statistics": {
+                "class_pixel_counts": {
+                    str(item.class_id): int(class_counts[item.class_id].item())
+                    for item in class_spec.classes
+                },
+                "unknown_pixel_count": int(
+                    class_counts[class_spec.ignore_id].item()
+                ),
+                "unknown_reason_pixel_counts": _unknown_reason_counts(reason),
+            },
+            "render_metrics": render_metrics,
+            "tiff_writer": tiff_writer,
+            "raster_encodings": raster_encodings,
+            "file_sizes_bytes": {
+                name: int((staging / name).stat().st_size) for name in files
+            },
             "files": files,
         }
     )

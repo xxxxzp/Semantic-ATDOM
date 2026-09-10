@@ -317,13 +317,13 @@ P^{TDOM}_{pk}=\frac{N_{pk}}{U_p+\epsilon}
 
 一个跨越建筑和植被的大高斯必须保留软概率；渲染器先在 TDOM 像素级混合所有可见高斯的概率，再执行 argmax/unknown gate，不得先把每个高斯硬化成置信度更高的类别。
 
-默认产品为与 RGB TDOM 同正射相机、范围、GSD、渲染节奏和地理参考的 `semantic_id`、`semantic_color`、`unknown_mask`、`semantic_support` 和 `semantic_entropy`。完整 \(K\) 通道概率栅格仅作为可选调试/科研输出。具体 gate 阈值尚未校准，必须由配置提供。
+默认产品为与 RGB TDOM 同正射相机、范围、GSD 和渲染节奏的 `semantic_id`、`semantic_color`、`unknown_mask`、`unknown_reason`、`semantic_support` 和独立诊断栅格。完整 \(K\) 通道概率栅格仅作为可选调试/科研输出。具体 gate 阈值尚未校准，必须由配置提供。当前 RGB TDOM 没有 CRS，因此这里只保证像素级配准，不能宣称 GIS 地理参考已经完备。
 
-WP4 使用独立的 forward-only CUDA kernel，在一次 TDOM 几何预处理和一次 alpha-T 遍历中渲染 `K+1` 个线性通道（类别分子与绝对语义支持），不创建 autograd 图，也不写入几何参数。当前 kernel 支持 `K+1 <= 16`，因此本项目的 8 类规范可直接运行。初始化、每个渐进阶段及最终 refinement 的现有 RGB TDOM 触发后，对应语义产品写入 `<Model_Path_Dir>/Semantic_TDOM/stage_<geometry_stage>/<product_key>/`，包含 `semantic_id.png`、`semantic_color.png`、`unknown_mask.png`、表示 \(U_p\) 的 `semantic_support.tif`、`semantic_entropy.tif` 和最后原子发布的 `manifest.json`；`semantic_probabilities.npy` 仅在显式启用时保存。RGB sidecar 与语义 manifest 共享唯一 `product_key`，并记录正射相机矩阵、视场角、范围、请求/实际 GSD、尺寸和显式 CRS（当前旧 RGB 管线未定义 CRS，因此为 `null`）；语义 manifest 另记录几何阶段、语义追踪到的影像、标签版本、几何哈希、类别规范哈希、gate 参数及各文件 SHA256。消费者必须按 `product_key` 配对，不能仅依赖文件序号。
+WP4 使用独立的 forward-only CUDA kernel，在一次 TDOM 几何预处理和一次 alpha-T 遍历中渲染 `K+4` 个通道：类别分子、绝对语义支持、类别均值二阶矩、航片组分歧和 Dirichlet 方差传播项；方差传播项由 kernel 额外按平方后的 alpha-T 语义权重累积。不创建 autograd 图，也不写入几何参数。当前 kernel 支持最多 20 个 feature channels，因此本项目 8 类对应的 12 通道可直接运行。初始化、每个渐进阶段及最终 refinement 的现有 RGB TDOM 触发后，对应语义产品写入 `<Model_Path_Dir>/Semantic_TDOM/stage_<geometry_stage>/<product_key>/`。Schema V2 包含 hard map、unknown 原因、全部标量诊断层、完整 `class_spec.json` 和最后原子发布的 `manifest.json`；`semantic_probabilities.npy` 仅在显式启用时保存。诊断层默认量化为带显式 scale/nodata 元数据的 uint16 tiled lossless-compressed TIFF；量化误差不超过各指标定义域的 \(1/65534\)，也可配置为 float32。RGB sidecar 与语义 manifest 共享唯一 `product_key`，并记录正射相机矩阵、投影平面原点/法向/基向量/角点、视场角、范围、请求/实际 GSD、尺寸和显式 CRS；语义 manifest 另记录几何阶段、语义追踪到的影像、标签版本、几何哈希、类别规范、gate 参数、质量状态、渲染耗时及各文件 SHA256。消费者必须按 `product_key` 配对，不能仅依赖文件序号。
 
-未校准 gate 的暂定默认值为 `coverage=0.05`、`absolute_support=0.01`、`support_ratio=0.05`、`margin=0.05`，只能作为框架运行默认值，不能解释为已验证的精度最优值。它们分别由命令行参数配置，后续必须依据真实场景诊断结果校准。
+未校准 gate 的暂定默认值为 `coverage=0.05`、`absolute_support=0.01`、`support_ratio=0.05`、`margin=0.05`。新增的 Top-1、归一化 entropy 和 group disagreement gate 默认处于兼容模式，不在无真值条件下武断改变 V1 覆盖率；它们全部可由命令行配置，后续必须依据真实场景诊断结果校准。
 
-渲染前按 `H×W×K` 保守估算 forward、归一化中间量、每高斯特征和 CPU 序列化副本，并同时检查实时空闲 CUDA 显存和默认 512 MiB headroom；CUDA 预处理得到真实 `sum(tiles_touched)` 后，还必须在分配 radix-sort/binning buffer 前校验剩余硬预算。默认总预算为 8 GiB，任一检查超限时明确拒绝本次语义产品而不影响 RGB 几何。超大幅面后续应加入分块渲染，不能通过取消预算保护来规避。
+渲染前按实际 feature channels、行带输出、tile finalize 工作集和每高斯状态保守估算显存，并同时检查实时空闲 CUDA 显存和默认 512 MiB headroom；CUDA 预处理得到真实 `sum(tiles_touched)` 后，还必须在分配 radix-sort/binning buffer 前校验剩余硬预算。默认优先一次性渲染；预算不足或显式设置 `render_tile_rows` 时，保持完整相机投影和全局深度顺序，以 16 像素对齐行带精确输出并逐带转移到 CPU。该降级路径会重复 preprocess/binning，优先保证全分辨率结果可生成和逐像素一致性，不使用半分辨率替代。
 
 ## 不确定性输出
 
@@ -343,6 +343,19 @@ V_{gk}=
 - Top-1/Top-2 margin：最终分类决策的稳定程度；
 - 几何覆盖、绝对语义支持和语义支持比例。
 
+令 \(w_{pg}=\kappa_{pg}\rho_g\)，实现中的标量分歧与方差为：
+
+\[
+D_p=\frac{\sum_g w_{pg}\lVert\mu_g\rVert_2^2}{U_p+\epsilon}
+-\lVert P^{TDOM}_p\rVert_2^2
+\]
+
+\[
+V_p=\frac{\sum_g w_{pg}^2\sum_kV_{gk}}{U_p^2+\epsilon}
+\]
+
+航片组分歧将每高斯 `group_variance` 的类别维 trace 按 \(w_{pg}\) 加权平均。三者分别描述像素内高斯意见不同、证据数量导致的后验方差和相关航片组之间的不一致，不能互相冒充。
+
 ## 状态持久化与版本校验
 
 每高斯概率必须存在于运行时，并推荐保存为内部 `semantic_state.pt` sidecar，以支持中断恢复；它不是用户产品。sidecar 至少保存 raw/robust 浓度、group count/variance、support、dirty 状态、开放组暂定增量、label ledger、类别 schema 和配置。
@@ -355,7 +368,7 @@ WP3 通过 `tools/train_progressive.py --enable_semantics` 启用。同步状态
 
 WP5 在最终几何冻结后仅在所有已排序影像标签均就绪且无同步错误时启动：第一遍从空先验投影全部影像并形成使用组内全部视图的精确 G0；第二遍再次投影全部影像，以 leave-one-group-out 共识计算精确 G1。最终状态替换在线近似状态，最终 Semantic TDOM manifest 标记 `posterior=robust_exact_final`；耗时、峰值 CUDA 显存、组数以及在线/最终 JS 偏差和类别一致率写入 `<Model_Path_Dir>/semantic/final_rebuild_metrics.json`。若全量重建失败，保留在线状态并将错误反馈为语义告警，几何结果不受影响。
 
-V1 默认使用 `float32`。scores 使用 mmap/分块读取，只保留当前影像或小批次；不得将全数据 score tensor 一次加载到显存。
+V1 的语义状态、融合和渲染计算默认使用 `float32`；产品诊断栅格可按 manifest 中的比例量化为 uint16。scores 使用 mmap/分块读取，只保留当前影像或小批次；不得将全数据 score tensor 一次加载到显存。
 
 ## 准实时指标
 

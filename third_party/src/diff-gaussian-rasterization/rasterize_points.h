@@ -83,6 +83,28 @@ RasterizeSemanticTdomCUDA(
 	const int64_t max_binning_bytes,
 	const bool debug);
 
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+RasterizeSemanticTdomRegionCUDA(
+	const torch::Tensor& means3D,
+	const torch::Tensor& opacity,
+	const torch::Tensor& scales,
+	const torch::Tensor& rotations,
+	const float scale_modifier,
+	const torch::Tensor& cov3D_precomp,
+	const torch::Tensor& features,
+	const torch::Tensor& viewmatrix,
+	const torch::Tensor& projmatrix,
+	const float tan_fovx,
+	const float tan_fovy,
+	const torch::Tensor& campos,
+	const int image_height,
+	const int image_width,
+	const int output_y_start,
+	const int output_height,
+	const int squared_feature_channel,
+	const int64_t max_binning_bytes,
+	const bool debug);
+
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 RasterizeGaussiansBackwardCUDA(
  	const torch::Tensor& background,

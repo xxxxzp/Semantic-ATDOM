@@ -964,6 +964,21 @@ class GaussianTrainer(mp.Process):
                 ),
                 min_support_ratio=self.args.semantic_tdom_min_support_ratio,
                 min_margin=self.args.semantic_tdom_min_margin,
+                min_top1_probability=(
+                    self.args.semantic_tdom_min_top1_probability
+                ),
+                max_normalized_entropy=(
+                    self.args.semantic_tdom_max_normalized_entropy
+                ),
+                max_group_disagreement=(
+                    self.args.semantic_tdom_max_group_disagreement
+                ),
+                render_tile_rows=(
+                    self.args.semantic_tdom_render_tile_rows
+                ),
+                finalize_tile_rows=(
+                    self.args.semantic_tdom_finalize_tile_rows
+                ),
                 save_probabilities=(
                     self.args.semantic_tdom_save_probabilities
                 ),
@@ -1507,10 +1522,30 @@ class GaussianTrainer(mp.Process):
                     "extent": {
                         "width_world": float(rectangle["width"]),
                         "height_world": float(rectangle["height"]),
-                        "center_world": [
+                        "center_plane_coordinates": [
                             float(item)
                             for item in rectangle["Gaussians_center"]
                         ],
+                        "projection_plane_center_world": rectangle["center"]
+                        .detach()
+                        .cpu()
+                        .tolist(),
+                        "projection_plane_normal_world": rectangle["normal"]
+                        .detach()
+                        .cpu()
+                        .tolist(),
+                        "projection_plane_u_world": rectangle["u"]
+                        .detach()
+                        .cpu()
+                        .tolist(),
+                        "projection_plane_v_world": rectangle["v"]
+                        .detach()
+                        .cpu()
+                        .tolist(),
+                        "projection_plane_corners_world": rectangle["corners"]
+                        .detach()
+                        .cpu()
+                        .tolist(),
                     },
                     "requested_gsd": {
                         "x": float(self.GSD_x),
@@ -1526,11 +1561,22 @@ class GaussianTrainer(mp.Process):
                 }
 
                 TDOM = render(self.TDOM_Cam, self.gaussians, self.TDOM_pipeline, self.background, Render_Mask=torch.ones(1, dtype=torch.bool).cuda(), TDOM=True)["render"]
+                tdom_min = TDOM.min()
+                tdom_range = (TDOM.max() - tdom_min).clamp_min(1e-8)
+                TDOM_output = (
+                    ((TDOM - tdom_min) / tdom_range)
+                    .permute(1, 2, 0)
+                    .mul(255)
+                    .to(dtype=torch.uint8)
+                    .cpu()
+                    .numpy()
+                )
+                del TDOM
 
                 time2 = time.time()
                 print(f"Time cost of TDOM rendering: {time2 - time1}s")
                 self.DataSaver_queue.put(
-                    ["SaveTDOM", TDOM, self.TDOM_alignment]
+                    ["SaveTDOM", TDOM_output, self.TDOM_alignment]
                 )
 
     # 对当前高斯模型进行一次评估
@@ -1940,9 +1986,23 @@ class DataSaver(mp.Process):
         with torch.no_grad():
             # rendering_filepath = os.path.join(self.Intermediate_TDOM_Render_Path, f"{self.SaveTDOMNumber}.jpg")
             # torchvision.utils.save_image(tdom, rendering_filepath)
-            ImageOutput = (tdom - tdom.min()) / (tdom.max() - tdom.min())
-            ImageOutput = ImageOutput.permute(1, 2, 0).cpu().numpy()
-            ImageOutput = (ImageOutput * 255).astype(np.uint8)
+            if isinstance(tdom, torch.Tensor):
+                minimum = tdom.min()
+                value_range = (tdom.max() - minimum).clamp_min(1e-8)
+                ImageOutput = (
+                    ((tdom - minimum) / value_range)
+                    .permute(1, 2, 0)
+                    .mul(255)
+                    .to(dtype=torch.uint8)
+                    .cpu()
+                    .numpy()
+                )
+            else:
+                ImageOutput = np.asarray(tdom)
+                if ImageOutput.ndim != 3 or ImageOutput.shape[2] != 3:
+                    raise ValueError("TDOM output must have shape [H, W, 3]")
+                if ImageOutput.dtype != np.uint8:
+                    raise ValueError("preconverted TDOM output must be uint8")
             height, width = ImageOutput.shape[:2]
             if self.MaxTDOMWidth < width:
                 self.MaxTDOMWidth = width

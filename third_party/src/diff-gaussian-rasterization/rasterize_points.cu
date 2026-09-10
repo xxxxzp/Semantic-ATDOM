@@ -320,8 +320,8 @@ RasterizeSemanticObservationCUDA(
 	return std::make_tuple(evidence, all_mass, valid_mass, radii, dense);
 }
 
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
-RasterizeSemanticTdomCUDA(
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+RasterizeSemanticTdomRegionCUDA(
 	const torch::Tensor& means3D,
 	const torch::Tensor& opacity,
 	const torch::Tensor& scales,
@@ -336,6 +336,9 @@ RasterizeSemanticTdomCUDA(
 	const torch::Tensor& campos,
 	const int image_height,
 	const int image_width,
+	const int output_y_start,
+	const int output_height,
+	const int squared_feature_channel,
 	const int64_t max_binning_bytes,
 	const bool debug)
 {
@@ -354,10 +357,18 @@ RasterizeSemanticTdomCUDA(
 		features.size(0) == P && features.device() == device,
 		"features must be contiguous CUDA float32 with shape [N, C]");
 	const int num_channels = features.size(1);
-	TORCH_CHECK(num_channels >= 1 && num_channels <= 16,
-		"semantic TDOM supports 1..16 feature channels");
+	TORCH_CHECK(num_channels >= 1 && num_channels <= 20,
+		"semantic TDOM supports 1..20 feature channels");
 	TORCH_CHECK(image_height > 0 && image_width > 0,
 		"semantic TDOM dimensions must be positive");
+	TORCH_CHECK(output_y_start >= 0 && output_height > 0 &&
+		output_y_start + output_height <= image_height,
+		"semantic TDOM output rows must be inside the full image");
+	TORCH_CHECK(output_y_start % BLOCK_Y == 0,
+		"semantic TDOM output_y_start must align to BLOCK_Y");
+	TORCH_CHECK(squared_feature_channel >= -1 &&
+		squared_feature_channel < num_channels,
+		"squared_feature_channel must be -1 or a valid feature channel");
 	TORCH_CHECK(max_binning_bytes >= 0,
 		"semantic TDOM binning byte budget must be non-negative");
 	TORCH_CHECK(tan_fovx > 0.0f && tan_fovy > 0.0f && scale_modifier > 0.0f,
@@ -400,14 +411,15 @@ RasterizeSemanticTdomCUDA(
 
 	auto float_opts = means3D.options().dtype(torch::kFloat32);
 	torch::Tensor rendered_features = torch::zeros(
-		{num_channels, image_height, image_width}, float_opts);
+		{num_channels, output_height, image_width}, float_opts);
 	torch::Tensor coverage = torch::zeros(
-		{image_height, image_width}, float_opts);
+		{output_height, image_width}, float_opts);
+	torch::Tensor squared_moment = torch::zeros(
+		{output_height, image_width}, float_opts);
 	torch::Tensor radii = torch::zeros(
 		{P}, means3D.options().dtype(torch::kInt32));
 	if (P != 0)
 	{
-		torch::Tensor dummy_colors = torch::zeros({P, 3}, float_opts);
 		auto byte_opts = means3D.options().dtype(torch::kUInt8);
 		torch::Tensor geomBuffer = torch::empty({0}, byte_opts);
 		torch::Tensor binningBuffer = torch::empty({0}, byte_opts);
@@ -419,7 +431,7 @@ RasterizeSemanticTdomCUDA(
 			geomFunc, binningFunc, imgFunc,
 			P, image_width, image_height,
 			means3D.data_ptr<float>(),
-			dummy_colors.data_ptr<float>(),
+			features.data_ptr<float>(),
 			opacity.data_ptr<float>(),
 			use_covariance ? nullptr : scales.data_ptr<float>(),
 			scale_modifier,
@@ -431,13 +443,62 @@ RasterizeSemanticTdomCUDA(
 			tan_fovx, tan_fovy,
 			features.data_ptr<float>(),
 			num_channels,
+			output_y_start,
+			output_height,
+			squared_feature_channel,
 			rendered_features.data_ptr<float>(),
 			coverage.data_ptr<float>(),
+			squared_feature_channel >= 0
+				? squared_moment.data_ptr<float>() : nullptr,
 			radii.data_ptr<int>(),
 			static_cast<size_t>(max_binning_bytes),
 			debug);
 	}
-	return std::make_tuple(rendered_features, coverage, radii);
+	return std::make_tuple(
+		rendered_features, coverage, radii, squared_moment);
+}
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
+RasterizeSemanticTdomCUDA(
+	const torch::Tensor& means3D,
+	const torch::Tensor& opacity,
+	const torch::Tensor& scales,
+	const torch::Tensor& rotations,
+	const float scale_modifier,
+	const torch::Tensor& cov3D_precomp,
+	const torch::Tensor& features,
+	const torch::Tensor& viewmatrix,
+	const torch::Tensor& projmatrix,
+	const float tan_fovx,
+	const float tan_fovy,
+	const torch::Tensor& campos,
+	const int image_height,
+	const int image_width,
+	const int64_t max_binning_bytes,
+	const bool debug)
+{
+	auto result = RasterizeSemanticTdomRegionCUDA(
+		means3D,
+		opacity,
+		scales,
+		rotations,
+		scale_modifier,
+		cov3D_precomp,
+		features,
+		viewmatrix,
+		projmatrix,
+		tan_fovx,
+		tan_fovy,
+		campos,
+		image_height,
+		image_width,
+		0,
+		image_height,
+		-1,
+		max_binning_bytes,
+		debug);
+	return std::make_tuple(
+		std::get<0>(result), std::get<1>(result), std::get<2>(result));
 }
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>

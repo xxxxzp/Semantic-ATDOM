@@ -61,6 +61,9 @@ _GEOMETRY_ATTRIBUTE_NAMES = (
 
 
 def _geometry_attributes(gaussians) -> Dict[str, torch.Tensor]:
+    cached = getattr(gaussians, "geometry_attributes_cpu", None)
+    if callable(cached):
+        return cached()
     if hasattr(gaussians, "_values"):
         source = gaussians._values
         return {
@@ -238,6 +241,8 @@ class FrozenGaussianSnapshot:
             name: getattr(gaussians, "_" + name).detach().clone()
             for name in self._ATTRIBUTE_NAMES
         }
+        self._cpu_values = None
+        self._geometry_hash = None
 
     @property
     def get_xyz(self):
@@ -256,7 +261,19 @@ class FrozenGaussianSnapshot:
         return torch.nn.functional.normalize(self._values["rotation"])
 
     def geometry_sha256(self) -> str:
-        return _geometry_attributes_sha256(self._values)
+        if self._geometry_hash is None:
+            self._geometry_hash = _geometry_attributes_sha256(
+                self.geometry_attributes_cpu()
+            )
+        return self._geometry_hash
+
+    def geometry_attributes_cpu(self) -> Dict[str, torch.Tensor]:
+        if self._cpu_values is None:
+            self._cpu_values = {
+                name: value.detach().cpu().contiguous()
+                for name, value in self._values.items()
+            }
+        return self._cpu_values
 
 
 class FrozenCameraSnapshot:
@@ -1041,6 +1058,30 @@ class ProgressiveSemanticHook:
                             if exact_rebuilt
                             else "robust_online"
                         ),
+                        "semantic_quality": {
+                            "final_requested": bool(final),
+                            "exact_rebuild_succeeded": bool(exact_rebuilt),
+                            "status": (
+                                "exact_final"
+                                if exact_rebuilt
+                                else (
+                                    "online_fallback"
+                                    if final
+                                    else "online"
+                                )
+                            ),
+                            "deferred_image_ids": list(deferred),
+                            "errors_before_tdom": list(errors),
+                            "gaussian_ids_sha256": (
+                                self.orchestrator.state.gaussian_ids_sha256
+                            ),
+                            "topology_version": int(
+                                self.orchestrator.state.topology_version
+                            ),
+                            "num_gaussians": int(
+                                self.orchestrator.state.num_gaussians
+                            ),
+                        },
                         "alignment": _tdom_alignment(
                             tdom_camera, tdom_alignment
                         ),

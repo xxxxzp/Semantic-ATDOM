@@ -44,6 +44,22 @@ namespace CudaRasterizer
 		static GeometryState fromChunk(char*& chunk, size_t P);
 	};
 
+	// Forward-only Semantic TDOM needs only projection/binning attributes.
+	// Keeping this separate avoids allocating RGB, depth-map and backward state.
+	struct SemanticGeometryState
+	{
+		size_t scan_size;
+		float* depths;
+		char* scanning_space;
+		float2* means2D;
+		float* cov3D;
+		float4* conic_opacity;
+		uint32_t* point_offsets;
+		uint32_t* tiles_touched;
+
+		static SemanticGeometryState fromChunk(char*& chunk, size_t P);
+	};
+
 	struct ImageState
 	{
 		uint32_t *bucket_count;
@@ -60,6 +76,14 @@ namespace CudaRasterizer
 		char* contrib_scan;
 
 		static ImageState fromChunk(char*& chunk, size_t N);
+	};
+
+	// Semantic compositing only reads one range per screen-space tile.
+	struct SemanticImageState
+	{
+		uint2* ranges;
+
+		static SemanticImageState fromChunk(char*& chunk, size_t tile_count);
 	};
 
 	struct BinningState

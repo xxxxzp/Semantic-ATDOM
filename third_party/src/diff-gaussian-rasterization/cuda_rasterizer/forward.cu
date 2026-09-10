@@ -897,7 +897,7 @@ void FORWARD::semanticObservation(
 
 namespace
 {
-constexpr int MAX_SEMANTIC_TDOM_CHANNELS = 16;
+constexpr int MAX_SEMANTIC_TDOM_CHANNELS = 20;
 
 __global__ void __launch_bounds__(BLOCK_X * BLOCK_Y)
 semanticTdomCUDA(
@@ -908,25 +908,34 @@ semanticTdomCUDA(
 	const float4* __restrict__ conic_opacity,
 	const float* __restrict__ features,
 	int num_channels,
+	int output_y_start,
+	int output_height,
+	int squared_feature_channel,
 	float* __restrict__ rendered_features,
-	float* __restrict__ coverage)
+	float* __restrict__ coverage,
+	float* __restrict__ squared_moment)
 {
 	auto block = cg::this_thread_block();
 	const uint32_t horizontal_blocks = (W + BLOCK_X - 1) / BLOCK_X;
+	const uint32_t output_block_y = output_y_start / BLOCK_Y;
+	const uint32_t global_block_y =
+		block.group_index().y + output_block_y;
 	const uint2 pix_min = {
 		block.group_index().x * BLOCK_X,
-		block.group_index().y * BLOCK_Y
+		global_block_y * BLOCK_Y
 	};
 	const uint2 pix = {
 		pix_min.x + block.thread_index().x,
 		pix_min.y + block.thread_index().y
 	};
-	const bool inside = pix.x < W && pix.y < H;
+	const bool inside = pix.x < W && pix.y < H &&
+		pix.y >= output_y_start &&
+		pix.y < output_y_start + output_height;
 	bool done = !inside;
-	const uint32_t pix_id = W * pix.y + pix.x;
+	const uint32_t pix_id = W * (pix.y - output_y_start) + pix.x;
 	const float2 pixf = {(float)pix.x, (float)pix.y};
 	const uint32_t tile_id =
-		block.group_index().y * horizontal_blocks + block.group_index().x;
+		global_block_y * horizontal_blocks + block.group_index().x;
 	const uint2 range = ranges[tile_id];
 	const int rounds = (range.y - range.x + BLOCK_SIZE - 1) / BLOCK_SIZE;
 	int toDo = range.y - range.x;
@@ -936,6 +945,7 @@ semanticTdomCUDA(
 	__shared__ float4 collected_conic_opacity[BLOCK_SIZE];
 
 	float accumulated[MAX_SEMANTIC_TDOM_CHANNELS] = {0.0f};
+	float accumulated_squared_moment = 0.0f;
 	float T = 1.0f;
 	for (int i = 0; i < rounds; i++, toDo -= BLOCK_SIZE)
 	{
@@ -978,15 +988,24 @@ semanticTdomCUDA(
 				accumulated[channel] +=
 					features[gaussian_id * num_channels + channel]
 					* contribution;
+			if (squared_feature_channel >= 0)
+			{
+				const float value = features[
+					gaussian_id * num_channels + squared_feature_channel];
+				accumulated_squared_moment +=
+					value * contribution * contribution;
+			}
 			T = test_T;
 		}
 	}
 	if (inside)
 	{
 		for (int channel = 0; channel < num_channels; channel++)
-			rendered_features[channel * H * W + pix_id] =
+			rendered_features[channel * output_height * W + pix_id] =
 				accumulated[channel];
 		coverage[pix_id] = 1.0f - T;
+		if (squared_moment != nullptr)
+			squared_moment[pix_id] = accumulated_squared_moment;
 	}
 }
 }
@@ -1000,8 +1019,12 @@ void FORWARD::semanticTdom(
 	const float4* conic_opacity,
 	const float* features,
 	int num_channels,
+	int output_y_start,
+	int output_height,
+	int squared_feature_channel,
 	float* rendered_features,
-	float* coverage)
+	float* coverage,
+	float* squared_moment)
 {
 	semanticTdomCUDA<<<grid, block>>>(
 		ranges,
@@ -1012,8 +1035,12 @@ void FORWARD::semanticTdom(
 		conic_opacity,
 		features,
 		num_channels,
+		output_y_start,
+		output_height,
+		squared_feature_channel,
 		rendered_features,
-		coverage);
+		coverage,
+		squared_moment);
 }
 
 void FORWARD::preprocess(int P, int D, int M,

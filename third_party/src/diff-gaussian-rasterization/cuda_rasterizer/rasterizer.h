@@ -115,8 +115,12 @@ namespace CudaRasterizer
 			const float tan_fovy,
 			const float* features,
 			const int num_channels,
+			const int output_y_start,
+			const int output_height,
+			const int squared_feature_channel,
 			float* rendered_features,
 			float* coverage,
+			float* squared_moment,
 			int* radii,
 			const size_t max_binning_bytes,
 			bool debug = false);

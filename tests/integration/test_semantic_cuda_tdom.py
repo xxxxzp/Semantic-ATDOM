@@ -31,6 +31,19 @@ except (ImportError, OSError):
     "requires CUDA and the rebuilt Semantic TDOM rasterizer",
 )
 class SemanticCudaTdomTests(unittest.TestCase):
+    @staticmethod
+    def _two_class_spec():
+        return SemanticClassSpec.from_dict(
+            {
+                "schema_version": 1,
+                "ignore_id": 255,
+                "classes": [
+                    {"id": 0, "name": "ground", "color": [0, 0, 0]},
+                    {"id": 1, "name": "building", "color": [255, 0, 0]},
+                ],
+            }
+        )
+
     def test_high_level_renderer_enforces_memory_budget(self):
         class Gaussians:
             get_xyz = torch.zeros((1, 3), dtype=torch.float32, device="cuda")
@@ -42,16 +55,7 @@ class SemanticCudaTdomTests(unittest.TestCase):
                 device="cuda",
             )
 
-        spec = SemanticClassSpec.from_dict(
-            {
-                "schema_version": 1,
-                "ignore_id": 255,
-                "classes": [
-                    {"id": 0, "name": "ground", "color": [0, 0, 0]},
-                    {"id": 1, "name": "building", "color": [255, 0, 0]},
-                ],
-            }
-        )
+        spec = self._two_class_spec()
         camera = DummyCamera(
             np.eye(3, dtype=np.float32),
             np.zeros(3, dtype=np.float32),
@@ -67,6 +71,71 @@ class SemanticCudaTdomTests(unittest.TestCase):
                 camera,
                 spec,
                 config=SemanticTdomConfig(max_output_bytes=1),
+            )
+
+    def test_high_level_exact_stripes_match_full_frame(self):
+        class Gaussians:
+            get_xyz = torch.tensor(
+                [[0.0, 0.0, 1.0], [0.1, 0.0, 2.0]],
+                dtype=torch.float32,
+                device="cuda",
+            )
+            get_opacity = torch.tensor(
+                [[0.5], [0.5]], dtype=torch.float32, device="cuda"
+            )
+            get_scaling = torch.tensor(
+                [[0.2, 0.2, 0.2], [0.2, 0.2, 0.2]],
+                dtype=torch.float32,
+                device="cuda",
+            )
+            get_rotation = torch.tensor(
+                [[1.0, 0.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0]],
+                dtype=torch.float32,
+                device="cuda",
+            )
+
+        camera = DummyCamera(
+            np.eye(3, dtype=np.float32),
+            np.zeros(3, dtype=np.float32),
+            1.0,
+            1.0,
+            16,
+            32,
+        )
+        state = SemanticGaussianState.initialize(2, 2, device="cuda")
+        state.add_evidence(
+            torch.tensor([[4.0, 1.0], [1.0, 4.0]], device="cuda")
+        )
+        full = rasterize_semantic_tdom(
+            Gaussians(),
+            state,
+            camera,
+            self._two_class_spec(),
+            config=SemanticTdomConfig(min_free_cuda_bytes=0),
+        )
+        striped = rasterize_semantic_tdom(
+            Gaussians(),
+            state,
+            camera,
+            self._two_class_spec(),
+            config=SemanticTdomConfig(
+                render_tile_rows=16, min_free_cuda_bytes=0
+            ),
+        )
+
+        self.assertEqual(full.metrics["render_mode"], "full_frame")
+        self.assertEqual(striped.metrics["render_mode"], "exact_striped")
+        torch.testing.assert_close(striped.class_ids, full.class_ids)
+        for name in (
+            "coverage",
+            "absolute_support",
+            "entropy",
+            "mixture_disagreement",
+            "group_disagreement",
+            "posterior_variance",
+        ):
+            torch.testing.assert_close(
+                getattr(striped, name), getattr(full, name), equal_nan=True
             )
 
     def _empty_call(self, channels):
@@ -99,7 +168,7 @@ class SemanticCudaTdomTests(unittest.TestCase):
             1.0,
             1.0,
             16,
-            16,
+            32,
         )
         means = torch.tensor(
             [[0.0, 0.0, 1.0], [0.1, 0.0, 2.0]],
@@ -179,6 +248,33 @@ class SemanticCudaTdomTests(unittest.TestCase):
         torch.testing.assert_close(radii, rgb_radii)
         self.assertFalse(semantic.requires_grad)
 
+        tile_arguments = (
+            means,
+            opacity,
+            scales,
+            rotations,
+            1.0,
+            empty,
+            features,
+            camera.world_view_transform.contiguous(),
+            camera.full_proj_transform.contiguous(),
+            float(torch.tan(torch.tensor(camera.FoVx * 0.5))),
+            float(torch.tan(torch.tensor(camera.FoVy * 0.5))),
+            camera.camera_center.contiguous(),
+            camera.image_height,
+            camera.image_width,
+        )
+        first, first_coverage, _, _ = _C.semantic_tdom_tile(
+            *tile_arguments, 0, 16, -1, 1 << 60, True
+        )
+        second, second_coverage, _, _ = _C.semantic_tdom_tile(
+            *tile_arguments, 16, 16, -1, 1 << 60, True
+        )
+        torch.testing.assert_close(torch.cat((first, second), dim=1), semantic)
+        torch.testing.assert_close(
+            torch.cat((first_coverage, second_coverage), dim=0), coverage
+        )
+
         with self.assertRaisesRegex(RuntimeError, "binning buffer"):
             _C.semantic_tdom(
                 means,
@@ -199,6 +295,50 @@ class SemanticCudaTdomTests(unittest.TestCase):
                 True,
             )
 
+    def test_squared_semantic_moment_uses_squared_alpha_t_weight(self):
+        device = torch.device("cuda")
+        camera = DummyCamera(
+            np.eye(3, dtype=np.float32),
+            np.zeros(3, dtype=np.float32),
+            1.0,
+            1.0,
+            16,
+            16,
+        )
+        means = torch.tensor([[0.0, 0.0, 1.0]], device=device)
+        opacity = torch.tensor([[0.5]], device=device)
+        scales = torch.tensor([[0.2, 0.2, 0.2]], device=device)
+        rotations = torch.tensor(
+            [[1.0, 0.0, 0.0, 0.0]], device=device
+        )
+        features = torch.tensor([[0.7, 0.3]], device=device)
+        empty = torch.empty(0, dtype=torch.float32, device=device)
+        _, coverage, _, squared = _C.semantic_tdom_tile(
+            means,
+            opacity,
+            scales,
+            rotations,
+            1.0,
+            empty,
+            features,
+            camera.world_view_transform.contiguous(),
+            camera.full_proj_transform.contiguous(),
+            float(torch.tan(torch.tensor(camera.FoVx * 0.5))),
+            float(torch.tan(torch.tensor(camera.FoVy * 0.5))),
+            camera.camera_center.contiguous(),
+            camera.image_height,
+            camera.image_width,
+            0,
+            camera.image_height,
+            0,
+            1 << 60,
+            True,
+        )
+
+        torch.testing.assert_close(
+            squared, 0.7 * coverage.square(), rtol=1e-5, atol=1e-6
+        )
+
     def test_empty_geometry_returns_unknown_ready_zero_maps(self):
         rendered, coverage, radii = self._empty_call(4)
         self.assertEqual(tuple(rendered.shape), (4, 3, 5))
@@ -207,14 +347,14 @@ class SemanticCudaTdomTests(unittest.TestCase):
         self.assertEqual(float(rendered.sum()), 0.0)
 
     def test_channel_boundaries_cover_current_and_maximum_class_counts(self):
-        for channels in (9, 16):
+        for channels in (9, 16, 20):
             rendered, coverage, _ = self._empty_call(channels)
             self.assertEqual(tuple(rendered.shape), (channels, 3, 5))
             self.assertEqual(tuple(coverage.shape), (3, 5))
 
-    def test_more_than_sixteen_channels_is_rejected(self):
-        with self.assertRaisesRegex(RuntimeError, "1..16"):
-            self._empty_call(17)
+    def test_more_than_twenty_channels_is_rejected(self):
+        with self.assertRaisesRegex(RuntimeError, "1..20"):
+            self._empty_call(21)
 
 
 if __name__ == "__main__":

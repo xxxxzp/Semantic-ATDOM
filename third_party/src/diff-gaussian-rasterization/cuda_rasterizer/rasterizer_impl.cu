@@ -265,6 +265,20 @@ CudaRasterizer::GeometryState CudaRasterizer::GeometryState::fromChunk(char*& ch
 	return geom;
 }
 
+CudaRasterizer::SemanticGeometryState CudaRasterizer::SemanticGeometryState::fromChunk(char*& chunk, size_t P)
+{
+	SemanticGeometryState geom;
+	obtain(chunk, geom.depths, P, 128);
+	obtain(chunk, geom.means2D, P, 128);
+	obtain(chunk, geom.cov3D, P * 6, 128);
+	obtain(chunk, geom.conic_opacity, P, 128);
+	obtain(chunk, geom.tiles_touched, P, 128);
+	cub::DeviceScan::InclusiveSum(nullptr, geom.scan_size, geom.tiles_touched, geom.tiles_touched, P);
+	obtain(chunk, geom.scanning_space, geom.scan_size, 128);
+	obtain(chunk, geom.point_offsets, P, 128);
+	return geom;
+}
+
 CudaRasterizer::ImageState CudaRasterizer::ImageState::fromChunk(char*& chunk, size_t N)
 {
 	ImageState img;
@@ -283,6 +297,13 @@ CudaRasterizer::ImageState CudaRasterizer::ImageState::fromChunk(char*& chunk, s
 	cub::DeviceScan::InclusiveSum(nullptr, img.bucket_count_scan_size, img.bucket_count, img.bucket_count, N);
 	obtain(chunk, img.bucket_count_scanning_space, img.bucket_count_scan_size, 128);
 
+	return img;
+}
+
+CudaRasterizer::SemanticImageState CudaRasterizer::SemanticImageState::fromChunk(char*& chunk, size_t tile_count)
+{
+	SemanticImageState img;
+	obtain(chunk, img.ranges, tile_count, 128);
 	return img;
 }
 
@@ -726,8 +747,12 @@ int CudaRasterizer::Rasterizer::semanticTdom(
 	const float tan_fovy,
 	const float* features,
 	const int num_channels,
+	const int output_y_start,
+	const int output_height,
+	const int squared_feature_channel,
 	float* rendered_features,
 	float* coverage,
+	float* squared_moment,
 	int* radii,
 	const size_t max_binning_bytes,
 	bool debug)
@@ -735,9 +760,10 @@ int CudaRasterizer::Rasterizer::semanticTdom(
 	const float focal_y = height / (2.0f * tan_fovy);
 	const float focal_x = width / (2.0f * tan_fovx);
 
-	size_t chunk_size = required<GeometryState>(P);
+	size_t chunk_size = required<SemanticGeometryState>(P);
 	char* chunkptr = geometryBuffer(chunk_size);
-	GeometryState geomState = GeometryState::fromChunk(chunkptr, P);
+	SemanticGeometryState geomState =
+		SemanticGeometryState::fromChunk(chunkptr, P);
 
 	dim3 tile_grid(
 		(width + BLOCK_X - 1) / BLOCK_X,
@@ -745,9 +771,11 @@ int CudaRasterizer::Rasterizer::semanticTdom(
 		1);
 	dim3 block(BLOCK_X, BLOCK_Y, 1);
 
-	size_t img_chunk_size = required<ImageState>(width * height);
+	const size_t tile_count = tile_grid.x * tile_grid.y;
+	size_t img_chunk_size = required<SemanticImageState>(tile_count);
 	char* img_chunkptr = imageBuffer(img_chunk_size);
-	ImageState imgState = ImageState::fromChunk(img_chunkptr, width * height);
+	SemanticImageState imgState =
+		SemanticImageState::fromChunk(img_chunkptr, tile_count);
 
 	CHECK_CUDA(FORWARD::preprocess_TDOM(
 		P, 0, 0,
@@ -758,7 +786,7 @@ int CudaRasterizer::Rasterizer::semanticTdom(
 		opacities,
 		nullptr,
 		nullptr,
-		geomState.clamped,
+		nullptr,
 		cov3D_precomp,
 		dummy_colors,
 		viewmatrix,
@@ -774,8 +802,8 @@ int CudaRasterizer::Rasterizer::semanticTdom(
 		geomState.means2D,
 		geomState.depths,
 		geomState.cov3D,
-		geomState.rgb,
-		geomState.GaussianDepth,
+		nullptr,
+		nullptr,
 		geomState.conic_opacity,
 		tile_grid,
 		geomState.tiles_touched,
@@ -835,7 +863,7 @@ int CudaRasterizer::Rasterizer::semanticTdom(
 	CHECK_CUDA(cudaMemset(
 		imgState.ranges,
 		0,
-		tile_grid.x * tile_grid.y * sizeof(uint2)), debug)
+		tile_count * sizeof(uint2)), debug)
 	if (num_rendered > 0)
 		identifyTileRanges<<<(num_rendered + 255) / 256, 256>>>(
 			num_rendered,
@@ -843,8 +871,12 @@ int CudaRasterizer::Rasterizer::semanticTdom(
 			imgState.ranges);
 	CHECK_CUDA(, debug)
 
+	dim3 output_grid(
+		tile_grid.x,
+		(output_height + BLOCK_Y - 1) / BLOCK_Y,
+		1);
 	CHECK_CUDA(FORWARD::semanticTdom(
-		tile_grid,
+		output_grid,
 		block,
 		imgState.ranges,
 		binningState.point_list,
@@ -854,8 +886,12 @@ int CudaRasterizer::Rasterizer::semanticTdom(
 		geomState.conic_opacity,
 		features,
 		num_channels,
+		output_y_start,
+		output_height,
+		squared_feature_channel,
 		rendered_features,
-		coverage), debug)
+		coverage,
+		squared_moment), debug)
 
 	return num_rendered;
 }

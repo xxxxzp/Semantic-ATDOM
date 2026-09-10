@@ -119,6 +119,45 @@ def _empty_uncertainty(reference: torch.Tensor) -> torch.Tensor:
     return torch.full_like(reference, float("nan"))
 
 
+def _semantic_render_features(
+    semantic_state,
+    device: torch.device,
+    use_robust: bool,
+    eps: float,
+) -> torch.Tensor:
+    """Build the K+4 per-Gaussian values consumed by the CUDA renderer."""
+    alpha = semantic_state.alpha_robust if use_robust else semantic_state.alpha_raw
+    alpha = alpha.detach().to(device=device, dtype=torch.float32)
+    concentration = alpha.sum(dim=1)
+    means = alpha / (concentration.unsqueeze(1) + eps)
+    evidence_ratio = (
+        (concentration - semantic_state.prior_total)
+        / (concentration + eps)
+    ).clamp(min=0.0, max=1.0)
+    probability_second_moment = means.square().sum(dim=1)
+    # Squared distance between two categorical distributions can reach 2
+    # (opposite one-hot vectors), so the flight-group trace must retain [0, 2].
+    group_disagreement = semantic_state.group_variance.detach().to(
+        device=device, dtype=torch.float32
+    ).sum(dim=1).clamp(min=0.0, max=2.0)
+    posterior_variance = (
+        (1.0 - probability_second_moment).clamp_min(0.0)
+        / (concentration + 1.0)
+    )
+    auxiliary = torch.stack(
+        (
+            evidence_ratio,
+            evidence_ratio * probability_second_moment,
+            evidence_ratio * group_disagreement,
+            evidence_ratio.square() * posterior_variance,
+        ),
+        dim=1,
+    )
+    return torch.cat(
+        (means * evidence_ratio.unsqueeze(1), auxiliary), dim=1
+    ).contiguous()
+
+
 def finalize_semantic_tdom(
     rendered_features: torch.Tensor,
     coverage: torch.Tensor,
@@ -486,34 +525,12 @@ def rasterize_semantic_tdom(
         - finalize_bytes - feature_channels * render_pixel_count * 4,
     )
 
-    alpha = semantic_state.alpha_robust if use_robust else semantic_state.alpha_raw
-    alpha = alpha.detach().to(device=means3d.device, dtype=torch.float32)
-    concentration = alpha.sum(dim=1)
-    means = alpha / (concentration.unsqueeze(1) + config.eps)
-    evidence_ratio = (
-        (concentration - semantic_state.prior_total)
-        / (concentration + config.eps)
-    ).clamp(min=0.0, max=1.0)
-    probability_second_moment = means.square().sum(dim=1)
-    group_disagreement = semantic_state.group_variance.detach().to(
-        device=means3d.device, dtype=torch.float32
-    ).sum(dim=1).clamp(min=0.0, max=1.0)
-    posterior_variance = (
-        (1.0 - probability_second_moment).clamp_min(0.0)
-        / (concentration + 1.0)
+    features = _semantic_render_features(
+        semantic_state,
+        device=means3d.device,
+        use_robust=use_robust,
+        eps=config.eps,
     )
-    auxiliary = torch.stack(
-        (
-            evidence_ratio,
-            evidence_ratio * probability_second_moment,
-            evidence_ratio * group_disagreement,
-            evidence_ratio.square() * posterior_variance,
-        ),
-        dim=1,
-    )
-    features = torch.cat(
-        (means * evidence_ratio.unsqueeze(1), auxiliary), dim=1
-    ).contiguous()
     opacities = gaussians.get_opacity.detach().to(dtype=torch.float32).contiguous()
     scales = gaussians.get_scaling.detach().to(dtype=torch.float32).contiguous()
     rotations = gaussians.get_rotation.detach().to(dtype=torch.float32).contiguous()
@@ -642,7 +659,7 @@ def rasterize_semantic_tdom(
         "feature_channels": int(feature_channels),
         "finalize_tile_rows": int(config.finalize_tile_rows),
     }
-    del features, means, auxiliary
+    del features
     with torch.cuda.device(means3d.device):
         allocated_after_finalize = torch.cuda.memory_allocated()
     updated_metrics = dict(metrics)

@@ -9,9 +9,11 @@ from semantic_atdom.semantics.schema import SemanticClassSpec, sha256_file
 from semantic_atdom.semantics.tdom import (
     SemanticTdomConfig,
     UnknownReason,
+    _semantic_render_features,
     finalize_semantic_tdom,
     write_semantic_tdom,
 )
+from semantic_atdom.semantics.state import SemanticGaussianState
 
 
 CLASS_SPEC = SemanticClassSpec.from_dict(
@@ -136,6 +138,22 @@ class SemanticTdomTests(unittest.TestCase):
         )
         torch.testing.assert_close(
             result.group_disagreement, torch.tensor([[1.60]])
+        )
+
+    def test_render_features_keep_group_trace_above_one(self):
+        state = SemanticGaussianState.initialize(1, 2)
+        state.add_evidence(torch.tensor([[1.0, 1.0]]))
+        state.group_variance[0] = torch.tensor([0.8, 0.8])
+
+        features = _semantic_render_features(
+            state, torch.device("cpu"), use_robust=True, eps=1e-8
+        )
+
+        evidence_ratio = 2.0 / 3.0
+        self.assertAlmostEqual(
+            float(features[0, CLASS_SPEC.num_classes + 2]),
+            evidence_ratio * 1.6,
+            places=6,
         )
 
     def test_uncertainty_is_undefined_without_semantic_evidence(self):

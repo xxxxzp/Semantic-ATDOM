@@ -629,6 +629,80 @@ class ProgressiveSemanticHookTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "closed"):
             hook.synchronize(1, [Camera()], Gaussians(), Path("unused"))
 
+    def test_async_hook_applies_topology_only_through_each_frozen_snapshot(self):
+        started = threading.Event()
+        release = threading.Event()
+        observed = []
+
+        class Core:
+            def __init__(self):
+                class Runner:
+                    state = SemanticGaussianState.initialize(1, 2)
+
+                self.orchestrator = Runner()
+
+            def synchronize(
+                self, stage, cameras, gaussians, root, final, boundaries, *tdom
+            ):
+                if stage == 1:
+                    started.set()
+                    release.wait(timeout=2)
+                state_count = self.orchestrator.state.num_gaussians
+                snapshot_count = gaussians.get_xyz.shape[0]
+                observed.append((stage, state_count, snapshot_count))
+                if state_count != snapshot_count:
+                    raise RuntimeError(
+                        "semantic state/snapshot topology mismatch: {} != {}".format(
+                            state_count, snapshot_count
+                        )
+                    )
+                return type_result(stage)
+
+            def begin_final(self):
+                return None
+
+        class Camera:
+            image_name = "000001"
+            image_height = 1
+            image_width = 1
+            FoVx = 1.0
+            FoVy = 1.0
+            world_view_transform = torch.eye(4)
+            full_proj_transform = torch.eye(4)
+            camera_center = torch.zeros(3)
+            Tri_Mask = None
+
+        class Gaussians:
+            def __init__(self, count):
+                self._xyz = torch.zeros((count, 3))
+                self._features_dc = torch.zeros((count, 1, 3))
+                self._features_rest = torch.zeros((count, 0, 3))
+                self._opacity = torch.zeros((count, 1))
+                self._scaling = torch.zeros((count, 3))
+                self._rotation = torch.tensor(
+                    [[1.0, 0.0, 0.0, 0.0]]
+                ).repeat(count, 1)
+
+        def type_result(stage):
+            from semantic_atdom.semantics.orchestrator import SemanticSyncResult
+
+            return SemanticSyncResult(stage, "000001", (), (), 0, True, ())
+
+        hook = AsyncProgressiveSemanticHook(Core())
+        hook.synchronize(1, [Camera()], Gaussians(1), Path("unused"))
+        self.assertTrue(started.wait(timeout=1))
+        hook.apply_topology(TopologyDelta.append_prior(1, 1))
+        hook.synchronize(2, [Camera()], Gaussians(2), Path("unused"))
+        hook.apply_topology(TopologyDelta.append_prior(2, 1))
+        release.set()
+
+        final = hook.synchronize(
+            3, [Camera()], Gaussians(3), Path("unused"), final=True
+        )
+
+        self.assertEqual(final.semantic_through_image, "000001")
+        self.assertEqual(observed, [(1, 1, 1), (2, 2, 2), (3, 3, 3)])
+
 
 if __name__ == "__main__":
     unittest.main()

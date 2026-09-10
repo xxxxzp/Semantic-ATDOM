@@ -1258,13 +1258,15 @@ class AsyncProgressiveSemanticHook:
             max_workers=1, thread_name_prefix="semantic-atdom"
         )
         self._stage_pending = False
+        self._pending_stage_count = 0
+        self._latest_stage_token = 0
+        self._latest_stage_request = None
         self._last_result = None
         self._error = None
         self._is_valid = True
         self._expected_gaussian_count = core.orchestrator.state.num_gaussians
         self._stage_boundaries = []
         self._closed = False
-        self._pending_request = None
         self._lock = threading.Lock()
         self._idle_event = threading.Event()
         self._idle_event.set()
@@ -1322,7 +1324,7 @@ class AsyncProgressiveSemanticHook:
             if self._closed:
                 return
             self._closed = True
-            self._pending_request = None
+            self._latest_stage_request = None
         self._executor.shutdown(wait=wait)
 
     def synchronize(
@@ -1367,14 +1369,22 @@ class AsyncProgressiveSemanticHook:
         )
         if not final:
             with self._lock:
-                if self._stage_pending:
-                    # Keep a single newest catch-up snapshot.  Intermediate
-                    # stage boundaries remain in the request for lag reporting.
-                    self._pending_request = request
-                    return self._current_status(geometry_stage)
+                # Submit an ordered marker for every snapshot.  The marker may
+                # skip obsolete semantic work, but its position in the single
+                # worker queue prevents a frozen snapshot from crossing later
+                # topology events.
+                self._latest_stage_token += 1
+                token = self._latest_stage_token
+                # Retain only the newest heavyweight GPU snapshot.  Ordered
+                # markers carry a token, not a second reference to old tensors.
+                self._latest_stage_request = request
+                self._pending_stage_count += 1
                 self._stage_pending = True
                 self._idle_event.clear()
-            self._submit_stage(request)
+            future = self._executor.submit(
+                self._run_stage_marker, token
+            )
+            future.add_done_callback(self._stage_done)
             return self._current_status(geometry_stage)
 
         if final:
@@ -1404,24 +1414,36 @@ class AsyncProgressiveSemanticHook:
             finally:
                 self.close(wait=True)
 
-    def _submit_stage(self, request) -> None:
-        future = self._executor.submit(self.core.synchronize, *request)
-        future.add_done_callback(self._stage_done)
+    def _run_stage_marker(self, token):
+        with self._lock:
+            if token != self._latest_stage_token:
+                return None
+            request = self._latest_stage_request
+        if request is None:
+            return None
+        try:
+            return self.core.synchronize(*request)
+        finally:
+            with self._lock:
+                if (
+                    token == self._latest_stage_token
+                    and self._latest_stage_request is request
+                ):
+                    self._latest_stage_request = None
 
     def _stage_done(self, future) -> None:
         try:
-            self._last_result = future.result()
+            result = future.result()
+            if result is not None:
+                self._last_result = result
         except Exception as error:
             self._error = error
             self.invalidate(error)
         with self._lock:
-            pending = self._pending_request
-            self._pending_request = None
-            if pending is None or self._closed or self._error is not None:
+            self._pending_stage_count -= 1
+            if self._pending_stage_count == 0:
                 self._stage_pending = False
                 self._idle_event.set()
-                return
-        self._submit_stage(pending)
 
     def _background_done(self, future) -> None:
         try:

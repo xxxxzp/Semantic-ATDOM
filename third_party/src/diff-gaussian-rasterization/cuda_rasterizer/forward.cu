@@ -762,6 +762,260 @@ void FORWARD::render(
 		Use_Render_Mask);
 }
 
+__global__ void __launch_bounds__(BLOCK_X * BLOCK_Y)
+semanticObservationCUDA(
+	const uint2* __restrict__ ranges,
+	const uint32_t* __restrict__ point_list,
+	int P, int W, int H,
+	const float2* __restrict__ points_xy_image,
+	const float4* __restrict__ conic_opacity,
+	const int64_t* __restrict__ labels,
+	const float* __restrict__ boundary_weights,
+	int num_classes,
+	int ignore_id,
+	float* __restrict__ evidence,
+	float* __restrict__ all_mass,
+	float* __restrict__ valid_mass,
+	float* __restrict__ dense_contributions)
+{
+	auto block = cg::this_thread_block();
+	const uint32_t horizontal_blocks = (W + BLOCK_X - 1) / BLOCK_X;
+	const uint2 pix_min = {
+		block.group_index().x * BLOCK_X,
+		block.group_index().y * BLOCK_Y
+	};
+	const uint2 pix = {
+		pix_min.x + block.thread_index().x,
+		pix_min.y + block.thread_index().y
+	};
+	const bool inside = pix.x < W && pix.y < H;
+	bool done = !inside;
+	const uint32_t pix_id = W * pix.y + pix.x;
+	const float2 pixf = { (float)pix.x, (float)pix.y };
+
+	const uint32_t tile_id =
+		block.group_index().y * horizontal_blocks + block.group_index().x;
+	const uint2 range = ranges[tile_id];
+	const int rounds = (range.y - range.x + BLOCK_SIZE - 1) / BLOCK_SIZE;
+	int toDo = range.y - range.x;
+
+	__shared__ int collected_id[BLOCK_SIZE];
+	__shared__ float2 collected_xy[BLOCK_SIZE];
+	__shared__ float4 collected_conic_opacity[BLOCK_SIZE];
+
+	float T = 1.0f;
+	for (int i = 0; i < rounds; i++, toDo -= BLOCK_SIZE)
+	{
+		const int num_done = __syncthreads_count(done);
+		if (num_done == BLOCK_SIZE)
+			break;
+
+		const int progress = i * BLOCK_SIZE + block.thread_rank();
+		if (range.x + progress < range.y)
+		{
+			const int gaussian_id = point_list[range.x + progress];
+			collected_id[block.thread_rank()] = gaussian_id;
+			collected_xy[block.thread_rank()] = points_xy_image[gaussian_id];
+			collected_conic_opacity[block.thread_rank()] =
+				conic_opacity[gaussian_id];
+		}
+		block.sync();
+
+		for (int j = 0; !done && j < min(BLOCK_SIZE, toDo); j++)
+		{
+			const float2 xy = collected_xy[j];
+			const float2 d = { xy.x - pixf.x, xy.y - pixf.y };
+			const float4 con_o = collected_conic_opacity[j];
+			const float power = -0.5f *
+				(con_o.x * d.x * d.x + con_o.z * d.y * d.y)
+				- con_o.y * d.x * d.y;
+			if (power > 0.0f)
+				continue;
+
+			const float alpha = min(0.99f, con_o.w * expf(power));
+			if (alpha < 1.0f / 255.0f)
+				continue;
+			const float test_T = T * (1.0f - alpha);
+			if (test_T < 0.0001f)
+			{
+				done = true;
+				continue;
+			}
+
+			const int gaussian_id = collected_id[j];
+			const float contribution = alpha * T;
+			atomicAdd(all_mass + gaussian_id, contribution);
+			if (dense_contributions != nullptr)
+				dense_contributions[pix_id * P + gaussian_id] = contribution;
+
+			const int64_t label = labels[pix_id];
+			if (label != ignore_id && label >= 0 && label < num_classes)
+			{
+				const float weighted =
+					contribution * boundary_weights[pix_id];
+				atomicAdd(valid_mass + gaussian_id, weighted);
+				atomicAdd(
+					evidence + gaussian_id * num_classes + (int)label,
+					weighted);
+			}
+			T = test_T;
+		}
+	}
+}
+
+void FORWARD::semanticObservation(
+	const dim3 grid, dim3 block,
+	const uint2* ranges,
+	const uint32_t* point_list,
+	int P, int W, int H,
+	const float2* means2D,
+	const float4* conic_opacity,
+	const int64_t* labels,
+	const float* boundary_weights,
+	int num_classes,
+	int ignore_id,
+	float* evidence,
+	float* all_mass,
+	float* valid_mass,
+	float* dense_contributions)
+{
+	semanticObservationCUDA<<<grid, block>>>(
+		ranges,
+		point_list,
+		P, W, H,
+		means2D,
+		conic_opacity,
+		labels,
+		boundary_weights,
+		num_classes,
+		ignore_id,
+		evidence,
+		all_mass,
+		valid_mass,
+		dense_contributions);
+}
+
+namespace
+{
+constexpr int MAX_SEMANTIC_TDOM_CHANNELS = 16;
+
+__global__ void __launch_bounds__(BLOCK_X * BLOCK_Y)
+semanticTdomCUDA(
+	const uint2* __restrict__ ranges,
+	const uint32_t* __restrict__ point_list,
+	int W, int H,
+	const float2* __restrict__ points_xy_image,
+	const float4* __restrict__ conic_opacity,
+	const float* __restrict__ features,
+	int num_channels,
+	float* __restrict__ rendered_features,
+	float* __restrict__ coverage)
+{
+	auto block = cg::this_thread_block();
+	const uint32_t horizontal_blocks = (W + BLOCK_X - 1) / BLOCK_X;
+	const uint2 pix_min = {
+		block.group_index().x * BLOCK_X,
+		block.group_index().y * BLOCK_Y
+	};
+	const uint2 pix = {
+		pix_min.x + block.thread_index().x,
+		pix_min.y + block.thread_index().y
+	};
+	const bool inside = pix.x < W && pix.y < H;
+	bool done = !inside;
+	const uint32_t pix_id = W * pix.y + pix.x;
+	const float2 pixf = {(float)pix.x, (float)pix.y};
+	const uint32_t tile_id =
+		block.group_index().y * horizontal_blocks + block.group_index().x;
+	const uint2 range = ranges[tile_id];
+	const int rounds = (range.y - range.x + BLOCK_SIZE - 1) / BLOCK_SIZE;
+	int toDo = range.y - range.x;
+
+	__shared__ int collected_id[BLOCK_SIZE];
+	__shared__ float2 collected_xy[BLOCK_SIZE];
+	__shared__ float4 collected_conic_opacity[BLOCK_SIZE];
+
+	float accumulated[MAX_SEMANTIC_TDOM_CHANNELS] = {0.0f};
+	float T = 1.0f;
+	for (int i = 0; i < rounds; i++, toDo -= BLOCK_SIZE)
+	{
+		const int num_done = __syncthreads_count(done);
+		if (num_done == BLOCK_SIZE)
+			break;
+		const int progress = i * BLOCK_SIZE + block.thread_rank();
+		if (range.x + progress < range.y)
+		{
+			const int gaussian_id = point_list[range.x + progress];
+			collected_id[block.thread_rank()] = gaussian_id;
+			collected_xy[block.thread_rank()] = points_xy_image[gaussian_id];
+			collected_conic_opacity[block.thread_rank()] =
+				conic_opacity[gaussian_id];
+		}
+		block.sync();
+
+		for (int j = 0; !done && j < min(BLOCK_SIZE, toDo); j++)
+		{
+			const float2 xy = collected_xy[j];
+			const float2 d = {xy.x - pixf.x, xy.y - pixf.y};
+			const float4 con_o = collected_conic_opacity[j];
+			const float power = -0.5f *
+				(con_o.x * d.x * d.x + con_o.z * d.y * d.y)
+				- con_o.y * d.x * d.y;
+			if (power > 0.0f)
+				continue;
+			const float alpha = min(0.99f, con_o.w * expf(power));
+			if (alpha < 1.0f / 255.0f)
+				continue;
+			const float test_T = T * (1.0f - alpha);
+			if (test_T < 0.0001f)
+			{
+				done = true;
+				continue;
+			}
+			const int gaussian_id = collected_id[j];
+			const float contribution = alpha * T;
+			for (int channel = 0; channel < num_channels; channel++)
+				accumulated[channel] +=
+					features[gaussian_id * num_channels + channel]
+					* contribution;
+			T = test_T;
+		}
+	}
+	if (inside)
+	{
+		for (int channel = 0; channel < num_channels; channel++)
+			rendered_features[channel * H * W + pix_id] =
+				accumulated[channel];
+		coverage[pix_id] = 1.0f - T;
+	}
+}
+}
+
+void FORWARD::semanticTdom(
+	const dim3 grid, dim3 block,
+	const uint2* ranges,
+	const uint32_t* point_list,
+	int W, int H,
+	const float2* means2D,
+	const float4* conic_opacity,
+	const float* features,
+	int num_channels,
+	float* rendered_features,
+	float* coverage)
+{
+	semanticTdomCUDA<<<grid, block>>>(
+		ranges,
+		point_list,
+		W,
+		H,
+		means2D,
+		conic_opacity,
+		features,
+		num_channels,
+		rendered_features,
+		coverage);
+}
+
 void FORWARD::preprocess(int P, int D, int M,
 	const float* means3D,
 	const glm::vec3* scales,

@@ -15,6 +15,8 @@
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("rasterize_gaussians", &RasterizeGaussiansCUDA);
   m.def("rasterize_gaussians_backward", &RasterizeGaussiansBackwardCUDA);
+  m.def("semantic_observation", &RasterizeSemanticObservationCUDA);
+  m.def("semantic_tdom", &RasterizeSemanticTdomCUDA);
   m.def("mark_visible", &markVisible);
   m.def("adamUpdate", &adamUpdate);
   m.def("fusedssim", &fusedssim);

@@ -99,6 +99,14 @@ class RepositoryLayoutTests(unittest.TestCase):
         self.assertTrue(
             (ROOT / "docs" / "design" / "semantic-tdom-glossary.md").is_file()
         )
+        self.assertTrue(
+            (
+                ROOT
+                / "docs"
+                / "design"
+                / "phantom3-semantic-label-contract-v1.md"
+            ).is_file()
+        )
         decisions = ROOT / "docs" / "decisions"
         self.assertEqual(
             {

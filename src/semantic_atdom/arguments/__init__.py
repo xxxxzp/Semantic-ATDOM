@@ -104,6 +104,7 @@ class PipelineParams(ParamGroup):
         self.Use_Tri_Mask = False
         self.Single = False
         self.render_TDOM = False
+        self.enable_semantics = False
         self.Get_Pos = False
 
         # Use for Ablation
@@ -164,6 +165,21 @@ class OptimizationParams(ParamGroup):
         self.TDOM_FoVx = 3.0
         self.GSD_x = 0.00
         self.GSD_y = 0.00
+        self.semantic_overlap_threshold = 0.4
+        self.semantic_max_group_size = 4
+        self.semantic_reliability_floor = 0.1
+        self.semantic_temperature = 0.1
+        self.semantic_boundary_bandwidth = 2.0
+        self.semantic_boundary_floor = 0.25
+        self.semantic_data_root = ""
+        self.semantic_tdom_min_coverage = 0.05
+        self.semantic_tdom_min_absolute_support = 0.01
+        self.semantic_tdom_min_support_ratio = 0.05
+        self.semantic_tdom_min_margin = 0.05
+        self.semantic_tdom_save_probabilities = False
+        self.semantic_tdom_final_only = False
+        self.semantic_tdom_max_output_bytes = 8 * 1024**3
+        self.semantic_tdom_min_free_cuda_bytes = 512 * 1024**2
 
         super().__init__(parser, "Optimization Parameters")
 

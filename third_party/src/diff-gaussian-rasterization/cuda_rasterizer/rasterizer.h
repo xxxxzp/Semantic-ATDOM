@@ -14,6 +14,7 @@
 
 #include <vector>
 #include <functional>
+#include <cstdint>
 
 namespace CudaRasterizer
 {
@@ -62,6 +63,63 @@ namespace CudaRasterizer
 			bool debug = false,
 			bool Use_Render_Mask = false,
 			bool TDOM = false);
+
+		static int semanticObservation(
+			std::function<char* (size_t)> geometryBuffer,
+			std::function<char* (size_t)> binningBuffer,
+			std::function<char* (size_t)> imageBuffer,
+			const int P,
+			const int width,
+			const int height,
+			const float* means3D,
+			const float* colors_precomp,
+			const float* opacities,
+			const float* scales,
+			const float scale_modifier,
+			const float* rotations,
+			const float* cov3D_precomp,
+			const float* viewmatrix,
+			const float* projmatrix,
+			const float* cam_pos,
+			const float tan_fovx,
+			const float tan_fovy,
+			const int64_t* labels,
+			const float* boundary_weights,
+			const int num_classes,
+			const int ignore_id,
+			float* evidence,
+			float* all_mass,
+			float* valid_mass,
+			float* dense_contributions,
+			int* radii,
+			bool debug = false);
+
+		static int semanticTdom(
+			std::function<char* (size_t)> geometryBuffer,
+			std::function<char* (size_t)> binningBuffer,
+			std::function<char* (size_t)> imageBuffer,
+			const int P,
+			const int width,
+			const int height,
+			const float* means3D,
+			const float* dummy_colors,
+			const float* opacities,
+			const float* scales,
+			const float scale_modifier,
+			const float* rotations,
+			const float* cov3D_precomp,
+			const float* viewmatrix,
+			const float* projmatrix,
+			const float* cam_pos,
+			const float tan_fovx,
+			const float tan_fovy,
+			const float* features,
+			const int num_channels,
+			float* rendered_features,
+			float* coverage,
+			int* radii,
+			const size_t max_binning_bytes,
+			bool debug = false);
 
 		static void backward(
 			const int P, int D, int M, int R, int B,

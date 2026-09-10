@@ -15,6 +15,7 @@ packages = [
     "semantic_atdom.arguments",
     "semantic_atdom.scene",
     "semantic_atdom.gaussian_renderer",
+    "semantic_atdom.semantics",
     "semantic_atdom.utils",
     "lpipsPyTorch",
     "lpipsPyTorch.modules",

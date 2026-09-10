@@ -1,4 +1,5 @@
 import os
+import hashlib
 import random
 import torch
 from random import randint
@@ -29,11 +30,17 @@ import cv2
 import gc
 import statistics
 import copy
+import warnings
 from semantic_atdom.utils.graphics_utils import getWorld2View2, getProjectionMatrix
 import torchvision
 import torch.multiprocessing as mp
 from skimage.metrics import structural_similarity as ssim
 import lpips
+from semantic_atdom.semantics.orchestrator import (
+    AsyncProgressiveSemanticHook,
+    OnlineSemanticConfig,
+)
+from semantic_atdom.semantics.tdom import SemanticTdomConfig
 
 try:
     from torch.utils.tensorboard import SummaryWriter
@@ -42,6 +49,13 @@ except ImportError:
     TENSORBOARD_FOUND = False
 
 WARNED = False
+
+def SemanticWarning(message):
+    """Warnings-as-errors must never couple semantics back into geometry."""
+    try:
+        warnings.warn(message, RuntimeWarning)
+    except Exception:
+        pass
 
 def Get_lpips(rgbs: torch.Tensor, target_rgbs: torch.Tensor, lpips_vgg):
     gt = target_rgbs.unsqueeze(0) * 2 - 1
@@ -468,6 +482,7 @@ class DataPreProccesser(mp.Process):
 
         self.targetcam = None
         self.TDOM_Cam = None
+        self.TDOM_alignment = None
         self.TDOM_pipeline = None
         self.targetcam_savetimes = 0
         self.TDOM_Cam_savetimes = 0
@@ -785,7 +800,7 @@ class DataPreProccesser(mp.Process):
             else:
                 Commond_from_GaussianTrainer = self.DataPreProccesser_queue.get()
                 if Commond_from_GaussianTrainer[0] == "Progressive_First_Step":
-                    if ProgressiveTrainingTime + self.args.StartFromImageNo + 1 <= self.args.EndAtImageNo or self.args.EndAtImageNo == -1:
+                    if (ProgressiveTrainingTime < len(self.source_path_list) - 1) and (ProgressiveTrainingTime + self.args.StartFromImageNo + 1 <= self.args.EndAtImageNo or self.args.EndAtImageNo == -1):
                         # 数据更新同时计算这一次有多少新增影像
                         self.NewImagesNum = self.IM[ProgressiveTrainingTime + 1] - self.IM[ProgressiveTrainingTime]
                         self.args.source_path = self.source_path_list[ProgressiveTrainingTime]
@@ -794,7 +809,7 @@ class DataPreProccesser(mp.Process):
                         self.args.model_path_second = self.model_path_list[ProgressiveTrainingTime + 1]
 
                         # 根据新的稀疏点云来扩张高斯点云
-                        get_ply = True if ProgressiveTrainingTime == len(self.source_path_list) - 3 else False
+                        get_ply = True if ProgressiveTrainingTime == len(self.source_path_list) - 2 else False
                         # self.NewCams = self.ExpandingGS_From_SparsePCD(get_ply=get_ply)
                         New_scene_info_traincam, NewCams, UpdatedTrainCamsPos, scene_info, new_model_path_second, cameras_extent = self.ExpandingGS_From_SparsePCD2(Commond_from_GaussianTrainer[1], get_ply=get_ply)
                         # print(f"ChosenImagesNum: {len(self.ChosenImageNames)}")
@@ -813,7 +828,7 @@ class DataPreProccesser(mp.Process):
 
                         ProgressiveTrainingTime += 1
                 elif Commond_from_GaussianTrainer[0] == "Progressive":
-                    if (ProgressiveTrainingTime + self.args.StartFromImageNo + 1 <= self.args.EndAtImageNo or self.args.EndAtImageNo == -1) and (ProgressiveTrainingTime < len(self.source_path_list) - 2):
+                    if (ProgressiveTrainingTime + self.args.StartFromImageNo + 1 <= self.args.EndAtImageNo or self.args.EndAtImageNo == -1) and (ProgressiveTrainingTime < len(self.source_path_list) - 1):
                         # 数据更新同时计算这一次有多少新增影像
                         self.NewImagesNum = self.IM[ProgressiveTrainingTime + 1] - self.IM[ProgressiveTrainingTime]
                         self.args.source_path = self.source_path_list[ProgressiveTrainingTime]
@@ -822,7 +837,7 @@ class DataPreProccesser(mp.Process):
                         self.args.model_path_second = self.model_path_list[ProgressiveTrainingTime + 1]
 
                         # 根据新的稀疏点云来扩张高斯点云
-                        get_ply = True if ProgressiveTrainingTime == len(self.source_path_list) - 3 else False
+                        get_ply = True if ProgressiveTrainingTime == len(self.source_path_list) - 2 else False
                         # self.NewCams = self.ExpandingGS_From_SparsePCD(get_ply=get_ply)
                         New_scene_info_traincam, NewCams, UpdatedTrainCamsPos, scene_info, new_model_path_second, cameras_extent = self.ExpandingGS_From_SparsePCD2(Commond_from_GaussianTrainer[1], get_ply=get_ply)
                         # print(f"ChosenImagesNum: {len(self.ChosenImageNames)}")
@@ -855,16 +870,15 @@ class DataPreProccesser(mp.Process):
                                 if self.DataPreProccesser_queue.get()[0] == "Progressive_finish":
                                     print("*****************************************************************************")
                                     print("DataPreProccesser: Start Final Refinement...")
-                                    self.args.source_path = self.source_path_list[-2]
-                                    self.args.model_path = self.model_path_list[-2]
+                                    # The final source stage was already expanded and
+                                    # trained. Reuse its output directory instead of
+                                    # reserving (and thereby skipping) the last stage.
+                                    self.args.source_path = self.source_path_list[-1]
+                                    self.args.model_path = self.model_path_list[-1]
                                     self.args.source_path_second = self.source_path_list[-1]
                                     self.args.model_path_second = self.model_path_list[-1]
-                                    # self.scene.model_path = self.args.model_path_second
-                                    prepare_output_and_logger(self.args, True)
-                                    shutil.copy(os.path.join(self.args.model_path, "input.ply"), os.path.join(self.args.model_path_second, "input.ply"))
-                                    shutil.copy(os.path.join(self.args.model_path, "cameras.json"), os.path.join(self.args.model_path_second, "cameras.json"))
 
-                                    msg = ["Final_Refinement", self.args.model_path_second]
+                                    msg = ["Final_Refinement", self.args.model_path]
                                     self.GaussianTrainer_queue.put(msg)
 
                                     break
@@ -927,6 +941,133 @@ class GaussianTrainer(mp.Process):
         # 在SLAM数据集上可能出现训练速度快于前端处理速度的现象，因此该布尔值用于表示是否已经完成“Render_New”这个操作
         self.RenderNewDone = False
 
+        # Optional WP3 sidecar. It is deliberately outside every RGB optimizer.
+        self.semantic_hook = None
+        self.semantic_tdom_config = None
+
+    def _initialize_semantic_hook(self):
+        if not self.args.enable_semantics:
+            return
+        try:
+            config = OnlineSemanticConfig(
+                overlap_threshold=self.args.semantic_overlap_threshold,
+                max_group_size=self.args.semantic_max_group_size,
+                reliability_floor=self.args.semantic_reliability_floor,
+                temperature=self.args.semantic_temperature,
+                boundary_bandwidth=self.args.semantic_boundary_bandwidth,
+                boundary_floor=self.args.semantic_boundary_floor,
+            )
+            self.semantic_tdom_config = SemanticTdomConfig(
+                min_coverage=self.args.semantic_tdom_min_coverage,
+                min_absolute_support=(
+                    self.args.semantic_tdom_min_absolute_support
+                ),
+                min_support_ratio=self.args.semantic_tdom_min_support_ratio,
+                min_margin=self.args.semantic_tdom_min_margin,
+                save_probabilities=(
+                    self.args.semantic_tdom_save_probabilities
+                ),
+                max_output_bytes=self.args.semantic_tdom_max_output_bytes,
+                min_free_cuda_bytes=(
+                    self.args.semantic_tdom_min_free_cuda_bytes
+                ),
+            )
+            self.semantic_hook = AsyncProgressiveSemanticHook.create(
+                dataset_root=self.args.Source_Path_Dir,
+                output_root=os.path.join(
+                    self.args.Model_Path_Dir, "semantic"
+                ),
+                gaussians=self.gaussians,
+                config=config,
+                semantic_dataset_root=(
+                    self.args.semantic_data_root or self.args.Source_Path_Dir
+                ),
+            )
+            self.gaussians.set_topology_observer(
+                self.semantic_hook.apply_topology, owner=self.semantic_hook
+            )
+        except Exception as error:
+            self.semantic_hook = None
+            SemanticWarning(
+                "semantic initialization failed; RGB geometry continues: {}".format(
+                    error
+                )
+            )
+
+    def _run_semantic_hook(self, stage_name, final=False):
+        if self.semantic_hook is None:
+            return None
+        hook = self.semantic_hook
+        snapshot_root = os.path.join(
+            self.args.Source_Path_Dir, str(self.imagenum)
+        )
+        expected_training_type = {
+            "initialization": "Initialization",
+            "progressive": "On_The_Fly",
+            "final_refinement": "Final_Refinement",
+        }.get(stage_name)
+        alignment = self.TDOM_alignment or {}
+        render_semantic_tdom = (
+            stage_name in ("initialization", "progressive", "final_refinement")
+            and self.args.render_TDOM
+            and (not self.args.semantic_tdom_final_only or final)
+            and self.TDOM_Cam is not None
+            and alignment.get("geometry_stage") == int(self.imagenum)
+            and alignment.get("training_type") == expected_training_type
+        )
+        tdom_output_root = None
+        if render_semantic_tdom:
+            tdom_output_root = os.path.join(
+                self.args.Model_Path_Dir,
+                "Semantic_TDOM",
+                "stage_{:06d}".format(int(self.imagenum)),
+                alignment["product_key"],
+            )
+        try:
+            result = hook.synchronize(
+                geometry_stage=self.imagenum,
+                cameras=self.scene.getTrainCameras(),
+                gaussians=self.gaussians,
+                snapshot_root=snapshot_root,
+                final=final,
+                tdom_camera=(self.TDOM_Cam if render_semantic_tdom else None),
+                tdom_output_root=tdom_output_root,
+                tdom_config=self.semantic_tdom_config,
+                tdom_alignment=self.TDOM_alignment,
+            )
+            print(
+                "Semantic sync [{}]: geometry={}, through={}, lag={}".format(
+                    stage_name,
+                    result.geometry_stage,
+                    result.semantic_through_image,
+                    result.lag_batches,
+                )
+            )
+            if result.errors:
+                SemanticWarning(
+                    "semantic sync deferred after error; RGB geometry continues: {}".format(
+                        result.errors[0]
+                    )
+                )
+            if not result.within_lag_budget:
+                SemanticWarning(
+                    "semantic output is more than one progressive batch behind"
+                )
+            if final:
+                self.gaussians.set_topology_observer(None)
+                hook.close()
+            return result
+        except Exception as error:
+            SemanticWarning(
+                "semantic stage hook failed; RGB geometry continues: {}".format(
+                    error
+                )
+            )
+            hook.close(reason=error, wait=bool(final))
+            self.gaussians.set_topology_observer(None)
+            self.semantic_hook = None
+            return None
+
     def InitialGaussianTrain(self):
         # 设置初始场景的文件路径
         self.args.model_path = self.model_path_list[0] if self.args.ContinueFromImageNo == -1 else self.model_path_list[self.args.ContinueFromImageNo - self.args.StartFromImageNo]
@@ -962,6 +1103,10 @@ class GaussianTrainer(mp.Process):
             self.Train_Gaussians(self.args.IterationFirstScene, "Initialization")
         time2 = time.time()
         self.TimeCost["GaussianInitial"] = time2 - time1
+
+        # WP3 synchronization point: initialization/densify/prune is complete.
+        self._initialize_semantic_hook()
+        self._run_semantic_hook("initialization")
 
         # 向前端传递信息，表示初始训练已经完成，可以开始读取后续的影像
         self.SendImagePos_to_DataPreProccesser(True)
@@ -1009,6 +1154,11 @@ class GaussianTrainer(mp.Process):
     # 3DGS模型训练核心函数
     def Train_Gaussians(self, iteration, Training_Type):
         # self.Diary.write('\n')
+
+        # A semantic stage may only use a TDOM camera created by this exact
+        # RGB render.  Clear previous-stage data before any possible failure.
+        self.TDOM_Cam = None
+        self.TDOM_alignment = None
 
         Start_From_Its = self.AlreadyTrainingIterations
 
@@ -1274,7 +1424,7 @@ class GaussianTrainer(mp.Process):
                     image = render_pkg["render"]
                     self.DataSaver_queue.put(["SaveImage", image])
                     self.DataSaver_queue.put(["SaveGT", self.NewCams[i].image_name])
-        if Training_Type == "On_The_Fly" and self.args.render_TDOM:
+        if self.args.render_TDOM:
             print("GaussianTrainer: Save TDOM Results...")
             time1 = time.time()
             with torch.no_grad():
@@ -1319,16 +1469,69 @@ class GaussianTrainer(mp.Process):
                     W = rectangle["width"] / self.GSD_x
                     H = rectangle["height"] / self.GSD_y
 
+                W, H = int(round(float(W))), int(round(float(H)))
+
                 # 创建 DummyCamera 实例
                 self.TDOM_Cam = DummyCamera(R, T, FoVx, FoVy, W, H)
                 # 创建 DummyPipeline 实例
                 self.TDOM_pipeline = DummyPipeline()
+                product_key = "stage_{:06d}_{}".format(
+                    int(self.imagenum), Training_Type.lower()
+                )
+                self.TDOM_alignment = {
+                    "product_key": product_key,
+                    "rgb_tdom_product_key": product_key,
+                    "rgb_tdom_manifest_lookup": {
+                        "directory": "Intermediate_Results/TDOM",
+                        "product_key": product_key,
+                    },
+                    "geometry_stage": int(self.imagenum),
+                    "training_type": Training_Type,
+                    "image_width": int(self.TDOM_Cam.image_width),
+                    "image_height": int(self.TDOM_Cam.image_height),
+                    "fov_x_radians": float(self.TDOM_Cam.FoVx),
+                    "fov_y_radians": float(self.TDOM_Cam.FoVy),
+                    "world_view_transform": (
+                        self.TDOM_Cam.world_view_transform.detach()
+                        .cpu()
+                        .tolist()
+                    ),
+                    "full_projection_transform": (
+                        self.TDOM_Cam.full_proj_transform.detach()
+                        .cpu()
+                        .tolist()
+                    ),
+                    "camera_center": (
+                        self.TDOM_Cam.camera_center.detach().cpu().tolist()
+                    ),
+                    "extent": {
+                        "width_world": float(rectangle["width"]),
+                        "height_world": float(rectangle["height"]),
+                        "center_world": [
+                            float(item)
+                            for item in rectangle["Gaussians_center"]
+                        ],
+                    },
+                    "requested_gsd": {
+                        "x": float(self.GSD_x),
+                        "y": float(self.GSD_y),
+                    },
+                    "effective_gsd": {
+                        "x": float(rectangle["width"]) / W,
+                        "y": float(rectangle["height"]) / H,
+                    },
+                    # The current RGB TDOM pipeline has no world CRS contract.
+                    # An explicit null prevents consumers from assuming one.
+                    "crs": None,
+                }
 
                 TDOM = render(self.TDOM_Cam, self.gaussians, self.TDOM_pipeline, self.background, Render_Mask=torch.ones(1, dtype=torch.bool).cuda(), TDOM=True)["render"]
 
                 time2 = time.time()
                 print(f"Time cost of TDOM rendering: {time2 - time1}s")
-                self.DataSaver_queue.put(["SaveTDOM", TDOM])
+                self.DataSaver_queue.put(
+                    ["SaveTDOM", TDOM, self.TDOM_alignment]
+                )
 
     # 对当前高斯模型进行一次评估
     def Evaluate(self, Training_Type, EvaluateRender):
@@ -1512,7 +1715,7 @@ class GaussianTrainer(mp.Process):
 
     # 保存当前模型
     def GS_Save(self, UseSecondPath=True):
-        imagedirname = self.imagenum if not UseSecondPath else self.imagenum + 1
+        imagedirname = self.imagenum
         print("\n[Save At Image {}] Saving Checkpoint".format(imagedirname))
         torch.save((self.gaussians.capture(), self.AlreadyTrainingIterations), os.path.join(self.args.Model_Path_Dir, str(imagedirname), f"chkpnt{imagedirname}.pth"))
 
@@ -1541,6 +1744,8 @@ class GaussianTrainer(mp.Process):
                         self.DataPreProccesser_queue.put(msg)
                 elif Commond_from_DataPreProccesser[0] == "Progressive_Train":
                     with torch.no_grad():
+                        self.TDOM_Cam = None
+                        self.TDOM_alignment = None
                         time1 = time.time()
                         print("GaussianTrainer: Get Information from DataPreProccesser...")
 
@@ -1597,6 +1802,9 @@ class GaussianTrainer(mp.Process):
                     time2 = time.time()
                     self.TimeCost["ProgressiveTrain"] += time2 - time1
 
+                    # WP3 synchronization point: one progressive RGB batch ended.
+                    self._run_semantic_hook("progressive")
+
                     # 等待self.RenderNewDone变为True
                     while not self.RenderNewDone:
                         if not self.GaussianTrainer_queue.empty() or self.commond is not None:
@@ -1624,12 +1832,26 @@ class GaussianTrainer(mp.Process):
 
                 elif Commond_from_DataPreProccesser[0] == "Final_Refinement":
                     time1 = time.time()
+                    self.TDOM_Cam = None
+                    self.TDOM_alignment = None
                     self.scene.model_path = Commond_from_DataPreProccesser[1]
+                    if self.semantic_hook is not None:
+                        try:
+                            self.semantic_hook.begin_final()
+                        except Exception as error:
+                            SemanticWarning(
+                                "semantic final-boundary hook failed; RGB geometry continues: {}".format(
+                                    error
+                                )
+                            )
                     if not self.args.skip_GlobalOptimization:
                         self.Train_Gaussians(self.args.FinalOptimizationIterations, "Final_Refinement")
 
                     time2 = time.time()
                     self.TimeCost["FinalRefinement"] += time2 - time1
+
+                    # WP3 closes the online group here; WP5 will rebuild exactly.
+                    self._run_semantic_hook("final_refinement", final=True)
 
                     self.Finish = True
 
@@ -1714,7 +1936,7 @@ class DataSaver(mp.Process):
             self.SaveImageNumber += 1
 
     # 保存TDOM
-    def SaveTDOM(self, tdom):
+    def SaveTDOM(self, tdom, alignment=None):
         with torch.no_grad():
             # rendering_filepath = os.path.join(self.Intermediate_TDOM_Render_Path, f"{self.SaveTDOMNumber}.jpg")
             # torchvision.utils.save_image(tdom, rendering_filepath)
@@ -1727,7 +1949,36 @@ class DataSaver(mp.Process):
             if self.MaxTDOMHeight < height:
                 self.MaxTDOMHeight = height
             ImageOutput = Image.fromarray(ImageOutput)
-            ImageOutput.save(os.path.join(self.Intermediate_TDOM_Render_Path, f"{self.SaveTDOMNumber}.jpg"))
+            image_path = os.path.join(
+                self.Intermediate_TDOM_Render_Path,
+                f"{self.SaveTDOMNumber}.jpg",
+            )
+            ImageOutput.save(image_path)
+            if alignment is not None:
+                with open(image_path, "rb") as stream:
+                    image_sha256 = hashlib.sha256(stream.read()).hexdigest()
+                payload = dict(alignment)
+                payload.update(
+                    {
+                        "schema_version": 1,
+                        "rgb_tdom_file": os.path.basename(image_path),
+                        "rgb_tdom_sha256": image_sha256,
+                    }
+                )
+                manifest_path = os.path.splitext(image_path)[0] + ".json"
+                temporary = manifest_path + ".tmp"
+                with open(temporary, "w", encoding="utf-8") as stream:
+                    json.dump(
+                        payload,
+                        stream,
+                        ensure_ascii=False,
+                        indent=2,
+                        sort_keys=True,
+                    )
+                    stream.write("\n")
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                os.replace(temporary, manifest_path)
             self.SaveTDOMNumber += 1
 
     # 根据RGB影像的保存结果生成Demo
@@ -1834,7 +2085,14 @@ class DataSaver(mp.Process):
                 elif Commond_from_GaussianTrainer[0] == "SaveGT":
                     self.SaveGT(Commond_from_GaussianTrainer[1])
                 elif Commond_from_GaussianTrainer[0] == "SaveTDOM":
-                    self.SaveTDOM(Commond_from_GaussianTrainer[1])
+                    alignment = (
+                        Commond_from_GaussianTrainer[2]
+                        if len(Commond_from_GaussianTrainer) > 2
+                        else None
+                    )
+                    self.SaveTDOM(
+                        Commond_from_GaussianTrainer[1], alignment
+                    )
                 elif Commond_from_GaussianTrainer[0] == "GetDemo":
                     if self.SaveImageNumber > 0:
                         self.GetRGBDemo()

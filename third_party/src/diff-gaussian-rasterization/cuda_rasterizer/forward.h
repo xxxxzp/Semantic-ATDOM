@@ -18,6 +18,7 @@
 #define GLM_FORCE_CUDA
 #include <glm/glm.hpp>
 #include <functional>
+#include <cstdint>
 
 namespace FORWARD
 {
@@ -107,6 +108,37 @@ namespace FORWARD
 		float* out_depth_Hard,
 		float* rendered_normal,
 		const bool Use_Render_Mask);
+
+	// Forward-only semantic observation. Replays the same alpha-T traversal as
+	// RGB rendering and accumulates directly into per-Gaussian statistics.
+	void semanticObservation(
+		const dim3 grid, dim3 block,
+		const uint2* ranges,
+		const uint32_t* point_list,
+		int P, int W, int H,
+		const float2* means2D,
+		const float4* conic_opacity,
+		const int64_t* labels,
+		const float* boundary_weights,
+		int num_classes,
+		int ignore_id,
+		float* evidence,
+		float* all_mass,
+		float* valid_mass,
+		float* dense_contributions);
+
+	// Forward-only TDOM rendering for 1..16 semantic feature channels.
+	void semanticTdom(
+		const dim3 grid, dim3 block,
+		const uint2* ranges,
+		const uint32_t* point_list,
+		int W, int H,
+		const float2* means2D,
+		const float4* conic_opacity,
+		const float* features,
+		int num_channels,
+		float* rendered_features,
+		float* coverage);
 }
 
 

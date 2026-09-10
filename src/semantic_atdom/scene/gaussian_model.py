@@ -11,6 +11,7 @@
 
 import torch
 import numpy as np
+import hashlib
 from semantic_atdom.utils.general_utils import inverse_sigmoid, get_expon_lr_func, build_rotation
 from torch import nn
 import os
@@ -22,7 +23,9 @@ from semantic_atdom.utils.graphics_utils import BasicPointCloud
 from semantic_atdom.utils.general_utils import strip_symmetric, build_scaling_rotation
 from pytorch3d.transforms import quaternion_to_matrix
 from semantic_atdom.utils.graphics_utils import BasicPointCloud, getWorld2View2
+from semantic_atdom.semantics.topology import TopologyDelta
 import copy
+import warnings
 
 try:
     from diff_gaussian_rasterization import SparseGaussianAdam
@@ -136,6 +139,9 @@ class GaussianModel:
 
     # 直接更新Gaussian模型中的各项参数，这里全部都是上面__init__中涉及到的参数
     def UpdateGaussianParameters(self, ParametersDict, training_args):
+        self._invalidate_for_full_geometry_replacement(
+            "UpdateGaussianParameters replaced the complete Gaussian model"
+        )
         self.active_sh_degree = ParametersDict['active_sh_degree']
         self._xyz = ParametersDict['xyz']
         self._features_dc = ParametersDict['features_dc']
@@ -357,7 +363,131 @@ class GaussianModel:
         self.optimizer = None
         self.percent_dense = 0
         self.spatial_lr_scale = 0
+        self._topology_observer = None
+        self._topology_observer_owner = None
+        self._topology_observer_error = None
         self.setup_functions()
+
+    def set_topology_observer(self, observer, owner=None):
+        """Install one post-mutation semantic topology observer."""
+        if observer is not None and not callable(observer):
+            raise TypeError("topology observer must be callable or None")
+        if observer is None:
+            self._topology_observer = None
+            self._topology_observer_owner = None
+            return
+        if owner is None:
+            bound_owner = getattr(observer, "__self__", None)
+            if bound_owner is not None:
+                owner = bound_owner
+            elif callable(getattr(observer, "invalidate", None)):
+                owner = observer
+            else:
+                raise TypeError(
+                    "unbound topology observers require an explicit owner"
+                )
+        if not callable(getattr(owner, "invalidate", None)):
+            raise TypeError("topology observer owner must provide invalidate()")
+        observer_count = getattr(owner, "num_gaussians", None)
+        if observer_count != self.get_xyz.shape[0]:
+            raise ValueError(
+                "topology observer owner must match the current Gaussian count"
+            )
+        if not getattr(owner, "is_valid", False):
+            raise ValueError("cannot install an invalid semantic state owner")
+        self._topology_observer = observer
+        self._topology_observer_owner = owner
+        self._topology_observer_error = None
+
+    @property
+    def topology_requires_rebuild(self):
+        """Whether semantic topology sync failed without stopping geometry."""
+        return self._topology_observer_error is not None
+
+    @property
+    def topology_observer_error(self):
+        return self._topology_observer_error
+
+    def _emit_topology_delta(self, delta):
+        observer = self._topology_observer
+        if observer is not None and delta is not None:
+            try:
+                if delta.is_noop:
+                    return
+                observer(delta)
+            except Exception as error:
+                self._mark_topology_observer_failed(error)
+
+    def _build_topology_delta(self, factory, *args, **kwargs):
+        observer = self._topology_observer
+        if observer is None:
+            return None
+        try:
+            return factory(*args, **kwargs)
+        except Exception as error:
+            self._mark_topology_observer_failed(error)
+            return None
+
+    @staticmethod
+    def _clone_topology_delta(old_count, selected_mask):
+        parents = torch.nonzero(selected_mask, as_tuple=False).squeeze(1)
+        return TopologyDelta.clone(old_count, parents)
+
+    @staticmethod
+    def _split_topology_delta(old_count, selected_mask, children_per_parent):
+        parents = torch.nonzero(selected_mask, as_tuple=False).squeeze(1)
+        return TopologyDelta.split(
+            old_count,
+            parents,
+            children_per_parent=children_per_parent,
+        )
+
+    def _mark_topology_observer_failed(self, error):
+        owner = self._topology_observer_owner
+        self._topology_observer_error = error
+        self._topology_observer = None
+        self._topology_observer_owner = None
+        invalidate = getattr(owner, "invalidate", None)
+        if callable(invalidate):
+            try:
+                invalidate(error)
+            except Exception:
+                # Preserve the original sync error; invalidation is best-effort.
+                pass
+        try:
+            warnings.warn(
+                "semantic topology synchronization failed; geometry "
+                "continues and semantic state must be rebuilt: {}".format(
+                    error
+                ),
+                RuntimeWarning,
+            )
+        except Exception:
+            # Warning hooks and warnings-as-errors must not stop RGB geometry.
+            pass
+
+    def _invalidate_for_full_geometry_replacement(self, reason):
+        if self._topology_observer is not None:
+            self._mark_topology_observer_failed(RuntimeError(reason))
+
+    def geometry_sha256(self):
+        """Hash all ordered, row-aligned Gaussian attributes."""
+        digest = hashlib.sha256(b"semantic-atdom-geometry-v1\0")
+        attributes = (
+            ("xyz", self._xyz),
+            ("features_dc", self._features_dc),
+            ("features_rest", self._features_rest),
+            ("opacity", self._opacity),
+            ("scaling", self._scaling),
+            ("rotation", self._rotation),
+        )
+        for name, tensor in attributes:
+            value = tensor.detach().cpu().contiguous()
+            digest.update(name.encode("ascii") + b"\0")
+            digest.update(str(value.dtype).encode("ascii") + b"\0")
+            digest.update(str(tuple(value.shape)).encode("ascii") + b"\0")
+            digest.update(value.numpy().tobytes())
+        return digest.hexdigest()
 
     def capture(self, mask=None):
         if mask == None:
@@ -404,6 +534,9 @@ class GaussianModel:
             )
     
     def restore(self, model_args, training_args):
+        self._invalidate_for_full_geometry_replacement(
+            "restore replaced the complete Gaussian model"
+        )
         (self.active_sh_degree, 
         self._xyz, 
         self._features_dc, 
@@ -475,6 +608,9 @@ class GaussianModel:
 
         opacities = self.inverse_opacity_activation(0.1 * torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda"))
 
+        self._invalidate_for_full_geometry_replacement(
+            "create_from_pcd replaced the complete Gaussian model"
+        )
         self._xyz = nn.Parameter(fused_point_cloud.requires_grad_(True))
         self._features_dc = nn.Parameter(features[:,:,0:1].transpose(1, 2).contiguous().requires_grad_(True))
         self._features_rest = nn.Parameter(features[:,:,1:].transpose(1, 2).contiguous().requires_grad_(True))
@@ -646,6 +782,9 @@ class GaussianModel:
         for idx, attr_name in enumerate(rot_names):
             rots[:, idx] = np.asarray(plydata.elements[0][attr_name])
 
+        self._invalidate_for_full_geometry_replacement(
+            "load_ply replaced the complete Gaussian model"
+        )
         self._xyz = nn.Parameter(torch.tensor(xyz, dtype=torch.float, device="cuda").requires_grad_(True))
         self._features_dc = nn.Parameter(torch.tensor(features_dc, dtype=torch.float, device="cuda").transpose(1, 2).contiguous().requires_grad_(True))
         self._features_rest = nn.Parameter(torch.tensor(features_extra, dtype=torch.float, device="cuda").transpose(1, 2).contiguous().requires_grad_(True))
@@ -688,8 +827,13 @@ class GaussianModel:
                 optimizable_tensors[group["name"]] = group["params"][0]
         return optimizable_tensors
 
-    def prune_points(self, mask):
+    def prune_points(self, mask, emit_topology=True):
         valid_points_mask = ~mask
+        topology_delta = None
+        if self._topology_observer is not None and emit_topology:
+            topology_delta = self._build_topology_delta(
+                TopologyDelta.prune, valid_points_mask.reshape(-1)
+            )
         optimizable_tensors = self._prune_optimizer(valid_points_mask)
 
         self._xyz = optimizable_tensors["xyz"]
@@ -704,6 +848,8 @@ class GaussianModel:
         self.denom = self.denom[valid_points_mask]
         self.max_radii2D = self.max_radii2D[valid_points_mask]
         self.tmp_radii = self.tmp_radii[valid_points_mask] if self.tmp_radii is not None else None
+        if emit_topology:
+            self._emit_topology_delta(topology_delta)
 
     def cat_tensors_to_optimizer(self, tensors_dict):
         optimizable_tensors = {}
@@ -727,7 +873,25 @@ class GaussianModel:
 
         return optimizable_tensors
 
-    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_tmp_radii):
+    def densification_postfix(
+        self,
+        new_xyz,
+        new_features_dc,
+        new_features_rest,
+        new_opacities,
+        new_scaling,
+        new_rotation,
+        new_tmp_radii,
+        emit_topology=True,
+    ):
+        topology_delta = None
+        if self._topology_observer is not None and emit_topology:
+            topology_delta = self._build_topology_delta(
+                TopologyDelta.append_prior,
+                self.get_xyz.shape[0],
+                new_xyz.shape[0],
+                device=new_xyz.device,
+            )
         d = {"xyz": new_xyz,
         "f_dc": new_features_dc,
         "f_rest": new_features_rest,
@@ -747,6 +911,8 @@ class GaussianModel:
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+        if emit_topology:
+            self._emit_topology_delta(topology_delta)
 
     def densify_and_split(self, grads, grad_threshold, scene_extent, N=2):
         n_init_points = self.get_xyz.shape[0]
@@ -756,6 +922,14 @@ class GaussianModel:
         selected_pts_mask = torch.where(padded_grad >= grad_threshold, True, False)
         selected_pts_mask = torch.logical_and(selected_pts_mask,
                                               torch.max(self.get_scaling, dim=1).values > self.percent_dense*scene_extent)
+        topology_delta = None
+        if self._topology_observer is not None:
+            topology_delta = self._build_topology_delta(
+                self._split_topology_delta,
+                n_init_points,
+                selected_pts_mask,
+                N,
+            )
 
         stds = self.get_scaling[selected_pts_mask].repeat(N,1)
         means =torch.zeros((stds.size(0), 3),device="cuda")
@@ -769,16 +943,34 @@ class GaussianModel:
         new_opacity = self._opacity[selected_pts_mask].repeat(N,1)
         new_tmp_radii = self.tmp_radii[selected_pts_mask].repeat(N)
 
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_tmp_radii)
+        self.densification_postfix(
+            new_xyz,
+            new_features_dc,
+            new_features_rest,
+            new_opacity,
+            new_scaling,
+            new_rotation,
+            new_tmp_radii,
+            emit_topology=False,
+        )
 
         prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
-        self.prune_points(prune_filter)
+        self.prune_points(prune_filter, emit_topology=False)
+        self._emit_topology_delta(topology_delta)
 
     def densify_and_clone(self, grads, grad_threshold, scene_extent):
+        n_init_points = self.get_xyz.shape[0]
         # Extract points that satisfy the gradient condition
         selected_pts_mask = torch.where(torch.norm(grads, dim=-1) >= grad_threshold, True, False)
         selected_pts_mask = torch.logical_and(selected_pts_mask,
                                               torch.max(self.get_scaling, dim=1).values <= self.percent_dense*scene_extent)
+        topology_delta = None
+        if self._topology_observer is not None:
+            topology_delta = self._build_topology_delta(
+                self._clone_topology_delta,
+                n_init_points,
+                selected_pts_mask,
+            )
         
         new_xyz = self._xyz[selected_pts_mask]
         new_features_dc = self._features_dc[selected_pts_mask]
@@ -789,7 +981,17 @@ class GaussianModel:
 
         new_tmp_radii = self.tmp_radii[selected_pts_mask]
 
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_tmp_radii)
+        self.densification_postfix(
+            new_xyz,
+            new_features_dc,
+            new_features_rest,
+            new_opacities,
+            new_scaling,
+            new_rotation,
+            new_tmp_radii,
+            emit_topology=False,
+        )
+        self._emit_topology_delta(topology_delta)
 
     def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, radii):
         grads = self.xyz_gradient_accum / self.denom
@@ -832,4 +1034,3 @@ class GaussianModel:
 
     def get_rotation_matrix(self):
         return quaternion_to_matrix(self.get_rotation)
-

@@ -15,6 +15,7 @@ from semantic_atdom.semantics.schema import (
     SemanticLedger,
     SemanticSchemaError,
 )
+from semantic_atdom.semantics.provenance import SEMANTIC_METHOD_VERSION
 
 
 class SemanticStateError(ValueError):
@@ -24,12 +25,15 @@ class SemanticStateError(ValueError):
 class SemanticGaussianState:
     """Mutable sidecar tensors that are deliberately outside the RGB optimizer."""
 
-    SCHEMA_VERSION = 2
+    SCHEMA_VERSION = 3
+    RECOVERY_SCHEMA_VERSION = 2
     RECOVERY_CONTEXT_KEYS = (
+        "schema_version",
+        "semantic_method_version",
         "ledger",
         "label_provenance",
         "open_group",
-        "class_spec",
+        "ontology",
         "semantic_config",
     )
 
@@ -527,22 +531,29 @@ class SemanticGaussianState:
 
     def state_dict(
         self,
-        geometry_hash: str,
-        class_spec_hash: str,
+        projection_geometry_hash: str,
+        rgb_model_hash: str,
+        ontology_hash: str,
+        palette_hash: str,
         recovery_context: Mapping[str, object],
     ) -> Dict[str, object]:
         self._require_valid()
-        if not self._is_sha256(geometry_hash):
+        if not self._is_sha256(projection_geometry_hash):
             raise SemanticStateError(
-                "geometry_hash must be a lowercase SHA-256 digest"
+                "projection_geometry_hash must be a lowercase SHA-256 digest"
             )
-        if not self._is_sha256(class_spec_hash):
-            raise SemanticStateError(
-                "class_spec_hash must be a lowercase SHA-256 digest"
-            )
+        for name, value in (
+            ("rgb_model_hash", rgb_model_hash),
+            ("ontology_hash", ontology_hash),
+            ("palette_hash", palette_hash),
+        ):
+            if not self._is_sha256(value):
+                raise SemanticStateError(
+                    "{} must be a lowercase SHA-256 digest".format(name)
+                )
         context = self._validated_recovery_context(
             recovery_context,
-            class_spec_hash=class_spec_hash,
+            ontology_hash=ontology_hash,
             prior_total=self.prior_total,
             num_classes=self.num_classes,
         )
@@ -550,8 +561,11 @@ class SemanticGaussianState:
         context_sha256 = self.recovery_context_sha256(context)
         return {
             "schema_version": self.SCHEMA_VERSION,
-            "geometry_hash": geometry_hash,
-            "class_spec_hash": class_spec_hash,
+            "semantic_method_version": SEMANTIC_METHOD_VERSION,
+            "projection_geometry_hash": projection_geometry_hash,
+            "rgb_model_hash": rgb_model_hash,
+            "ontology_hash": ontology_hash,
+            "palette_hash": palette_hash,
             "num_classes": self.num_classes,
             "prior_total": self.prior_total,
             "topology_version": self.topology_version,
@@ -577,8 +591,10 @@ class SemanticGaussianState:
     def save(
         self,
         path: Path,
-        geometry_hash: str,
-        class_spec_hash: str,
+        projection_geometry_hash: str,
+        rgb_model_hash: str,
+        ontology_hash: str,
+        palette_hash: str,
         recovery_context: Mapping[str, object],
     ) -> None:
         path = Path(path)
@@ -586,7 +602,11 @@ class SemanticGaussianState:
         temporary = path.with_name(path.name + ".tmp")
         torch.save(
             self.state_dict(
-                geometry_hash, class_spec_hash, recovery_context
+                projection_geometry_hash,
+                rgb_model_hash,
+                ontology_hash,
+                palette_hash,
+                recovery_context,
             ),
             str(temporary),
         )
@@ -596,8 +616,8 @@ class SemanticGaussianState:
     def load(
         cls,
         path: Path,
-        expected_geometry_hash: str,
-        expected_class_spec_hash: str,
+        expected_projection_geometry_hash: str,
+        expected_ontology_hash: str,
         expected_gaussian_count: int,
         expected_recovery_context_sha256: str,
         map_location: Optional[str] = "cpu",
@@ -608,16 +628,27 @@ class SemanticGaussianState:
             raise SemanticStateError(
                 "unable to load semantic state {}: {}".format(path, error)
             )
-        if not isinstance(value, dict) or value.get("schema_version") not in (
-            1,
-            cls.SCHEMA_VERSION,
+        if (
+            not isinstance(value, dict)
+            or value.get("schema_version") != cls.SCHEMA_VERSION
         ):
-            raise SemanticStateError("unsupported semantic state schema")
-        if value.get("geometry_hash") != expected_geometry_hash:
-            raise SemanticStateError("semantic state geometry hash does not match")
-        if value.get("class_spec_hash") != expected_class_spec_hash:
             raise SemanticStateError(
-                "semantic state class spec hash does not match"
+                "unsupported semantic state schema; explicit rebuild is required"
+            )
+        if value.get("semantic_method_version") != SEMANTIC_METHOD_VERSION:
+            raise SemanticStateError(
+                "semantic state method version does not match; explicit rebuild is required"
+            )
+        if (
+            value.get("projection_geometry_hash")
+            != expected_projection_geometry_hash
+        ):
+            raise SemanticStateError(
+                "semantic state projection geometry hash does not match"
+            )
+        if value.get("ontology_hash") != expected_ontology_hash:
+            raise SemanticStateError(
+                "semantic state ontology hash does not match"
             )
         if not cls._is_sha256(expected_recovery_context_sha256):
             raise SemanticStateError(
@@ -638,25 +669,31 @@ class SemanticGaussianState:
             "recovery_context_sha256",
             "gaussian_ids_sha256",
             "num_classes",
+            "rgb_model_hash",
+            "palette_hash",
         )
-        if value.get("schema_version") == cls.SCHEMA_VERSION:
-            required += (
-                "open_raw_evidence",
-                "open_robust_evidence",
-                "open_group_count",
-                "open_distributions",
-                "open_supports",
-                "open_semantic_supports",
-            )
+        required += (
+            "open_raw_evidence",
+            "open_robust_evidence",
+            "open_group_count",
+            "open_distributions",
+            "open_supports",
+            "open_semantic_supports",
+        )
         missing = [name for name in required if name not in value]
         if missing:
             raise SemanticStateError(
                 "semantic state is missing fields: {}".format(missing)
             )
+        for name in ("rgb_model_hash", "palette_hash"):
+            if not cls._is_sha256(value[name]):
+                raise SemanticStateError(
+                    "semantic state {} is corrupted".format(name)
+                )
         try:
             context = cls._validated_recovery_context(
                 value["recovery_context"],
-                class_spec_hash=expected_class_spec_hash,
+                ontology_hash=expected_ontology_hash,
                 prior_total=value["prior_total"],
                 num_classes=value["num_classes"],
             )
@@ -713,7 +750,7 @@ class SemanticGaussianState:
     def _validated_recovery_context(
         cls,
         value: object,
-        class_spec_hash: str,
+        ontology_hash: str,
         prior_total: float,
         num_classes: int,
     ) -> Dict[str, object]:
@@ -727,6 +764,14 @@ class SemanticGaussianState:
         if missing:
             raise SemanticStateError(
                 "recovery_context is missing fields: {}".format(missing)
+            )
+        if value["schema_version"] != cls.RECOVERY_SCHEMA_VERSION:
+            raise SemanticStateError(
+                "unsupported semantic recovery schema; explicit rebuild is required"
+            )
+        if value["semantic_method_version"] != SEMANTIC_METHOD_VERSION:
+            raise SemanticStateError(
+                "semantic recovery method version does not match"
             )
         ledger_value = value["ledger"]
         if (
@@ -791,24 +836,45 @@ class SemanticGaussianState:
 
         open_group = cls._validated_open_group(value["open_group"])
 
+        ontology = value["ontology"]
         try:
-            class_spec = SemanticClassSpec.from_dict(value["class_spec"])
-        except (SemanticSchemaError, AttributeError) as error:
+            raw_classes = ontology["classes"]
+            class_ids = [item["id"] for item in raw_classes]
+            names = [item["name"] for item in raw_classes]
+            backgrounds = [item["is_background"] for item in raw_classes]
+        except (KeyError, TypeError) as error:
             raise SemanticStateError(
-                "invalid class spec recovery payload: {}".format(error)
+                "invalid ontology recovery payload: {}".format(error)
             )
-        if class_spec.fingerprint != class_spec_hash:
+        if (
+            not isinstance(ontology, Mapping)
+            or ontology.get("schema_version") != 1
+            or ontology.get("ignore_id") != 255
+            or not isinstance(raw_classes, list)
+            or not raw_classes
+            or class_ids != list(range(len(raw_classes)))
+            or any(not isinstance(name, str) or not name for name in names)
+            or len(names) != len(set(names))
+            or any(not isinstance(item, bool) for item in backgrounds)
+            or sum(backgrounds) > 1
+        ):
+            raise SemanticStateError("invalid ontology recovery payload")
+        if SemanticClassSpec._fingerprint(ontology) != ontology_hash:
             raise SemanticStateError(
-                "recovery class spec does not match class_spec_hash"
+                "recovery ontology does not match ontology_hash"
             )
-        if class_spec.num_classes != num_classes:
+        if len(raw_classes) != num_classes:
             raise SemanticStateError(
-                "recovery class spec does not match semantic state width"
+                "recovery ontology does not match semantic state width"
             )
 
         config = value["semantic_config"]
-        if not isinstance(config, Mapping) or config.get("schema_version") != 1:
+        if not isinstance(config, Mapping) or config.get("schema_version") != 2:
             raise SemanticStateError("invalid semantic config recovery payload")
+        if config.get("semantic_method_version") != SEMANTIC_METHOD_VERSION:
+            raise SemanticStateError(
+                "semantic config method version does not match"
+            )
         config_prior = config.get("prior_total")
         if isinstance(config_prior, bool) or not isinstance(
             config_prior, (int, float)
@@ -820,13 +886,15 @@ class SemanticGaussianState:
             )
 
         normalized = {
+            "schema_version": cls.RECOVERY_SCHEMA_VERSION,
+            "semantic_method_version": SEMANTIC_METHOD_VERSION,
             "ledger": {
                 "schema_version": 1,
                 "observations": [entry.to_dict() for entry in ledger.entries],
             },
             "label_provenance": dict(provenance),
             "open_group": open_group,
-            "class_spec": class_spec.to_dict(),
+            "ontology": dict(ontology),
             "semantic_config": dict(config),
         }
         try:
@@ -864,14 +932,14 @@ class SemanticGaussianState:
     def validated_recovery_context_sha256(
         cls,
         value: Mapping[str, object],
-        class_spec_hash: str,
+        ontology_hash: str,
         prior_total: float,
         num_classes: int,
     ) -> str:
         """Fingerprint externally loaded recovery inputs after validation."""
         normalized = cls._validated_recovery_context(
             value,
-            class_spec_hash=class_spec_hash,
+            ontology_hash=ontology_hash,
             prior_total=prior_total,
             num_classes=num_classes,
         )

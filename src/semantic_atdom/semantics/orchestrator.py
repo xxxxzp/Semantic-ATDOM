@@ -2,7 +2,6 @@
 
 from dataclasses import dataclass
 from concurrent.futures import ThreadPoolExecutor
-import hashlib
 import json
 import math
 import os
@@ -29,6 +28,12 @@ from semantic_atdom.semantics.schema import (
     sha256_file,
 )
 from semantic_atdom.semantics.state import SemanticGaussianState
+from semantic_atdom.semantics.provenance import (
+    RGB_MODEL_ATTRIBUTE_NAMES,
+    SEMANTIC_METHOD_VERSION,
+    rgb_model_sha256,
+    semantic_projection_sha256,
+)
 from semantic_atdom.semantics.tdom import (
     SemanticTdomConfig,
     rasterize_semantic_tdom,
@@ -50,14 +55,7 @@ def _acquisition_key(image_id: str):
     return (0, int(match.group(1)), image_id)
 
 
-_GEOMETRY_ATTRIBUTE_NAMES = (
-    "xyz",
-    "features_dc",
-    "features_rest",
-    "opacity",
-    "scaling",
-    "rotation",
-)
+_GEOMETRY_ATTRIBUTE_NAMES = RGB_MODEL_ATTRIBUTE_NAMES
 
 
 def _geometry_attributes(gaussians) -> Dict[str, torch.Tensor]:
@@ -74,17 +72,6 @@ def _geometry_attributes(gaussians) -> Dict[str, torch.Tensor]:
         name: getattr(gaussians, "_" + name).detach().cpu().contiguous()
         for name in _GEOMETRY_ATTRIBUTE_NAMES
     }
-
-
-def _geometry_attributes_sha256(attributes: Mapping[str, torch.Tensor]) -> str:
-    digest = hashlib.sha256(b"semantic-atdom-geometry-v1\0")
-    for name in _GEOMETRY_ATTRIBUTE_NAMES:
-        value = attributes[name].detach().cpu().contiguous()
-        digest.update(name.encode("ascii") + b"\0")
-        digest.update(str(value.dtype).encode("ascii") + b"\0")
-        digest.update(str(tuple(value.shape)).encode("ascii") + b"\0")
-        digest.update(value.numpy().tobytes())
-    return digest.hexdigest()
 
 
 def _tdom_alignment(camera, supplied: Optional[Mapping[str, object]] = None):
@@ -203,7 +190,8 @@ class OnlineSemanticConfig:
 
     def to_dict(self) -> Dict[str, object]:
         return {
-            "schema_version": 1,
+            "schema_version": 2,
+            "semantic_method_version": SEMANTIC_METHOD_VERSION,
             "overlap_threshold": self.overlap_threshold,
             "max_group_size": self.max_group_size,
             "reliability_floor": self.reliability_floor,
@@ -242,7 +230,8 @@ class FrozenGaussianSnapshot:
             for name in self._ATTRIBUTE_NAMES
         }
         self._cpu_values = None
-        self._geometry_hash = None
+        self._projection_hash = None
+        self._rgb_model_hash = None
 
     @property
     def get_xyz(self):
@@ -260,12 +249,23 @@ class FrozenGaussianSnapshot:
     def get_rotation(self):
         return torch.nn.functional.normalize(self._values["rotation"])
 
-    def geometry_sha256(self) -> str:
-        if self._geometry_hash is None:
-            self._geometry_hash = _geometry_attributes_sha256(
+    def semantic_projection_sha256(self) -> str:
+        if self._projection_hash is None:
+            self._projection_hash = semantic_projection_sha256(
                 self.geometry_attributes_cpu()
             )
-        return self._geometry_hash
+        return self._projection_hash
+
+    def rgb_model_sha256(self) -> str:
+        if self._rgb_model_hash is None:
+            self._rgb_model_hash = rgb_model_sha256(
+                self.geometry_attributes_cpu()
+            )
+        return self._rgb_model_hash
+
+    def geometry_sha256(self) -> str:
+        """Deprecated complete-model hash alias kept for external callers."""
+        return self.rgb_model_sha256()
 
     def geometry_attributes_cpu(self) -> Dict[str, torch.Tensor]:
         if self._cpu_values is None:
@@ -715,6 +715,8 @@ class OnlineSemanticOrchestrator:
 
     def recovery_context(self) -> Dict[str, object]:
         return {
+            "schema_version": 2,
+            "semantic_method_version": SEMANTIC_METHOD_VERSION,
             "ledger": {
                 "schema_version": 1,
                 "observations": [
@@ -723,7 +725,7 @@ class OnlineSemanticOrchestrator:
             },
             "label_provenance": self.label_provenance,
             "open_group": self.open_group,
-            "class_spec": self.class_spec.to_dict(),
+            "ontology": self.class_spec.ontology_dict(),
             "semantic_config": self.config.to_dict(),
         }
 
@@ -764,7 +766,11 @@ class ProgressiveSemanticHook:
                 with latest_path.open("r", encoding="utf-8") as stream:
                     latest = json.load(stream)
                 if (
-                    latest.get("schema_version") != 2
+                    latest.get("schema_version") != 3
+                    or latest.get("semantic_method_version")
+                    != SEMANTIC_METHOD_VERSION
+                    or latest.get("ontology_hash")
+                    != dataset.class_spec.ontology_fingerprint
                     or latest.get("slot") not in (0, 1)
                 ):
                     raise ValueError("invalid latest semantic slot")
@@ -797,17 +803,31 @@ class ProgressiveSemanticHook:
                     str(geometry_path), map_location="cpu"
                 )
                 attributes = geometry_payload["attributes"]
-                checkpoint_geometry_hash = _geometry_attributes_sha256(attributes)
+                checkpoint_projection_hash = semantic_projection_sha256(
+                    attributes
+                )
+                checkpoint_rgb_hash = rgb_model_sha256(attributes)
+                current_attributes = _geometry_attributes(gaussians)
+                current_projection_hash = semantic_projection_sha256(
+                    current_attributes
+                )
+                current_rgb_hash = rgb_model_sha256(current_attributes)
             except (OSError, ValueError, RuntimeError, KeyError, TypeError) as error:
                 raise SemanticSchemaError(
                     "unable to validate geometry checkpoint: {}".format(error)
                 )
             if (
-                geometry_payload.get("schema_version") != 1
-                or geometry_payload.get("geometry_hash")
-                != checkpoint_geometry_hash
-                or latest.get("geometry_hash") != checkpoint_geometry_hash
-                or gaussians.geometry_sha256() != checkpoint_geometry_hash
+                geometry_payload.get("schema_version") != 2
+                or geometry_payload.get("semantic_method_version")
+                != SEMANTIC_METHOD_VERSION
+                or geometry_payload.get("projection_geometry_hash")
+                != checkpoint_projection_hash
+                or geometry_payload.get("rgb_model_hash") != checkpoint_rgb_hash
+                or latest.get("projection_geometry_hash")
+                != checkpoint_projection_hash
+                or latest.get("rgb_model_hash") != checkpoint_rgb_hash
+                or current_projection_hash != checkpoint_projection_hash
+                or current_rgb_hash != checkpoint_rgb_hash
             ):
                 raise SemanticSchemaError(
                     "semantic recovery does not match the persisted geometry checkpoint"
@@ -818,7 +838,7 @@ class ProgressiveSemanticHook:
                 )
             recovery_hash = SemanticGaussianState.validated_recovery_context_sha256(
                 context,
-                class_spec_hash=dataset.class_spec.fingerprint,
+                ontology_hash=dataset.class_spec.ontology_fingerprint,
                 prior_total=config.prior_total,
                 num_classes=dataset.class_spec.num_classes,
             )
@@ -828,8 +848,8 @@ class ProgressiveSemanticHook:
                 )
             state = SemanticGaussianState.load(
                 state_path,
-                expected_geometry_hash=gaussians.geometry_sha256(),
-                expected_class_spec_hash=dataset.class_spec.fingerprint,
+                expected_projection_geometry_hash=current_projection_hash,
+                expected_ontology_hash=dataset.class_spec.ontology_fingerprint,
                 expected_gaussian_count=gaussians.get_xyz.shape[0],
                 expected_recovery_context_sha256=recovery_hash,
                 map_location=gaussians.get_xyz.device,
@@ -995,9 +1015,15 @@ class ProgressiveSemanticHook:
                     self._save_json_atomic(
                         self.output_root / "final_rebuild_metrics.json",
                         {
-                            "schema_version": 1,
+                            "schema_version": 2,
+                            "semantic_method_version": SEMANTIC_METHOD_VERSION,
                             "geometry_stage": geometry_stage,
-                            "geometry_hash": gaussians.geometry_sha256(),
+                            "projection_geometry_hash": semantic_projection_sha256(
+                                _geometry_attributes(gaussians)
+                            ),
+                            "rgb_model_hash": rgb_model_sha256(
+                                _geometry_attributes(gaussians)
+                            ),
                             "groups": [list(group) for group in rebuilt.image_groups],
                             "metrics": rebuilt.metrics.to_dict(),
                         },
@@ -1052,7 +1078,12 @@ class ProgressiveSemanticHook:
                         "geometry_stage": result.geometry_stage,
                         "semantic_through_image": result.semantic_through_image,
                         "label_version": self.orchestrator.label_version,
-                        "geometry_hash": gaussians.geometry_sha256(),
+                        "projection_geometry_hash": semantic_projection_sha256(
+                            _geometry_attributes(gaussians)
+                        ),
+                        "rgb_model_hash": rgb_model_sha256(
+                            _geometry_attributes(gaussians)
+                        ),
                         "posterior": (
                             "robust_exact_final"
                             if exact_rebuilt
@@ -1161,8 +1192,14 @@ class ProgressiveSemanticHook:
     def _persist(self, gaussians, result: SemanticSyncResult) -> None:
         self.output_root.mkdir(parents=True, exist_ok=True)
         attributes = _geometry_attributes(gaussians)
-        geometry_hash = _geometry_attributes_sha256(attributes)
-        if geometry_hash != gaussians.geometry_sha256():
+        projection_geometry_hash = semantic_projection_sha256(attributes)
+        rgb_hash = rgb_model_sha256(attributes)
+        current_attributes = _geometry_attributes(gaussians)
+        if (
+            projection_geometry_hash
+            != semantic_projection_sha256(current_attributes)
+            or rgb_hash != rgb_model_sha256(current_attributes)
+        ):
             raise SemanticSchemaError(
                 "frozen geometry changed while semantic state was persisted"
             )
@@ -1181,13 +1218,15 @@ class ProgressiveSemanticHook:
         geometry_path = self.output_root / "geometry_checkpoint.{}.pt".format(slot)
         self.orchestrator.state.save(
             state_path,
-            geometry_hash=geometry_hash,
-            class_spec_hash=self.dataset.class_spec.fingerprint,
+            projection_geometry_hash=projection_geometry_hash,
+            rgb_model_hash=rgb_hash,
+            ontology_hash=self.dataset.class_spec.ontology_fingerprint,
+            palette_hash=self.dataset.class_spec.palette_fingerprint,
             recovery_context=context,
         )
         context_hash = SemanticGaussianState.validated_recovery_context_sha256(
             context,
-            class_spec_hash=self.dataset.class_spec.fingerprint,
+            ontology_hash=self.dataset.class_spec.ontology_fingerprint,
             prior_total=self.orchestrator.config.prior_total,
             num_classes=self.dataset.class_spec.num_classes,
         )
@@ -1195,8 +1234,10 @@ class ProgressiveSemanticHook:
         self._save_torch_atomic(
             geometry_path,
             {
-                "schema_version": 1,
-                "geometry_hash": geometry_hash,
+                "schema_version": 2,
+                "semantic_method_version": SEMANTIC_METHOD_VERSION,
+                "projection_geometry_hash": projection_geometry_hash,
+                "rgb_model_hash": rgb_hash,
                 "attributes": attributes,
             },
         )
@@ -1204,9 +1245,13 @@ class ProgressiveSemanticHook:
         self._save_json_atomic(
             latest_path,
             {
-                "schema_version": 2,
+                "schema_version": 3,
+                "semantic_method_version": SEMANTIC_METHOD_VERSION,
                 "slot": slot,
-                "geometry_hash": geometry_hash,
+                "projection_geometry_hash": projection_geometry_hash,
+                "rgb_model_hash": rgb_hash,
+                "ontology_hash": self.dataset.class_spec.ontology_fingerprint,
+                "palette_hash": self.dataset.class_spec.palette_fingerprint,
                 "geometry_checkpoint": geometry_path.name,
                 "geometry_checkpoint_sha256": geometry_checkpoint_hash,
                 "recovery_context_sha256": context_hash,
@@ -1215,7 +1260,8 @@ class ProgressiveSemanticHook:
         self.orchestrator.state.recovery_context = context
         self.orchestrator.ledger.save(self.output_root / "ledger.json")
         payload = {
-            "schema_version": 1,
+            "schema_version": 2,
+            "semantic_method_version": SEMANTIC_METHOD_VERSION,
             "geometry_stage": result.geometry_stage,
             "semantic_through_image": result.semantic_through_image,
             "label_version": self.orchestrator.label_version,

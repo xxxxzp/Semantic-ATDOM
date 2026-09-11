@@ -15,6 +15,7 @@ from PIL import Image
 import torch
 
 from semantic_atdom.semantics.schema import SemanticClassSpec, sha256_file
+from semantic_atdom.semantics.provenance import SEMANTIC_METHOD_VERSION
 
 
 class UnknownReason(IntFlag):
@@ -1011,9 +1012,12 @@ def write_semantic_tdom(
     )
     payload.update(
         {
-            "schema_version": 2,
+            "schema_version": 3,
+            "semantic_method_version": SEMANTIC_METHOD_VERSION,
             "width": int(result.class_ids.shape[1]),
             "height": int(result.class_ids.shape[0]),
+            "ontology_hash": class_spec.ontology_fingerprint,
+            "palette_hash": files["render_palette.json"],
             "class_spec_sha256": class_spec.fingerprint,
             "class_spec": class_spec.to_dict(),
             "render_palette_sha256": files["render_palette.json"],

@@ -28,6 +28,13 @@ from semantic_atdom.semantics.state import (
     SemanticStateError,
 )
 from semantic_atdom.semantics.topology import TopologyDelta
+from semantic_atdom.semantics.provenance import (
+    RGB_MODEL_ATTRIBUTE_NAMES,
+    SEMANTIC_METHOD_VERSION,
+    SEMANTIC_PROJECTION_ATTRIBUTE_NAMES,
+    rgb_model_sha256,
+    semantic_projection_sha256,
+)
 from semantic_atdom.semantics.orchestrator import (
     AcquisitionOverlap,
     AsyncProgressiveSemanticHook,
@@ -68,6 +75,11 @@ __all__ = [
     "SemanticGaussianState",
     "SemanticStateError",
     "TopologyDelta",
+    "RGB_MODEL_ATTRIBUTE_NAMES",
+    "SEMANTIC_METHOD_VERSION",
+    "SEMANTIC_PROJECTION_ATTRIBUTE_NAMES",
+    "rgb_model_sha256",
+    "semantic_projection_sha256",
     "AcquisitionOverlap",
     "AsyncProgressiveSemanticHook",
     "CudaSemanticProjector",

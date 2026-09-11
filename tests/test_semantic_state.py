@@ -9,6 +9,7 @@ from semantic_atdom.semantics.state import (
     SemanticStateError,
 )
 from semantic_atdom.semantics.schema import SemanticClassSpec
+from semantic_atdom.semantics.provenance import SEMANTIC_METHOD_VERSION
 from semantic_atdom.semantics.topology import TopologyDelta
 
 
@@ -21,9 +22,14 @@ STATE_CLASS_SPEC = {
         {"id": 2, "name": "vegetation", "color": [0, 255, 0]},
     ],
 }
-STATE_CLASS_SPEC_HASH = SemanticClassSpec.from_dict(STATE_CLASS_SPEC).fingerprint
-GEOMETRY_HASH = "a" * 64
+STATE_SPEC = SemanticClassSpec.from_dict(STATE_CLASS_SPEC)
+ONTOLOGY_HASH = STATE_SPEC.ontology_fingerprint
+PALETTE_HASH = STATE_SPEC.palette_fingerprint
+PROJECTION_GEOMETRY_HASH = "a" * 64
+RGB_MODEL_HASH = "b" * 64
 RECOVERY_CONTEXT = {
+    "schema_version": 2,
+    "semantic_method_version": SEMANTIC_METHOD_VERSION,
     "ledger": {"schema_version": 1, "observations": []},
     "label_provenance": {
         "schema_version": 1,
@@ -37,8 +43,12 @@ RECOVERY_CONTEXT = {
         },
     },
     "open_group": None,
-    "class_spec": STATE_CLASS_SPEC,
-    "semantic_config": {"schema_version": 1, "prior_total": 1.0},
+    "ontology": STATE_SPEC.ontology_dict(),
+    "semantic_config": {
+        "schema_version": 2,
+        "semantic_method_version": SEMANTIC_METHOD_VERSION,
+        "prior_total": 1.0,
+    },
 }
 
 
@@ -119,21 +129,23 @@ class SemanticGaussianStateTests(unittest.TestCase):
             path = Path(directory) / "semantic_state.pt"
             state.save(
                 path,
-                geometry_hash=GEOMETRY_HASH,
-                class_spec_hash=STATE_CLASS_SPEC_HASH,
+                projection_geometry_hash=PROJECTION_GEOMETRY_HASH,
+                rgb_model_hash=RGB_MODEL_HASH,
+                ontology_hash=ONTOLOGY_HASH,
+                palette_hash=PALETTE_HASH,
                 recovery_context=RECOVERY_CONTEXT,
             )
             recovery_hash = state.validated_recovery_context_sha256(
                 RECOVERY_CONTEXT,
-                class_spec_hash=STATE_CLASS_SPEC_HASH,
+                ontology_hash=ONTOLOGY_HASH,
                 prior_total=1.0,
                 num_classes=3,
             )
 
             restored = SemanticGaussianState.load(
                 path,
-                expected_geometry_hash=GEOMETRY_HASH,
-                expected_class_spec_hash=STATE_CLASS_SPEC_HASH,
+                expected_projection_geometry_hash=PROJECTION_GEOMETRY_HASH,
+                expected_ontology_hash=ONTOLOGY_HASH,
                 expected_gaussian_count=2,
                 expected_recovery_context_sha256=recovery_hash,
             )
@@ -147,8 +159,8 @@ class SemanticGaussianStateTests(unittest.TestCase):
             with self.assertRaisesRegex(SemanticStateError, "geometry"):
                 SemanticGaussianState.load(
                     path,
-                    expected_geometry_hash="c" * 64,
-                    expected_class_spec_hash=STATE_CLASS_SPEC_HASH,
+                    expected_projection_geometry_hash="c" * 64,
+                    expected_ontology_hash=ONTOLOGY_HASH,
                     expected_gaussian_count=2,
                     expected_recovery_context_sha256=recovery_hash,
                 )
@@ -156,8 +168,8 @@ class SemanticGaussianStateTests(unittest.TestCase):
             with self.assertRaisesRegex(SemanticStateError, "count"):
                 SemanticGaussianState.load(
                     path,
-                    expected_geometry_hash=GEOMETRY_HASH,
-                    expected_class_spec_hash=STATE_CLASS_SPEC_HASH,
+                    expected_projection_geometry_hash=PROJECTION_GEOMETRY_HASH,
+                    expected_ontology_hash=ONTOLOGY_HASH,
                     expected_gaussian_count=3,
                     expected_recovery_context_sha256=recovery_hash,
                 )
@@ -165,18 +177,66 @@ class SemanticGaussianStateTests(unittest.TestCase):
             with self.assertRaisesRegex(SemanticStateError, "current inputs"):
                 SemanticGaussianState.load(
                     path,
-                    expected_geometry_hash=GEOMETRY_HASH,
-                    expected_class_spec_hash=STATE_CLASS_SPEC_HASH,
+                    expected_projection_geometry_hash=PROJECTION_GEOMETRY_HASH,
+                    expected_ontology_hash=ONTOLOGY_HASH,
                     expected_gaussian_count=2,
                     expected_recovery_context_sha256="d" * 64,
                 )
 
+            payload = torch.load(str(path), map_location="cpu")
+            self.assertEqual(payload["schema_version"], 3)
+            self.assertEqual(
+                payload["semantic_method_version"], SEMANTIC_METHOD_VERSION
+            )
+            self.assertEqual(payload["ontology_hash"], ONTOLOGY_HASH)
+            self.assertEqual(payload["palette_hash"], PALETTE_HASH)
+            self.assertEqual(payload["rgb_model_hash"], RGB_MODEL_HASH)
+
+    def test_sidecar_explicitly_rejects_old_schema_and_method(self):
+        state = SemanticGaussianState.initialize(1, 3)
+        recovery_hash = state.validated_recovery_context_sha256(
+            RECOVERY_CONTEXT, ONTOLOGY_HASH, 1.0, 3
+        )
+        payload = state.state_dict(
+            PROJECTION_GEOMETRY_HASH,
+            RGB_MODEL_HASH,
+            ONTOLOGY_HASH,
+            PALETTE_HASH,
+            RECOVERY_CONTEXT,
+        )
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "semantic_state.pt"
+            payload["schema_version"] = 2
+            torch.save(payload, str(path))
+            with self.assertRaisesRegex(SemanticStateError, "schema"):
+                SemanticGaussianState.load(
+                    path,
+                    PROJECTION_GEOMETRY_HASH,
+                    ONTOLOGY_HASH,
+                    1,
+                    recovery_hash,
+                )
+
+            payload["schema_version"] = 3
+            payload["semantic_method_version"] = "g1-alpha-v1"
+            torch.save(payload, str(path))
+            with self.assertRaisesRegex(SemanticStateError, "method version"):
+                SemanticGaussianState.load(
+                    path,
+                    PROJECTION_GEOMETRY_HASH,
+                    ONTOLOGY_HASH,
+                    1,
+                    recovery_hash,
+                )
+
     def test_recovery_context_rejects_placeholders(self):
         state = SemanticGaussianState.initialize(1, 3)
-        with self.assertRaisesRegex(SemanticStateError, "ledger"):
+        with self.assertRaisesRegex(SemanticStateError, "schema"):
             state.state_dict(
-                GEOMETRY_HASH,
-                STATE_CLASS_SPEC_HASH,
+                PROJECTION_GEOMETRY_HASH,
+                RGB_MODEL_HASH,
+                ONTOLOGY_HASH,
+                PALETTE_HASH,
                 {name: None for name in state.RECOVERY_CONTEXT_KEYS},
             )
 
@@ -202,7 +262,11 @@ class SemanticGaussianStateTests(unittest.TestCase):
             state.add_evidence(torch.zeros((1, 3)))
         with self.assertRaisesRegex(SemanticStateError, "requires rebuild"):
             state.state_dict(
-                GEOMETRY_HASH, STATE_CLASS_SPEC_HASH, RECOVERY_CONTEXT
+                PROJECTION_GEOMETRY_HASH,
+                RGB_MODEL_HASH,
+                ONTOLOGY_HASH,
+                PALETTE_HASH,
+                RECOVERY_CONTEXT,
             )
 
     def test_noop_delta_does_not_rebuild_or_increment_topology(self):

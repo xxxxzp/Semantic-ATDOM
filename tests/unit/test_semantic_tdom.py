@@ -289,6 +289,16 @@ class SemanticTdomTests(unittest.TestCase):
             for name in expected:
                 self.assertEqual(payload["files"][name], sha256_file(root / name))
             self.assertEqual(payload["geometry_stage"], 31)
+            self.assertEqual(payload["schema_version"], 3)
+            self.assertEqual(
+                payload["semantic_method_version"], "g1-evidence-v2"
+            )
+            self.assertEqual(
+                payload["ontology_hash"], CLASS_SPEC.ontology_fingerprint
+            )
+            self.assertEqual(
+                payload["palette_hash"], payload["render_palette_sha256"]
+            )
             self.assertEqual(payload["class_spec_sha256"], CLASS_SPEC.fingerprint)
             self.assertEqual(payload["class_spec"], CLASS_SPEC.to_dict())
             self.assertEqual(

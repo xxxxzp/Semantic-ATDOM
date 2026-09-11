@@ -51,6 +51,17 @@ class SemanticSchemaTests(unittest.TestCase):
         self.assertEqual(first.background_id, 0)
         self.assertEqual(first.fingerprint, second.fingerprint)
 
+    def test_ontology_and_display_palette_have_independent_fingerprints(self):
+        first = SemanticClassSpec.from_dict(CLASS_SPEC)
+        recolored = dict(CLASS_SPEC)
+        recolored["classes"] = [dict(item) for item in CLASS_SPEC["classes"]]
+        recolored["classes"][1]["color"] = [1, 2, 3]
+        second = SemanticClassSpec.from_dict(recolored)
+
+        self.assertEqual(first.ontology_fingerprint, second.ontology_fingerprint)
+        self.assertNotEqual(first.palette_fingerprint, second.palette_fingerprint)
+        self.assertNotEqual(first.fingerprint, second.fingerprint)
+
     def test_class_ids_must_be_contiguous(self):
         invalid = dict(CLASS_SPEC)
         invalid["classes"] = [

@@ -114,6 +114,8 @@ class RepositoryLayoutTests(unittest.TestCase):
                 "0002-dirichlet-semantic-field.md",
                 "0003-stage-synchronous-semantics.md",
                 "0004-clean-atdom-lineage.md",
+                "0005-evidence-conditioned-semantic-rendering.md",
+                "0006-bounded-online-semantic-products.md",
             },
             {path.name for path in decisions.glob("*.md")},
         )

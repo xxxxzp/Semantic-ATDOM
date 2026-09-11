@@ -240,16 +240,23 @@ class OnlineSemanticOrchestratorTests(unittest.TestCase):
         runner.ingest(observation("000001"), projection([1, 0], 0.5), matrix)
         context = runner.recovery_context()
         recovery_hash = state.validated_recovery_context_sha256(
-            context, CLASS_SPEC.fingerprint, 1.0, 2
+            context, CLASS_SPEC.ontology_fingerprint, 1.0, 2
         )
 
         with TemporaryDirectory() as directory:
             path = Path(directory) / "semantic_state.pt"
-            state.save(path, "a" * 64, CLASS_SPEC.fingerprint, context)
+            state.save(
+                path,
+                "a" * 64,
+                "b" * 64,
+                CLASS_SPEC.ontology_fingerprint,
+                CLASS_SPEC.palette_fingerprint,
+                context,
+            )
             restored = SemanticGaussianState.load(
                 path,
-                expected_geometry_hash="a" * 64,
-                expected_class_spec_hash=CLASS_SPEC.fingerprint,
+                expected_projection_geometry_hash="a" * 64,
+                expected_ontology_hash=CLASS_SPEC.ontology_fingerprint,
                 expected_gaussian_count=1,
                 expected_recovery_context_sha256=recovery_hash,
             )
@@ -340,6 +347,12 @@ class OnlineSemanticOrchestratorTests(unittest.TestCase):
 
 
 class ProgressiveSemanticHookTests(unittest.TestCase):
+    def test_online_config_declares_evidence_method_and_schema(self):
+        payload = OnlineSemanticConfig().to_dict()
+
+        self.assertEqual(payload["schema_version"], 2)
+        self.assertEqual(payload["semantic_method_version"], "g1-evidence-v2")
+
     def test_final_hook_rebuilds_every_ready_label_exactly_twice(self):
         class Camera:
             def __init__(self, image_name):
@@ -540,7 +553,18 @@ class ProgressiveSemanticHookTests(unittest.TestCase):
             latest = json.loads(
                 (root / "output" / "latest.json").read_text(encoding="utf-8")
             )
-            self.assertEqual(latest["schema_version"], 2)
+            self.assertEqual(latest["schema_version"], 3)
+            self.assertEqual(
+                latest["semantic_method_version"], "g1-evidence-v2"
+            )
+            self.assertEqual(
+                latest["ontology_hash"], dataset.class_spec.ontology_fingerprint
+            )
+            self.assertEqual(
+                latest["palette_hash"], dataset.class_spec.palette_fingerprint
+            )
+            self.assertIn("projection_geometry_hash", latest)
+            self.assertIn("rgb_model_hash", latest)
             self.assertTrue(
                 (root / "output" / latest["geometry_checkpoint"]).is_file()
             )

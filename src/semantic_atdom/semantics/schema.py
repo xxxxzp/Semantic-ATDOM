@@ -135,15 +135,52 @@ class SemanticClassSpec:
             "classes": [item.to_dict() for item in self.classes],
         }
 
-    @property
-    def fingerprint(self) -> str:
+    def ontology_dict(self) -> Dict[str, object]:
+        """Return class meaning without presentation-only colors."""
+        return {
+            "schema_version": self.schema_version,
+            "ignore_id": self.ignore_id,
+            "classes": [
+                {
+                    "id": item.class_id,
+                    "name": item.name,
+                    "is_background": item.is_background,
+                }
+                for item in self.classes
+            ],
+        }
+
+    def palette_dict(self) -> Dict[str, object]:
+        """Return the display mapping independently from class meaning."""
+        return {
+            "schema_version": self.schema_version,
+            "classes": [
+                {"id": item.class_id, "color": list(item.color)}
+                for item in self.classes
+            ],
+        }
+
+    @staticmethod
+    def _fingerprint(value: Mapping[str, object]) -> str:
         canonical = json.dumps(
-            self.to_dict(),
+            value,
             ensure_ascii=False,
             sort_keys=True,
             separators=(",", ":"),
         ).encode("utf-8")
         return hashlib.sha256(canonical).hexdigest()
+
+    @property
+    def fingerprint(self) -> str:
+        return self._fingerprint(self.to_dict())
+
+    @property
+    def ontology_fingerprint(self) -> str:
+        return self._fingerprint(self.ontology_dict())
+
+    @property
+    def palette_fingerprint(self) -> str:
+        return self._fingerprint(self.palette_dict())
 
 
 @dataclass(frozen=True)

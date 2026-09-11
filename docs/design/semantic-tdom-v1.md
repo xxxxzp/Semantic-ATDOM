@@ -1,143 +1,117 @@
-# Semantic TDOM V1：已确认设计
+# Semantic TDOM V1：G1 Evidence V2 合同
 
-## 文档状态
+## 文档状态与权威范围
 
-本文记录截至 2026-09-09 已确认的 Semantic TDOM V1 实施基线。研究比较和取舍依据见 [Semantic A-TDOM 推荐技术路线](../research/semantic-atdom-recommended-route.md)。仍未校准的数值参数集中列在文末，必须保持配置化，不应在实现中伪装成经验最优值。
+- 状态：设计已确认，实现与端到端运行尚未验证。
+- 确认日期：2026-09-11。
+- 语义方法版本：`g1-evidence-v2`。
+- 本文是 Semantic TDOM V1 数学、状态和产品行为的唯一权威合同。
 
-## 项目边界
+[全局认知](../project/global-context.md) 只维护稳定的项目入口、数据/环境事实和本文摘要；ADR 只解释为什么作出决定。其他文档中与本文冲突的公式或产品约定均由本文取代，尤其包括：
 
-- 开发仓库只以 `A-TDOM` 为代码基线。
-- `A-TDOM_Online` 只用于说明课题背景和曾经开展的工作，不是算法思路、代码结构或实现细节的参考来源，也不得从中复制实现。
-- 第一阶段使用类似 `/data3/xzp/data/Onthefly/phantom3_test100` 的连续无人机下视影像，先取前 100 张构成小规模验证场景。
-- 产品输出只要求俯视 RGB TDOM 与对应的 Semantic TDOM；任意视角语义渲染最多作为内部诊断能力。
-- 正式部署目标为单张 24 GB RTX 4090。第一阶段语义标签离线生成，不把 SAM 推理时间计入 mapping latency。
+- 使用 `rho * (alpha / A)` 作为类别质量；
+- leave-one-group-out 共识仍包含 Dirichlet 先验；
+- 使用 margin、entropy、Top-1 或 disagreement 改变 V1 hard-map gate；
+- clone/split 必须机械守恒所有后代的 Dirichlet evidence 总量；
+- 每个几何阶段必然发布一对 RGB/Semantic TDOM。
 
-## 目标与硬约束
+相关决策依据见：
 
-1. 语义随 A-TDOM 渐进训练同步生长，而不是等全部几何训练完成后再统一后处理。
-2. “离线语义”表示每张影像的标签已经预先生成，不表示语义构建发生在几何训练结束之后。
-3. 语义只能读取当前高斯的几何、可见性和外观属性，绝不向位置、尺度、旋转、opacity、SH、densification 或 RGB 损失传播梯度。
-4. 第一版语义更新不做反向训练，采用闭式概率更新；同一张标签不能因 RGB 训练被重复采样而被重复计为独立语义证据。
-5. G（高斯语义场）是研究主线。直接分割最终 RGB TDOM 的 D 路线、直接将源标签镶嵌到地图网格的 M 路线，仅作为以后可能的比较方案。
+- [渲染真实语义证据，而非先验类别质量](../decisions/0005-evidence-conditioned-semantic-rendering.md)；
+- [在线语义产品是有界近似](../decisions/0006-bounded-online-semantic-products.md)；
+- [语义严格位于几何下游](../decisions/0001-one-way-semantic-dependency.md)；
+- [语义随渐进阶段同步](../decisions/0003-stage-synchronous-semantics.md)。
 
-## 数据契约
+## 目标与非目标
 
-每张 RGB 影像必须存在同名的单通道语义标签 PNG，并推荐同时提供完整类别 score。语义结果在数据集根目录全局保存一次，阶段目录只表达渐进 SfM 快照：
+### 目标
 
-`phantom3_test100` 的具体目录、文件内容和交付验收要求见 [Phantom3 渐进数据语义标签交付规范 V1](phantom3-semantic-label-contract-v1.md)。
+1. 在 A-TDOM 渐进几何训练期间同步构建逐高斯闭集语义证据场。
+2. 利用连续、高重叠无人机下视影像降低单帧 SAM 标签噪声。
+3. 在不改变几何的前提下，生成与 RGB 正射图严格成对对齐的俯视 Semantic TDOM。
+4. 使在线预览保持准实时可用，并在冻结最终几何上提供可复现的精确重建。
+5. 将观测不足、类别混合和跨观测组冲突分别表达，而不是压缩成单一置信度。
 
-```text
-dataset/
-├── semantic/
-│   ├── class_spec.json
-│   ├── labels/000001.png
-│   ├── scores/000001.npy
-│   └── metadata/000001.json
-├── 3/
-├── ...
-└── 100/
-```
+### 非目标
 
-语义账本的唯一键为 `image_id + label_version`。`label_version` 至少绑定模型/checkpoint、类别本体、prompt、阈值和标签内容哈希；发布文件必须采用临时文件加原子重命名，避免读取半文件。
+- 不用语义 loss、标签或不确定性更新位置、尺度、旋转、opacity、SH、densification、prune 或 RGB 优化。
+- 不把最终 RGB TDOM 的二维分割或二维标签镶嵌称为 G 路线结果；它们仅是未来 D/M 对照。
+- 不在 V1 中训练逐高斯 logits、任意特征 embedding 或语义 MLP。
+- 不承诺纠正同一 SAM 模型在所有视角上的系统性错误。
+- 不承诺任意透视视角的语义产品，也不在没有 CRS 合同时声称输出是 GeoTIFF。
 
-类别在一次任务开始前固定，但数量 \(K\)、ID、名称、颜色和 background 策略全部来自 `class_spec.json`，不得在融合核心中写死。推荐首个任务采用以下八分类：
+## 符号与语义
 
-| ID | 类别 |
-|---:|---|
-| 0 | background |
-| 1 | bare_soil |
-| 2 | building |
-| 3 | vegetation |
-| 4 | paved_area |
-| 5 | vehicle |
-| 6 | water |
-| 7 | road |
-| 255 | ignore / unknown observation |
+| 符号 | 含义 |
+|---|---|
+| `g` | 一个 Gaussian primitive |
+| `v` | 一张源影像/相机观测 |
+| `h` | 一组高度相关的相机观测 |
+| `p` | 一个源影像或 TDOM 像素 |
+| `k` | 一个闭集类别，`0 <= k < K` |
+| `alpha0` | 总浓度为 1 的对称 Dirichlet 先验 |
+| `E_gk` | 高斯 `g` 对类别 `k` 的真实数据证据 |
+| `A_g` | `sum(alpha_g)`，等于 `1 + sum(E_g)` |
+| `rho_g` | 高斯 Dirichlet 总质量中真实证据所占比例 |
+| `kappa_vgp` | 高斯对像素的标准 alpha-T 可见性贡献 |
+| `C_p` | TDOM 像素的几何覆盖 |
+| `U_p` | TDOM 像素的真实证据支持 |
 
-`0` 只表示明确预测的 background。SAM 分数低于阈值、图像无效区或没有标签的像素必须写为 `255`，不得作为 background 证据。适配器的标准输出为：
+本文中的 Dirichlet 是一个轻量、可合并的 `Dirichlet-style evidence state`。由于相邻影像、SAM 错误、高斯足迹、拓扑后代和鲁棒权重并不独立，它不能被解释成经过校准的标准贝叶斯后验或分类错误概率。
 
-- `labels/<id>.png`：单通道整数图，值域为 `0..K-1` 或 `255`；
-- `scores/<id>.npy`：可选的 `[K,H,W]` 浮点分数；
-- `metadata/<id>.json`：模型、checkpoint、类别顺序、prompt、阈值、分辨率和哈希；
-- `class_spec.json`：schema 版本、类别定义和颜色。
+## 数据与标签前提
 
-硬标签是必需输入，完整 scores 是推荐输入且必须被框架支持；只有 PNG 时仍可运行。由于当前没有人工真值，未校准的 SAM score 只用于阈值拒绝和诊断，不直接转换为 Dirichlet 伪计数。
-
-## 渐进同步时序
-
-语义更新复用 A-TDOM 已有的阶段边界，而不是插入每个 RGB iteration：
+运行时语义根目录包含：
 
 ```text
-新 RGB + 预生成 semantic label 到达
-                │
-                ▼
-A-TDOM 添加相机与新高斯，并完成当前渐进批次的 RGB 训练
-                │
-                ▼
-Semantic synchronization point（无语义反向传播）
-                │
-                ├── 同步高斯生命周期
-                ├── 吸收尚未计入的观测组
-                └── 更新 Dirichlet 语义状态
-                │
-                ▼
-同时渲染 RGB TDOM 与 Semantic TDOM
+semantic/
+├── class_spec.json
+├── labels/<image-id>.png
+├── metadata/<image-id>.json
+└── scores/<image-id>.npy       # 可选；G1 V2 不依赖
 ```
 
-确认的同步点包括：
+- `class_spec.json` 是类别本体的机器可读真源。
+- label 是单通道整数图，值域为 `0..K-1` 或 `ignore=255`。
+- `background=0` 只表示上游模型明确产生的 background 证据。
+- ignore、缺失、低置信或无效像素不得转换成 background。
+- 同一 `image_id + label_version` 只能被 ledger 计入一次。
+- 标签必须与运行时 RGB/camera tensor 同尺寸、同方向、同像素坐标；运行时不得偷偷 resize、rotate 或 flip。
+- 启用语义时必须显式提供 semantic data root，不得隐式回退到 RGB/SfM source root。
 
-- 前 30 张影像的初始训练、densify 和 prune 结束；
-- 每次 `Progressive_Train` 批次结束；
-- 最终 refinement 结束。
+当前 Phantom3 使用八类 schema，但 stage 100 的前100张标签没有任何 background 像素；全部399张中也只有 `000112.png` 含6038个 background 像素。因此当前事实是“八类 schema，前100张实质观测到类别1–7和ignore”，不是“八个类别均已得到验证”。是否长期保留 background，需要在检查上游 ProC-SAM3 的类别语义后另行决定。
 
-初始化同步时融合前 30 张观测并生成第一张 Semantic TDOM；第 31 张开始渐进同步。若标签尚未就绪，几何训练不得等待，语义最多允许落后一个 progressive batch。输出 manifest 必须记录 `geometry_stage`、`semantic_through_image` 和 `label_version`。
+详细交付格式见 [Phantom3 语义标签交付规范](phantom3-semantic-label-contract-v1.md)。当前早期 metadata 的 source binding 技术债和本机路径见 [全局认知](../project/global-context.md)。
 
-每张影像在在线路径中只投影一次。只有 dirty 高斯和活动窗口影像允许局部重投影；最终 refinement 后基于最终几何执行全量精确语义重建。
+## 几何防火墙与阶段时序
 
-## 每高斯概率语义状态
+语义严格位于几何下游：
 
-第一版使用闭集 categorical–Dirichlet 语义场。每个高斯 `g` 保存 \(K\) 维 Dirichlet 浓度参数：
+- 所有高斯属性以 detached snapshot 读取；
+- 所有语义更新在无 autograd 的状态下执行；
+- 语义状态不注册进 RGB optimizer；
+- 语义失败只改变语义状态/产品资格，不能阻塞、回滚或改变几何训练。
 
-\[
-\boldsymbol{\alpha}_g=[\alpha_{g0},\ldots,\alpha_{g,K-1}]
-\]
+每个渐进阶段的逻辑顺序是：
 
-采用总浓度为 1 的对称弱先验：
+1. 新影像加入并完成当前阶段的几何优化；
+2. densify/prune 等几何拓扑更新完成；
+3. 冻结语义投影所需的当前几何与相机 snapshot；
+4. 消费尚未记账且已经就绪的标签；
+5. 更新 G0/G1 sidecar 与在线诊断；
+6. 地图发布调度器按需生成最新的 RGB/Semantic 产品对。
 
-\[
-\alpha_{0,k}=\frac{1}{K}
-\]
+在线流水线可以合并过时的几何/地图请求，但不能丢弃未计账的标签观测。`lag <= 1` 是待 profile 验证的 SLO，不是当前实现已经保证的硬事实。
 
-不使用从 SAM 标签频率估计出的类别先验，避免先验偏向 background 或面积较大的类别。
+## 单相机观测
 
-每高斯还需要维护或派生：
-
-```text
-dirichlet_alpha_raw[N, K]
-dirichlet_alpha_robust[N, K]
-group_variance[N, K]
-group_count[N]
-semantic_support[N]
-dirty[N]
-```
-
-类别概率、类别 ID、Dirichlet 方差、熵和 margin 均从这些状态派生，而不是作为独立真值维护。
-
-这些状态属于非参数化的 `SemanticGaussianState`，只能读取高斯属性的 detached 视图，并在 `torch.no_grad()` 下更新；不得注册进 RGB optimizer。
-
-## 从二维标签形成单相机观测
-
-对相机 `v`、高斯 `g` 和像素 `p`，采用标准前向 alpha compositing 的可见性贡献：
+对相机 `v`、高斯 `g` 和像素 `p`，使用与前向 Gaussian rasterization 相同的完整足迹和 alpha compositing：
 
 \[
 \kappa_{vgp}=\alpha_{vgp}T_{vgp}
 \]
 
-必须累计高斯的完整投影足迹，不使用仅投影高斯中心并读取单像素标签的近似。
-
-在硬标签边界附近使用轻量距离权重 `b_p` 降低不可靠标签的影响；边界像素不做整带删除，小目标也不做额外腐蚀。`ignore=255` 的权重恒为零。
-
-类别证据和单相机类别分布为：
+标签边界可靠度 `b_p` 位于 `[0,1]`；`ignore=255` 的类别权重恒为零。单相机类别证据为：
 
 \[
 e_{vgk}=\sum_{p:y_p=k}\kappa_{vgp}b_p
@@ -147,42 +121,40 @@ e_{vgk}=\sum_{p:y_p=k}\kappa_{vgp}b_p
 q_{vgk}=\frac{e_{vgk}}{\sum_j e_{vgj}+\epsilon}
 \]
 
-## 观测支持度
-
-定义总可见质量与有效标签质量：
+同时区分总可见质量和有效标签质量：
 
 \[
 m^{all}_{vg}=\sum_p\kappa_{vgp}
 \]
 
 \[
-m^{valid}_{vg}=\sum_{p:y_p\neq255}\kappa_{vgp}b_p
+m^{valid}_{vg}=\sum_{p:y_p\ne255}\kappa_{vgp}b_p
 \]
 
-单相机支持度采用无硬可见阈值的自然饱和形式：
+单相机有效支持采用：
 
 \[
-s_{vg}=
-\left(1-e^{-m^{all}_{vg}}\right)
+s_{vg}=\left(1-e^{-m^{all}_{vg}}\right)
 \frac{m^{valid}_{vg}}{m^{all}_{vg}+\epsilon}
 \]
 
+`projected_valid_mass[g]` 另行累计原始有效投影质量，用于观测量诊断；它不是 TDOM 像素的 `U_p`，也不是独立 Dirichlet 样本数。
+
 ## 相关观测分组
 
-连续无人机影像高度相关，因此相机不能全部作为独立 Dirichlet 样本。首个实验采用按采集顺序的锚点重叠率分组：
+连续无人机影像高度相关，不能把每张相邻影像视为完全独立证据。当前分组规则为：
 
-- 当前数据优先使用 COLMAP `imageMatchMatrix.txt`；
-- 必须先根据真实采集编号重排 `imagesNames.txt` 与匹配矩阵，不能把矩阵行号误当成采集顺序；
-- 新帧始终与当前组锚点比较，而不是只与前一帧比较，避免传递式重叠令分组无限增长；
-- 首轮归一化重叠阈值设为 `0.4`；
-- 每组最多 4 张影像；
-- 一个观测组对一个高斯最多贡献一个 Dirichlet 有效样本。
+- 使用六位数字 image stem 表示当前采集顺序；
+- `imagesNames.txt` 只用于将 ID 映射到 match matrix 的行列；
+- 新影像始终与当前组 anchor 比较归一化 overlap；
+- overlap 低于阈值或达到当前最大组长时关闭当前组；
+- 一个组对一个高斯最多贡献一个 Dirichlet-style 有效样本；
+- 开放组的暂定贡献在新帧到达时替换，不能重复累加。
 
-组内分布和支持度为：
+组分布和组支持为：
 
 \[
-\mathbf q_{hg}=
-\frac{\sum_{v\in h}s_{vg}\mathbf q_{vg}}
+q_{hg}=\frac{\sum_{v\in h}s_{vg}q_{vg}}
 {\sum_{v\in h}s_{vg}+\epsilon}
 \]
 
@@ -190,106 +162,142 @@ s_{vg}=
 s_{hg}=1-\prod_{v\in h}(1-s_{vg})
 \]
 
-未压缩的投影贡献另外累计到 `semantic_support`，不直接作为 Dirichlet 样本数。
-
-开放组必须立即提供暂定贡献，避免等待 2–4 帧才更新；新影像加入同一组时，以重算后的聚合结果**替换**旧暂定值，不得再次累加。新帧与锚点重叠低于 `0.4`、组大小达到 4、final refinement 开始或数据流结束时关闭当前组。在线每组最多保留 1–2 张代表性关键帧；最终精确重建使用组内全部有效影像。
-
-## G0：原始 Dirichlet 后验
-
-对已经关闭的独立观测组进行更新：
+组证据向量为：
 
 \[
-\boldsymbol{\alpha}^{raw}_g=
-\boldsymbol{\alpha}_0+
-\sum_h s_{hg}\mathbf q_{hg}
+E_{hg}=s_{hg}q_{hg}
 \]
 
-`raw` 表示给定几何版本和观测集合下未经鲁棒抑制的概率证据，不能被 G1 或后续正则结果覆盖。
+在线活动窗口至少保留开放组，并可保留有限数量的最近闭合组用于几何变化后的重投影。最终 exact rebuild 使用每组全部有效影像。默认 overlap threshold 为 0.4，默认最大组长为4；4不是数学硬上限。
 
-## G1：两遍鲁棒 Dirichlet 后验
+## G0：原始证据状态
 
-G1 采用确定性两遍构建。第一遍形成 `raw`；第二遍重新计算观测组贡献，并使用 leave-one-group-out 共识评价当前组。
+总浓度为1的对称先验为：
 
 \[
-\boldsymbol{\alpha}_{-h,g}=
-\boldsymbol{\alpha}^{raw}_g-s_{hg}\mathbf q_{hg}
+\alpha_{0,k}=\frac{1}{K}
+\]
+
+原始数据证据和 Dirichlet-style 状态为：
+
+\[
+E^{raw}_g=\sum_hE_{hg}
 \]
 
 \[
-\mathbf m_{-h,g}=
-\frac{\boldsymbol{\alpha}_{-h,g}}
-{\sum_k\alpha_{-h,g,k}}
+\alpha^{raw}_g=\alpha_0+E^{raw}_g
+\]
+
+`alpha_raw` 不得被 robust 结果覆盖。它用于诊断标签原始证据、计算 leave-one-group-out 共识，并与 robust 结果比较。
+
+## G1：排除先验和自身的鲁棒证据
+
+评价当前组 `h` 时，从 G0 中同时扣除对称先验和当前组自身：
+
+\[
+E_{-h,g}=\alpha^{raw}_g-\alpha_0-E_{hg}
+=\sum_{j\ne h}E_{jg}
+\]
+
+只有满足以下两个条件才建立 leave-one-group-out 共识：
+
+\[
+N_{-h,g}\ge2
 \]
 
 \[
-d_{hg}=JS(\mathbf q_{hg},\mathbf m_{-h,g})
+S_{-h,g}=\sum_kE_{-h,g,k}\ge S_{min}
 \]
 
-最终鲁棒后验为：
+此时：
 
 \[
-\boldsymbol{\alpha}^{robust}_g=
-\boldsymbol{\alpha}_0+
-\sum_h r_{hg}s_{hg}\mathbf q_{hg}
+m_{-h,g}=\frac{E_{-h,g}}
+{\sum_kE_{-h,g,k}+\epsilon}
 \]
-
-`r_hg` 是随 JS divergence 单调下降且具有正下限的软权重，首版采用可配置形式：
 
 \[
-r(d)=r_{min}+(1-r_{min})\exp(-d/\tau)
+d_{hg}=JS(q_{hg},m_{-h,g})
 \]
-
-不得硬删除冲突组。只有一个有效组时不做冲突降权；两个组冲突时保留双方并维持不确定性；三个以上观测组中，少数冲突组由其余组形成的共识降权。
-
-在线路径不重放全部历史组：前两个有效组权重为 1，从第三个组开始与先前闭合组共识计算 JS 软权重，并只保留必要聚合统计。最终 refinement 后，从空先验对最终几何执行全量投影，并用上述 leave-one-group-out 公式两遍精确重建 G0/G1。\(r_{min}\) 与 \(\tau\) 在没有真值前保持配置化。
-
-## 高斯生命周期
-
-densification API 必须在几何变更完成后向已注册的语义 observer 发布显式 `TopologyDelta`，包括保留/删除索引、父子映射与子权重；未注册 observer 时不构造事件，语义只响应拓扑结果，不参与 clone、split 或 prune 的决策。
-
-observer 必须绑定一个具有 `num_gaussians`、`is_valid` 和 `invalidate()` 的明确 owner；closure 只有显式传入 owner 后才能注册。observer 失败不得中断或回滚几何训练。几何模块必须禁用失败的 observer、记录 `requires_rebuild` 状态并继续原几何流程；对应语义状态同时失效，只有在当前几何上显式重建并重新注册后才能继续使用。`restore`、`load_ply`、`create_from_pcd` 等整模型替换入口也必须先解绑并使已有语义状态失效。
-
-| 几何事件 | 语义处理 |
-|---|---|
-| 初始点/新点扩张 | 初始化为对称弱先验，不从邻居猜类别 |
-| clone/split | 子高斯继承父节点的数据证据类别比例，证据质量在后代间守恒分配 |
-| prune | 删除对应语义状态和活动统计 |
-| 小幅参数变化 | 在线保留近似状态 |
-| 显著投影变化 | 标记 dirty，在活动窗口内重新观测 |
-| final refinement 完成 | 在最终几何上从空先验全量重建 |
-
-令父高斯的数据证据为
 
 \[
-\mathbf E_g=\boldsymbol\alpha_g-\boldsymbol\alpha_0.
+r_{hg}=r_{min}+(1-r_{min})\exp(-d_{hg}/\tau)
 \]
 
-若产生 \(m\) 个后代，则
+若其他有效组数量或总支持不足，则 `r_hg=1`。最终鲁棒证据为：
 
 \[
-\boldsymbol\alpha_{c_i}=\boldsymbol\alpha_0+\lambda_i\mathbf E_g,
-\qquad
-\lambda_i\ge0,\quad\sum_{i=1}^{m}\lambda_i=1.
+E^{robust}_g=\sum_hr_{hg}E_{hg}
 \]
-
-\(\lambda_i\) 优先按子高斯 opacity×体积归一化，无法稳定计算时均分。该规则保持的是数据证据的类别比例；由于每个子高斯重新拥有一份弱先验，其后验均值会保守地向先验收缩。不得给每个子高斯复制父节点全部浓度，否则 densification 会在没有新观测时凭空增加语义置信度。
-
-## Semantic TDOM 概率渲染
-
-对选定的 Dirichlet 后验，定义：
 
 \[
-A_g=\sum_k\alpha_{gk},\qquad
-\mu_{gk}=\frac{\alpha_{gk}}{A_g}
+\alpha^{robust}_g=\alpha_0+E^{robust}_g
 \]
 
-由于先验总浓度为 1，高斯的数据支持比例为：
+禁止使用包含当前组自身的全局均值评价当前组。先验只保证空状态数值稳定，不参与“其他观测形成的共识”。JS 只降低新增组证据且保留正下限；它只处理跨视角不一致，不能识别所有视角一致的 SAM 系统性错误。
+
+在线 G1 使用当时已经闭合的其他组形成有因果顺序的近似权重；最终冻结几何上的 exact rebuild 使用两遍计算，对每组执行真正的 leave-one-group-out。产物必须记录 raw/robust 的证据衰减和类别差异统计。
+
+## 在线组间分歧
+
+在线路径对闭合组的原始 `q_hg` 和 `s_hg` 维护逐高斯加权流式一阶/二阶矩：
+
+- 使用 raw 组分布，不使用已经经过 JS 抑制的 robust evidence；
+- 先验不参与组间分歧；
+- 开放组只形成可替换的 provisional 统计；
+- 少于两个达到有效支持的闭合组时，分歧为 NaN，不得以0表示“完全一致”；
+- final exact rebuild 使用全部有效组重新计算权威统计。
+
+manifest 必须将该层标记为 `online_estimate` 或 `exact_final`。
+
+## 高斯拓扑变化
+
+语义不决定 clone、split 或 prune。几何模块只在操作完成后发送显式 topology delta。
+
+没有新语义观测时，拓扑重参数化的核心不变量是：在固定审计相机上，类别分布、evidence support ratio、entropy 和 hard class 应尽量连续。Dirichlet concentration 不是物理质量，不能仅以“所有后代 evidence 张量之和不变”替代渲染场连续性。
+
+V2 的初始近似为：
+
+- clone：父高斯保留状态，子高斯复制父高斯的类别 evidence distribution、concentration、group moments 和 group count；
+- split：每个子高斯复制父状态，父高斯删除；
+- prune：删除对应语义状态；
+- 没有明确父节点的新高斯：只初始化对称先验；
+- `projected_valid_mass` 等物理累计量与 Dirichlet confidence 分开处理，可按 topology weight 分配；
+- 所有 clone/split 后代均标记为 approximate/dirty，并由活动窗口重新投影。
+
+复制策略不是“产生新统计证据”，而是保持局部原语对已有知识的继承。它必须通过拓扑前后像素级渲染测试验证；若不能满足容差，则产品标记 `topology_approximate`。最终 exact rebuild 从原始标签重新建立状态。
+
+## Evidence-conditioned Semantic TDOM
+
+正式产品使用 `alpha_robust`。先扣除先验，得到真实类别证据：
 
 \[
-\rho_g=\frac{A_g-1}{A_g}
+E_{gk}=\max(\alpha^{robust}_{gk}-\alpha_{0,k},0)
 \]
 
-对俯视像素 `p`：
+\[
+E_g=\sum_kE_{gk},\qquad A_g=1+E_g
+\]
+
+有真实证据时，证据条件类别分布为：
+
+\[
+\tilde q_g(k)=\frac{E_{gk}}{E_g}
+\]
+
+高斯 evidence ratio 和逐类别 belief mass 为：
+
+\[
+\rho_g=\frac{E_g}{A_g}=\frac{A_g-1}{A_g}
+\]
+
+\[
+B_g(k)=\rho_g\tilde q_g(k)=\frac{E_{gk}}{A_g}
+\]
+
+没有真实证据时 `rho_g=0`，该高斯不向任何类别 numerator 提供质量；`tilde q_g` 视为未定义。均匀先验不能生成 background 或其他类别。
+
+令 `kappa_pg` 为与 RGB TDOM 相同排序和 alpha compositing 得到的几何权重：
 
 \[
 C_p=\sum_g\kappa_{pg}
@@ -300,129 +308,230 @@ U_p=\sum_g\kappa_{pg}\rho_g
 \]
 
 \[
-N_{pk}=\sum_g\kappa_{pg}\rho_g\mu_{gk}
+N_p(k)=\sum_g\kappa_{pg}B_g(k)
 \]
 
 \[
-P^{TDOM}_{pk}=\frac{N_{pk}}{U_p+\epsilon}
+P_p(k)=\frac{N_p(k)}{U_p+\epsilon}
 \]
 
-其中：
+- `geometry_coverage[p] = C_p`；
+- `pixel_evidence_support[p] = U_p`；
+- `pixel_support_ratio[p] = U_p/(C_p+epsilon)`；
+- 剩余透射率不计入 background；
+- background 只能来自 `E_g,0 > 0` 的真实类别0证据。
 
-- `C_p` 是几何覆盖；
-- `U_p` 是绝对语义支持；
-- `U_p / C_p` 是几何覆盖区域中的语义支持比例；
-- 剩余透射率 `1-C_p` 表示没有几何，不能写入 background；
-- 只有几何覆盖、绝对语义支持、语义支持比例和 Top-1/Top-2 margin 同时达到阈值时才输出 `0..K-1`，否则输出 `255`。
+`alpha/A` 可以作为包含先验的内部 predictive 诊断，但不能再作为正式类别 numerator，也不能被描述为已经排除先验的类别分布。
 
-一个跨越建筑和植被的大高斯必须保留软概率；渲染器先在 TDOM 像素级混合所有可见高斯的概率，再执行 argmax/unknown gate，不得先把每个高斯硬化成置信度更高的类别。
+## Hard-map gate
 
-默认产品为与 RGB TDOM 同正射相机、范围、GSD 和渲染节奏的 `semantic_id`、`semantic_color`、`unknown_mask`、`unknown_reason`、`semantic_support` 和 `semantic_entropy`。其余独立诊断栅格通过 `--semantic_tdom_save_diagnostics` 显式启用，完整 \(K\) 通道概率栅格仅作为可选调试/科研输出。具体 gate 阈值尚未校准，必须由配置提供。当前 RGB TDOM 没有 CRS，因此这里只保证像素级配准，不能宣称 GIS 地理参考已经完备。
-
-WP4 使用独立的 forward-only CUDA kernel，在一次 TDOM 几何预处理和一次 alpha-T 遍历中渲染 `K+4` 个通道：类别分子、绝对语义支持、类别均值二阶矩、航片组分歧和 Dirichlet 方差传播项；方差传播项由 kernel 额外按平方后的 alpha-T 语义权重累积。不创建 autograd 图，也不写入几何参数。当前 kernel 支持最多 20 个 feature channels，因此本项目 8 类对应的 12 通道可直接运行。初始化、每个渐进阶段及最终 refinement 的现有 RGB TDOM 触发后，对应语义产品写入 `<Model_Path_Dir>/Semantic_TDOM/stage_<geometry_stage>/<product_key>/`。Schema V2 包含 hard map、unknown 原因、核心标量层、可选完整诊断层、完整 `class_spec.json` 和最后原子发布的 `manifest.json`；`semantic_probabilities.npy` 仅在显式启用时保存。诊断层默认量化为带显式 scale/nodata 元数据的 uint16 tiled lossless-compressed TIFF；量化误差不超过对应指标定义域跨度的 \(1/65534\)，也可配置为 float32。RGB sidecar 与语义 manifest 共享唯一 `product_key`，并记录正射相机矩阵、投影平面原点/法向/基向量/角点、视场角、范围、请求/实际 GSD、尺寸和显式 CRS；语义 manifest 另记录几何阶段、语义追踪到的影像、标签版本、几何哈希、类别规范、gate 参数、质量状态、渲染耗时及各文件 SHA256。消费者必须按 `product_key` 配对，不能仅依赖文件序号。
-
-未校准 gate 的暂定默认值为 `coverage=0.05`、`absolute_support=0.01`、`support_ratio=0.05`、`margin=0.05`。新增的 Top-1、归一化 entropy 和 group disagreement gate 分别以 `0`、`1`、`2` 处于兼容模式，不在无真值条件下武断改变 V1 覆盖率；它们全部可由命令行配置，后续必须依据真实场景诊断结果校准。
-
-渲染前按实际 feature channels、行带输出、tile finalize 工作集和每高斯状态保守估算显存，并同时检查实时空闲 CUDA 显存和默认 512 MiB headroom；CUDA 预处理得到当前行带真实的 Gaussian–tile 交集数后，还必须在分配 radix-sort/binning buffer 前校验剩余硬预算。默认优先一次性渲染；预算不足或显式设置 `render_tile_rows` 时，保持完整相机投影和全局深度顺序，以 16 像素对齐行带精确输出并逐带转移到 CPU。该降级路径会重复轻量 projection/preprocess，但每带只排序与本带相交的实例，优先保证全分辨率结果可生成和逐像素一致性，不使用半分辨率替代。
-
-## 不确定性输出
-
-高斯的 Dirichlet 后验方差为：
+V1 只有三个条件能够决定是否输出类别：
 
 \[
-V_{gk}=
-\frac{\alpha_{gk}(A_g-\alpha_{gk})}
+C_p\ge\theta_C,\qquad
+U_p\ge\theta_U,\qquad
+\frac{U_p}{C_p+\epsilon}\ge\theta_R
+\]
+
+三个条件同时满足时输出 `argmax_k P_p(k)`，否则输出 `ignore=255`。
+
+Top-1、margin、entropy、mixture disagreement、group disagreement 和 variance proxy 只能作为独立诊断，禁止通过默认值或可选参数改变 V1 `semantic_id`。需要研究额外拒绝条件时，应使用新的明确产品/method version，而不是静默改变 V1。
+
+当前未校准默认值为：
+
+| 参数 | 默认值 |
+|---|---:|
+| `min_coverage` | 0.05 |
+| `min_absolute_support` | 0.01 |
+| `min_support_ratio` | 0.05 |
+
+实际值必须写入 manifest；在没有评测前不得描述为最优阈值。
+
+## 独立诊断量
+
+### 类别决策诊断
+
+Top-1 probability、Top-1/Top-2 margin、categorical entropy 和 normalized entropy 均从最终 evidence-conditioned `P_p` 计算。无真实 evidence 时它们为 NaN。
+
+### 高斯混合分歧
+
+令 `b_pg = kappa_pg * rho_g`，则像素内不同高斯类别意见的混合分歧为：
+
+\[
+D^{mix}_p=
+\frac{\sum_gb_{pg}\lVert\tilde q_g\rVert_2^2}{U_p+\epsilon}
+-\lVert P_p\rVert_2^2
+\]
+
+该值与 observation-group disagreement 分开输出，不参与 hard-map gate。
+
+### Prior-regularized variance proxy
+
+原始 `alpha_robust` 的逐类别 Dirichlet 方差为：
+
+\[
+V_{gk}=\frac{\alpha_{gk}(A_g-\alpha_{gk})}
 {A_g^2(A_g+1)}
 \]
 
-像素级后验方差使用归一化语义权重的平方传播。以下量必须分别输出，不能混合为单一“confidence”：
-
-- Dirichlet 后验方差：观测数量不足带来的不确定性；
-- 高斯间分歧：同一像素的可见高斯具有不同类别均值；
-- 最终类别熵：像素概率分布的混合程度；
-- Top-1/Top-2 margin：最终分类决策的稳定程度；
-- 几何覆盖、绝对语义支持和语义支持比例。
-
-令 \(w_{pg}=\kappa_{pg}\rho_g\)，实现中的标量分歧与方差为：
+它包含先验，用于表达 evidence concentration 下的启发式不确定性，不是 `P_p` 的校准错误概率。令：
 
 \[
-D_p=\frac{\sum_g w_{pg}\lVert\mu_g\rVert_2^2}{U_p+\epsilon}
--\lVert P^{TDOM}_p\rVert_2^2
+\bar b_{pg}=\frac{b_{pg}}{U_p+\epsilon}
 \]
+
+像素 trace proxy 按独立近似进行平方权重传播：
 
 \[
-V_p=\frac{\sum_g w_{pg}^2\sum_kV_{gk}}{U_p^2+\epsilon}
+V^{proxy}_p=\sum_g\bar b_{pg}^{\,2}\sum_kV_{gk}
 \]
 
-航片组分歧将每高斯 `group_variance` 的类别维 trace 按 \(w_{pg}\) 加权平均；两个相反 one-hot 分布的平方距离决定其理论范围为 `[0, 2]`，不能截断成 `[0, 1]`。三者分别描述像素内高斯意见不同、证据数量导致的后验方差和相关航片组之间的不一致，不能互相冒充。没有语义证据时，这三类不确定性与熵均为未定义值 `NaN`，不能用数值零伪装成确定。
+manifest 必须将其定义为 `independence-approximation, prior-regularized Dirichlet trace-variance proxy`，并注明未校准。无真实 evidence 时为 NaN。`1-rho_g` 另行表达逐高斯先验/未知质量。
 
-## 状态持久化与版本校验
+## 在线一致性与产品状态
 
-每高斯概率必须存在于运行时，并推荐保存为内部 `semantic_state.pt` sidecar，以支持中断恢复；它不是用户产品。sidecar 至少保存 raw/robust 浓度、group count/variance、support、dirty 状态、开放组暂定增量、label ledger、类别 schema 和配置。
+历史证据由当时的几何、opacity、scale 和相机姿态投影产生；只刷新有限活动窗口不能使全部历史 evidence 与最新几何严格一致。因此在线结果一律视为有界近似。
 
-恢复时必须验证高斯数量、稳定 ID 的内部完整性、几何 checkpoint 哈希、类别本体哈希，以及由严格校验后的 ledger、label provenance、开放组、类别 schema 和语义配置共同形成的 recovery-context 哈希。几何哈希由 `GaussianModel.geometry_sha256()` 对全部有序、逐行对齐的高斯属性及其形状和 dtype 计算，作为几何与 sidecar 的独立可信绑定，不能只散列文件名。任一不匹配都必须显式拒绝静默续算，并选择局部修复或从空先验重建。WP3 sidecar schema V2 保存开放组的成员元数据、暂定 G0/G1 增量和组内观测统计，恢复后可以继续以替换语义吸收同组影像。
+至少区分：
 
-WP3 通过 `tools/train_progressive.py --enable_semantics` 启用。同步状态写入 `<Model_Path_Dir>/semantic/`：两个轮换 slot 分别保存 `semantic_state.<slot>.pt`、`recovery_context.<slot>.json` 与对应的只读 `geometry_checkpoint.<slot>.pt`。几何 checkpoint 保存全部有序高斯属性；`latest.json` 同时绑定其文件 SHA256、属性哈希、语义 slot 和 recovery-context 哈希，并且只在整组写完后原子切换，避免中断写盘破坏上一个可恢复状态或发布一个没有对应持久化几何的语义状态。`ledger.json` 提供逐影像幂等记录，`sync_status.json` 记录 `geometry_stage`、`semantic_through_image`、`label_version` 和滞后状态。标签尚未发布或语义处理失败时只延后语义，不能中断 RGB 几何流程。
+| 状态 | 含义 | 产品资格 |
+|---|---|---|
+| `approx_online` | 正常在线近似，陈旧度与 lag 未超当前 SLO | 实时预览 |
+| `stale_online` | lag、历史证据陈旧、deferred 或 error 超限 | 诊断 |
+| `online_fallback` | 已请求 final，但 exact rebuild 失败 | 诊断 |
+| `exact_partial` | 最终几何上重投影全部可用标签，但输入不完整或 source 未完全绑定 | 有质量声明的最终结果 |
+| `exact_final` | 预期标签、来源和最终重建全部完整 | 唯一完整权威结果 |
+| `failed` | 未达到最低产品要求 | 不发布类别产品 |
 
-当语义交付不位于 RGB 渐进数据根目录时，通过 `--semantic_data_root` 指向包含 `semantic/class_spec.json`、`semantic/labels/` 和 `semantic/metadata/` 的独立数据根；COLMAP stage 与 RGB images 仍由 `Source_Path_Dir` 提供。该参数正好覆盖当前 `/home/xuzipeng/code/Semantic-A-TDOM/datas/semantic_labels` 的交付方式，无需复制 102 张标签。
+在线 readiness 使用连续前缀 watermark 计算 lag；最终冻结几何上的重建可以使用缺口后的所有有效标签。final manifest 必须记录预期、有效、缺失、失败和 source-unverified 的影像 ID 与比例。
 
-WP5 在最终几何冻结后仅在所有已排序影像标签均就绪且无同步错误时启动：第一遍从空先验投影全部影像并形成使用组内全部视图的精确 G0；第二遍再次投影全部影像，以 leave-one-group-out 共识计算精确 G1。最终状态替换在线近似状态，最终 Semantic TDOM manifest 标记 `posterior=robust_exact_final`；耗时、峰值 CUDA 显存、组数以及在线/最终 JS 偏差和类别一致率写入 `<Model_Path_Dir>/semantic/final_rebuild_metrics.json`。若全量重建失败，保留在线状态并将错误反馈为语义告警，几何结果不受影响。
+最终 exact rebuilder 必须能够在 online hook 已失效时，从最终几何、相机、overlap、class spec 和原始标签独立从零启动。在线 ledger 可以加速查找，但不能成为正确性的必要条件。
 
-V1 的语义状态、融合和渲染计算默认使用 `float32`；产品诊断栅格可按 manifest 中的比例量化为 uint16，并由环境中明确声明的 `tifffile` 写成 tiled TIFF。scores 使用 mmap/分块读取，只保留当前影像或小批次；不得将全数据 score tensor 一次加载到显存。
+## 固定地图网格与成对发布
 
-## 准实时指标
+同一任务在开始时固定局部地图网格的：
 
-- `mapping latency`：标签已可用时，从几何阶段结束到 semantic sync 与 Semantic TDOM 写盘完成；
-- `end-to-end latency`：从新影像到标签、几何同步和最终产品完成，留作后续在线 SAM 阶段评价。
+- 投影平面法向和二维轴方向；
+- origin；
+- GSD；
+- pixel-axis convention；
+- grid ID。
 
-首版目标是在单张 24 GB RTX 4090 上，在线 semantic sync 的摊销耗时不超过对应 progressive 几何阶段耗时的 20%。final exact rebuild 单独统计，不纳入在线预算。标签默认使用原始分辨率；半分辨率只能作为 profiling/ablation 开关。
+未知完整范围时，通过固定 origin/GSD 的 tile index 向外扩展，不能移动或缩放已经发布的网格。尚未实现固定网格时，产品只能标为 `pair-aligned`，不能声称不同 stage 之间已经对齐。
 
-## 当前实现优先级
+地图发布事件与几何阶段分开。latest-wins 调度可以跳过旧的地图渲染请求，但不能丢弃标签观测。每个发布事件冻结一个共同 snapshot，并原子发布：
 
-第一版只实现以下主链路：
+- RGB TDOM 与 sidecar；
+- Semantic TDOM 与 manifest；
+- 引用两侧 manifest/hash 的 `pair_manifest.json`。
+
+两侧必须共享 `product_key`、`projection_geometry_hash`、相机、grid、extent、GSD、尺寸和几何阶段。`projection_geometry_hash` 只覆盖语义投影相关的 `xyz/opacity/scale/rotation` 与相机版本；`rgb_model_hash` 另含 SH/appearance。Semantic manifest 另记录 semantic state hash、method/schema version、label version 和所有产物 hash。
+
+## 产物分级
+
+`approx_online` 的核心产物为：
 
 ```text
-预生成 labels + scores（scores 可缺省）
-  → 与 A-TDOM 阶段同步
-  → 完整足迹 alpha-T 观测
-  → 相关帧分组
-  → 在线 G0 + 近似 G1
-  → 最终几何上的全量精确 G0/G1
-  → 概率 Semantic TDOM 与独立不确定性图层
+semantic_id.png
+semantic_color.png
+unknown_mask.png
+unknown_reason.png
+pixel_evidence_support.tif
+semantic_entropy.tif
+class_spec.json
+manifest.json
 ```
 
-实施工作包按以下顺序推进：
+`exact_final`/`exact_partial` 默认额外输出：
 
-1. WP0：类别/标签数据契约、ledger、纯 PyTorch/CPU 参考实现和微型测试；
-2. WP1：`SemanticGaussianState`、`TopologyDelta`、证据守恒和几何隔离测试；
-3. WP2：无梯度 CUDA observation kernel；
-4. WP3：阶段 hook、分组、开放组替换和在线 orchestrator；
-5. WP4：Semantic TDOM renderer 与产品输出；
-6. WP5：最终精确重建和单卡性能基准。
+```text
+geometry_coverage.tif
+pixel_support_ratio.tif
+top1_probability.tif
+margin.tif
+mixture_disagreement.tif
+group_disagreement.tif
+prior_regularized_variance_proxy.tif
+```
 
-以下内容只记录为以后可能的扩展，不阻塞第一版：
+完整 `K x H x W` evidence-conditioned 概率栅格始终是可选的 `semantic_probabilities.npy`。manifest 必须列出实际文件、hash、encoding 和缺省原因，消费者不能假设可选诊断一定存在。
 
-- G2：受 NG-GS 启发的边界歧义检测与局部连续语义场；
-- G3：受 NRGS 启发、冻结高斯属性的轻量语义正则网络；
-- D：直接分割最终 RGB TDOM；
-- M：源标签直接融合到地图网格。
+`unknown_reason.png` 只编码低几何覆盖、低绝对 evidence support、低 support ratio 和无 evidence。其他诊断不得暗中增加拒绝原因。旧名称 `semantic_support.tif` 和 `posterior_variance.tif` 最多保留一个 schema 版本的 deprecated alias。
 
-## 保持配置化、等待校准的参数
+## 状态、身份与恢复
 
-以下内容不是架构悬案，不阻塞实现：
+每高斯 sidecar 至少保存：
 
-1. JS 软权重的 `r_min` 和 `tau`；
-2. `C_min`、`U_min`、语义支持比例和 Top-1/Top-2 margin 阈值；
-3. 标签边界距离权重的带宽和下限；
-4. dirty 判定所需的位置、投影协方差和 opacity 变化阈值；
-5. CUDA 的最佳 tile、分块和常用 \(K\) 模板配置。
+```text
+alpha_raw[N, K]
+alpha_robust[N, K]
+group weighted moments/count/support
+projected_valid_mass[N]
+gaussian_ids[N]
+topology version and dirty/staleness state
+open/recent group caches
+label ledger and provenance
+semantic method/config versions
+```
 
-第一阶段不制作人工真值，因此只验收几何隔离、幂等、证据守恒、顺序稳定、unknown 行为、遮挡/足迹正确性、恢复一致性、RGB/Semantic TDOM 配准和资源预算。SAM 模型选择、阈值精度校准、正式评价指标与消融设计留到后续阶段。
+身份拆分为：
 
-## 论文依据
+- `ontology_hash`：ignore ID、类别 ID、名称、顺序和 background 语义；改变时发布新标签/方法版本并重建 evidence；
+- `palette_hash`：显示颜色；改变时只需重渲染 color 产品；
+- 完整 `class_spec_sha256`：兼容与审计用途；
+- `semantic_projection_hash`：投影相关几何和相机；
+- `rgb_model_hash`：包含 SH 的完整 RGB 模型；
+- `semantic_state_hash`：sidecar 内容与 recovery context。
 
-- Wilson et al., *Modeling Uncertainty in 3D Gaussian Splatting through Continuous Semantic Splatting*, ICRA 2025: <https://arxiv.org/abs/2411.02547>
-- Zhao et al., *ReSemGS-SLAM: Real-time semantic Gaussian Splatting SLAM based on semantic consistency perception*, 2026: <https://www.sciencedirect.com/science/article/pii/S0950705126007811>
-- He et al., *NG-GS: NeRF-Guided 3D Gaussian Splatting Segmentation*, CVPR 2026 Highlight: <https://arxiv.org/abs/2604.14706>
-- Yang et al., *NRGS: Neural Regularization for Robust 3D Semantic Gaussian Splatting*, ICME 2026: <https://arxiv.org/abs/2604.22439>
-- Gao et al., *Evolving Semantic Propagation for Aerial Semantic 3D Gaussian Splatting*, AAAI 2026: <https://ojs.aaai.org/index.php/AAAI/article/view/42418>
+仅修改 palette 不得强迫重建 alpha。恢复必须校验 method/schema、ontology、label provenance、投影几何、高斯 ID/数量、拓扑版本、配置、ledger 和开放组。任何关键项不匹配时显式拒绝，不得静默继续。
+
+`g1-evidence-v2` 必须使用新的 state/recovery schema 和 product/manifest schema。旧 sidecar 不允许直接 resume；必须从对应标签和几何显式重建。旧产物可以保留用于比较，但必须标记为 superseded，不能在原目录无提示覆盖。
+
+## 准实时资源合同
+
+- 正式开发硬件基线为单张 24 GB RTX 4090。
+- semantic projection snapshot 只复制 `xyz/opacity/scale/rotation` 和必要相机数据，不复制无关 SH。
+- 语义 GPU 工作使用显式低优先级 CUDA stream 和 snapshot-ready event；CPU worker 异步本身不代表 GPU 隔离。
+- 必须配置显存 headroom、单次预算和 checkpoint cadence。
+- 超预算时依次停止中间诊断写盘、跳过过时 TDOM、合并到最新 snapshot；不得丢弃未计账标签或阻塞几何。
+- 不默认每个阶段保存完整 RGB geometry checkpoint；语义 sidecar 使用周期 checkpoint 与最终原子 checkpoint。
+- final exact rebuild 的耗时单独统计，不计入在线 SLO。
+- 在干净环境完成 stage 30 到 100 profile 前，不固定具体在线耗时百分比。
+
+性能记录至少拆分标签读取、边界权重、projection/fusion、group update、TDOM render、写盘、checkpoint、CPU/GPU 峰值内存和 lag。
+
+## 当前未校准默认值
+
+| 参数 | 默认值 | 说明 |
+|---|---:|---|
+| overlap threshold | 0.4 | anchor-based 分组 |
+| max group size | 4 | 延迟/相关性默认，不是数学上限 |
+| boundary bandwidth | 2 | label pixel |
+| boundary floor | 0.25 | `[0,1]` |
+| `S_min` | 1.0 | LOO 其他组累计有效支持候选值 |
+| reliability floor | 0.1 | JS 权重正下限 |
+| JS temperature | 0.1 | JS 软权重温度 |
+| min geometry coverage | 0.05 | hard-map gate |
+| min pixel evidence support | 0.01 | hard-map gate |
+| min pixel support ratio | 0.05 | hard-map gate |
+
+这些值全部必须配置化并写入 manifest；当前没有人工真值或正式评测支持其最优性。
+
+## 实施与验证门槛
+
+实现顺序必须是：
+
+1. CPU/reference 数学与边界条件测试；
+2. state/schema/version 与旧状态拒绝测试；
+3. CUDA 与 CPU reference 数值一致性；
+4. 拓扑前后渲染场连续性测试；
+5. online staleness/group disagreement/final recovery；
+6. 固定网格与原子 paired publication；
+7. 只读 dataset preflight/cache；
+8. 干净 `semantic-atdom` 环境中的真实 CUDA import；
+9. Phantom3 stage 30 到 31 smoke；
+10. Phantom3 stage 30 到 100 运行与资源 profile。
+
+在 CPU 数学合同稳定前不得继续修改 CUDA。单元测试通过不等于端到端能力可运行；每项未完成验证必须显式标为“未验证”。
+
+当前实现仍与本文存在多项差距，包括 prior-contaminated 类别 numerator、包含先验的 LOO 共识、诊断 gate、旧 schema、含 SH 的快照/hash、动态跨阶段网格、非原子 RGB/Semantic 配对，以及 online hook 失败后无法独立 final rebuild。实施状态以 [全局认知](../project/global-context.md) 的当前状态表和 active plan 为准。

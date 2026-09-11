@@ -104,7 +104,7 @@ class SemanticTdomTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "three integers"):
                 load_semantic_tdom_palette(palette_path, CLASS_SPEC)
 
-    def test_soft_probabilities_are_mixed_before_unknown_gate(self):
+    def test_diagnostic_margin_does_not_change_three_condition_hard_map(self):
         rendered = torch.tensor(
             [
                 [[0.6, 0.2]],
@@ -124,16 +124,14 @@ class SemanticTdomTests(unittest.TestCase):
             rendered, coverage, CLASS_SPEC, config
         )
 
-        self.assertEqual(result.class_ids.tolist(), [[0, 255]])
+        self.assertEqual(result.class_ids.tolist(), [[0, 0]])
         torch.testing.assert_close(
             result.probabilities[:, 0, 0], torch.tensor([0.75, 0.25])
         )
         self.assertEqual(result.colors[:, 0, 0].tolist(), [10, 20, 30])
-        self.assertEqual(result.colors[:, 0, 1].tolist(), [0, 0, 0])
+        self.assertEqual(result.colors[:, 0, 1].tolist(), [10, 20, 30])
         self.assertFalse(torch.isnan(result.entropy[0, 1]))
-        self.assertEqual(
-            int(result.unknown_reason[0, 1]), int(UnknownReason.LOW_MARGIN)
-        )
+        self.assertEqual(int(result.unknown_reason[0, 1]), 0)
 
     def test_entropy_and_unknown_reasons_remain_explainable(self):
         rendered = torch.tensor(
@@ -151,11 +149,9 @@ class SemanticTdomTests(unittest.TestCase):
             SemanticTdomConfig(min_margin=0.2),
         )
 
-        self.assertTrue(result.unknown_mask[0, 0])
+        self.assertFalse(result.unknown_mask[0, 0])
         self.assertFalse(torch.isnan(result.entropy[0, 0]))
-        self.assertTrue(
-            int(result.unknown_reason[0, 0]) & int(UnknownReason.LOW_MARGIN)
-        )
+        self.assertEqual(int(result.unknown_reason[0, 0]), 0)
         self.assertTrue(torch.isnan(result.entropy[0, 1]))
         self.assertTrue(
             int(result.unknown_reason[0, 1])
@@ -186,7 +182,7 @@ class SemanticTdomTests(unittest.TestCase):
             result.group_disagreement, torch.tensor([[0.20]])
         )
         torch.testing.assert_close(
-            result.posterior_variance, torch.tensor([[0.125]])
+            result.prior_regularized_variance_proxy, torch.tensor([[0.125]])
         )
 
     def test_group_disagreement_keeps_full_trace_range(self):
@@ -223,6 +219,17 @@ class SemanticTdomTests(unittest.TestCase):
             places=6,
         )
 
+    def test_render_features_exclude_prior_from_class_mass(self):
+        state = SemanticGaussianState.initialize(1, 2)
+        state.add_evidence(torch.tensor([[0.0, 4.0]]))
+
+        features = _semantic_render_features(
+            state, torch.device("cpu"), use_robust=True, eps=1e-8
+        )
+
+        torch.testing.assert_close(features[0, :2], torch.tensor([0.0, 0.8]))
+        self.assertEqual(float(features[0, 0]), 0.0)
+
     def test_uncertainty_is_undefined_without_semantic_evidence(self):
         result = finalize_semantic_tdom(
             torch.zeros((CLASS_SPEC.num_classes + 4, 1, 1)),
@@ -234,7 +241,7 @@ class SemanticTdomTests(unittest.TestCase):
             "normalized_entropy",
             "mixture_disagreement",
             "group_disagreement",
-            "posterior_variance",
+            "prior_regularized_variance_proxy",
         ):
             self.assertTrue(torch.isnan(getattr(result, name)).all(), name)
 
@@ -272,15 +279,15 @@ class SemanticTdomTests(unittest.TestCase):
                 "semantic_color.png",
                 "unknown_mask.png",
                 "unknown_reason.png",
-                "semantic_support.tif",
+                "pixel_evidence_support.tif",
                 "semantic_entropy.tif",
-                "coverage.tif",
-                "support_ratio.tif",
+                "geometry_coverage.tif",
+                "pixel_support_ratio.tif",
                 "top1_probability.tif",
                 "margin.tif",
                 "mixture_disagreement.tif",
                 "group_disagreement.tif",
-                "posterior_variance.tif",
+                "prior_regularized_variance_proxy.tif",
                 "semantic_probabilities.npy",
                 "class_spec.json",
                 "render_palette.json",
@@ -314,14 +321,26 @@ class SemanticTdomTests(unittest.TestCase):
                 "semantic/tdom_palette.json",
             )
             self.assertNotIn("render_palette", payload["unknown_gate"])
+            self.assertNotIn("min_margin", payload["unknown_gate"])
+            self.assertNotIn("max_normalized_entropy", payload["unknown_gate"])
             self.assertEqual(
-                payload["raster_encodings"]["semantic_support.tif"]["dtype"],
+                set(payload["unknown_reason_bits"]),
+                {
+                    "low_coverage",
+                    "low_absolute_support",
+                    "low_support_ratio",
+                    "no_semantic_evidence",
+                },
+            )
+            self.assertEqual(
+                payload["raster_encodings"]["pixel_evidence_support.tif"]["dtype"],
                 "uint16",
             )
             self.assertEqual(
                 payload["raster_encodings"]["group_disagreement.tif"]["scale"],
                 2.0 / 65534.0,
             )
+            self.assertNotIn("posterior_variance.tif", payload["files"])
 
             second_manifest = write_semantic_tdom(
                 result,
@@ -356,7 +375,7 @@ class SemanticTdomTests(unittest.TestCase):
             payload = json.loads(manifest_path.read_text(encoding="utf-8"))
             self.assertEqual(
                 set(payload["raster_encodings"]),
-                {"semantic_support.tif", "semantic_entropy.tif"},
+                {"pixel_evidence_support.tif", "semantic_entropy.tif"},
             )
 
     def test_channel_count_must_match_class_spec(self):

@@ -103,6 +103,17 @@ class SemanticCudaTdomTests(unittest.TestCase):
             32,
         )
         state = SemanticGaussianState.initialize(2, 2, device="cuda")
+        prior_only = rasterize_semantic_tdom(
+            Gaussians(),
+            state,
+            camera,
+            self._two_class_spec(),
+            config=SemanticTdomConfig(min_free_cuda_bytes=0),
+        )
+        self.assertEqual(float(prior_only.absolute_support.max()), 0.0)
+        self.assertTrue(bool((prior_only.class_ids == 255).all()))
+        self.assertTrue(bool(torch.isnan(prior_only.entropy).all()))
+
         state.add_evidence(
             torch.tensor([[4.0, 1.0], [1.0, 4.0]], device="cuda")
         )
@@ -136,11 +147,59 @@ class SemanticCudaTdomTests(unittest.TestCase):
             "entropy",
             "mixture_disagreement",
             "group_disagreement",
-            "posterior_variance",
+            "prior_regularized_variance_proxy",
         ):
             torch.testing.assert_close(
                 getattr(striped, name), getattr(full, name), equal_nan=True
             )
+
+    def test_high_level_renderer_never_turns_prior_into_class_mass(self):
+        class Gaussians:
+            get_xyz = torch.tensor(
+                [[0.0, 0.0, 1.0], [0.1, 0.0, 2.0]],
+                dtype=torch.float32,
+                device="cuda",
+            )
+            get_opacity = torch.tensor(
+                [[0.5], [0.5]], dtype=torch.float32, device="cuda"
+            )
+            get_scaling = torch.full(
+                (2, 3), 0.2, dtype=torch.float32, device="cuda"
+            )
+            get_rotation = torch.tensor(
+                [[1.0, 0.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0]],
+                dtype=torch.float32,
+                device="cuda",
+            )
+
+        camera = DummyCamera(
+            np.eye(3, dtype=np.float32),
+            np.zeros(3, dtype=np.float32),
+            1.0,
+            1.0,
+            16,
+            32,
+        )
+        state = SemanticGaussianState.initialize(2, 2, device="cuda")
+        state.add_evidence(
+            torch.tensor([[0.0, 4.0], [0.0, 4.0]], device="cuda")
+        )
+        result = rasterize_semantic_tdom(
+            Gaussians(),
+            state,
+            camera,
+            self._two_class_spec(),
+            config=SemanticTdomConfig(
+                min_free_cuda_bytes=0, save_probabilities=True
+            ),
+        )
+        supported = result.absolute_support > 0
+        classified = ~result.unknown_mask
+
+        self.assertTrue(bool(supported.any()))
+        self.assertTrue(bool(classified.any()))
+        self.assertTrue(bool((result.probabilities[0, supported] == 0).all()))
+        self.assertTrue(bool((result.class_ids[classified] == 1).all()))
 
     def _empty_call(self, channels):
         device = torch.device("cuda")

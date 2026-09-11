@@ -16,6 +16,7 @@ import torch
 
 from semantic_atdom.semantics.schema import SemanticClassSpec, sha256_file
 from semantic_atdom.semantics.provenance import SEMANTIC_METHOD_VERSION
+from semantic_atdom.semantics.reference import evidence_conditioned_belief
 
 
 class UnknownReason(IntFlag):
@@ -120,6 +121,14 @@ class SemanticTdomConfig:
         payload = asdict(self)
         payload.pop("render_palette")
         payload.pop("render_palette_source")
+        for name in (
+            "min_margin",
+            "min_top1_probability",
+            "max_normalized_entropy",
+            "max_group_disagreement",
+        ):
+            payload.pop(name)
+        payload["semantic_method_version"] = SEMANTIC_METHOD_VERSION
         return payload
 
 
@@ -229,9 +238,14 @@ class SemanticTdomResult(NamedTuple):
     margin: Optional[torch.Tensor]
     mixture_disagreement: Optional[torch.Tensor]
     group_disagreement: Optional[torch.Tensor]
-    posterior_variance: Optional[torch.Tensor]
+    prior_regularized_variance_proxy: Optional[torch.Tensor]
     radii: Optional[torch.Tensor]
     metrics: Mapping[str, object]
+
+    @property
+    def posterior_variance(self) -> Optional[torch.Tensor]:
+        """Deprecated schema-2 alias for downstream Python callers."""
+        return self.prior_regularized_variance_proxy
 
 
 def _empty_uncertainty(reference: torch.Tensor) -> torch.Tensor:
@@ -247,20 +261,21 @@ def _semantic_render_features(
     """Build the K+4 per-Gaussian values consumed by the CUDA renderer."""
     alpha = semantic_state.alpha_robust if use_robust else semantic_state.alpha_raw
     alpha = alpha.detach().to(device=device, dtype=torch.float32)
-    concentration = alpha.sum(dim=1)
-    means = alpha / (concentration.unsqueeze(1) + eps)
-    evidence_ratio = (
-        (concentration - semantic_state.prior_total)
-        / (concentration + eps)
-    ).clamp(min=0.0, max=1.0)
-    probability_second_moment = means.square().sum(dim=1)
+    belief = evidence_conditioned_belief(
+        alpha, prior_total=semantic_state.prior_total, eps=eps
+    )
+    concentration = belief.concentration
+    evidence_ratio = belief.evidence_ratio
+    distribution = belief.distribution
+    probability_second_moment = distribution.square().sum(dim=1)
     # Squared distance between two categorical distributions can reach 2
     # (opposite one-hot vectors), so the flight-group trace must retain [0, 2].
     group_disagreement = semantic_state.group_variance.detach().to(
         device=device, dtype=torch.float32
     ).sum(dim=1).clamp(min=0.0, max=2.0)
-    posterior_variance = (
-        (1.0 - probability_second_moment).clamp_min(0.0)
+    prior_regularized_mean = alpha / (concentration.unsqueeze(1) + eps)
+    prior_regularized_variance_proxy = (
+        (1.0 - prior_regularized_mean.square().sum(dim=1)).clamp_min(0.0)
         / (concentration + 1.0)
     )
     auxiliary = torch.stack(
@@ -268,12 +283,12 @@ def _semantic_render_features(
             evidence_ratio,
             evidence_ratio * probability_second_moment,
             evidence_ratio * group_disagreement,
-            evidence_ratio.square() * posterior_variance,
+            evidence_ratio.square() * prior_regularized_variance_proxy,
         ),
         dim=1,
     )
     return torch.cat(
-        (means * evidence_ratio.unsqueeze(1), auxiliary), dim=1
+        (belief.evidence / concentration.unsqueeze(1), auxiliary), dim=1
     ).contiguous()
 
 
@@ -355,14 +370,14 @@ def finalize_semantic_tdom(
             rendered_features[class_count + 2]
             / (absolute_support + config.eps)
         ).clamp(min=0.0, max=2.0)
-        posterior_variance = (
+        prior_regularized_variance_proxy = (
             rendered_features[class_count + 3]
             / (absolute_support.square() + config.eps)
         ).clamp(min=0.0, max=1.0)
     else:
         mixture_disagreement = _empty_uncertainty(absolute_support)
         group_disagreement = _empty_uncertainty(absolute_support)
-        posterior_variance = _empty_uncertainty(absolute_support)
+        prior_regularized_variance_proxy = _empty_uncertainty(absolute_support)
 
     reason = torch.zeros_like(absolute_support, dtype=torch.uint8)
 
@@ -380,21 +395,6 @@ def finalize_semantic_tdom(
         support_ratio < config.min_support_ratio,
         UnknownReason.LOW_SUPPORT_RATIO,
     )
-    add_reason(margin < config.min_margin, UnknownReason.LOW_MARGIN)
-    add_reason(
-        top1_probability < config.min_top1_probability,
-        UnknownReason.LOW_TOP1_PROBABILITY,
-    )
-    add_reason(
-        normalized_entropy > config.max_normalized_entropy,
-        UnknownReason.HIGH_NORMALIZED_ENTROPY,
-    )
-    if enhanced:
-        add_reason(
-            group_disagreement > config.max_group_disagreement,
-            UnknownReason.HIGH_GROUP_DISAGREEMENT,
-        )
-
     valid = reason == 0
     class_ids = probabilities.argmax(dim=0).to(dtype=torch.uint8)
     class_ids = torch.where(
@@ -412,6 +412,16 @@ def finalize_semantic_tdom(
         normalized_entropy,
         torch.full_like(normalized_entropy, float("nan")),
     )
+    top1_probability = torch.where(
+        semantic_evidence,
+        top1_probability,
+        torch.full_like(top1_probability, float("nan")),
+    )
+    margin = torch.where(
+        semantic_evidence,
+        margin,
+        torch.full_like(margin, float("nan")),
+    )
     if enhanced:
         undefined = torch.full_like(absolute_support, float("nan"))
         mixture_disagreement = torch.where(
@@ -420,8 +430,10 @@ def finalize_semantic_tdom(
         group_disagreement = torch.where(
             semantic_evidence, group_disagreement, undefined
         )
-        posterior_variance = torch.where(
-            semantic_evidence, posterior_variance, undefined
+        prior_regularized_variance_proxy = torch.where(
+            semantic_evidence,
+            prior_regularized_variance_proxy,
+            undefined,
         )
     colors = None
     if create_colors:
@@ -451,7 +463,7 @@ def finalize_semantic_tdom(
         margin=margin,
         mixture_disagreement=mixture_disagreement,
         group_disagreement=group_disagreement,
-        posterior_variance=posterior_variance,
+        prior_regularized_variance_proxy=prior_regularized_variance_proxy,
         radii=radii,
         metrics={},
     )
@@ -482,7 +494,7 @@ def _finalize_semantic_tdom_in_tiles(
         "margin",
         "mixture_disagreement",
         "group_disagreement",
-        "posterior_variance",
+        "prior_regularized_variance_proxy",
     )
     float_names = core_float_names + (
         diagnostic_float_names if config.save_diagnostics else ()
@@ -550,7 +562,9 @@ def _finalize_semantic_tdom_in_tiles(
         margin=outputs.get("margin"),
         mixture_disagreement=outputs.get("mixture_disagreement"),
         group_disagreement=outputs.get("group_disagreement"),
-        posterior_variance=outputs.get("posterior_variance"),
+        prior_regularized_variance_proxy=outputs.get(
+            "prior_regularized_variance_proxy"
+        ),
         radii=None if radii is None else radii.detach().cpu(),
         metrics=dict(metrics),
     )
@@ -750,7 +764,7 @@ def rasterize_semantic_tdom(
                     "margin",
                     "mixture_disagreement",
                     "group_disagreement",
-                    "posterior_variance",
+                    "prior_regularized_variance_proxy",
                     "probabilities",
                 )
                 if getattr(result, name) is not None
@@ -921,19 +935,21 @@ def write_semantic_tdom(
 
     tiff_writer = None
     diagnostic_tensors = {
-        "semantic_support.tif": result.absolute_support,
+        "pixel_evidence_support.tif": result.absolute_support,
         "semantic_entropy.tif": result.entropy,
     }
     if config.save_diagnostics:
         diagnostic_tensors.update(
             {
-                "coverage.tif": result.coverage,
-                "support_ratio.tif": result.support_ratio,
+                "geometry_coverage.tif": result.coverage,
+                "pixel_support_ratio.tif": result.support_ratio,
                 "top1_probability.tif": result.top1_probability,
                 "margin.tif": result.margin,
                 "mixture_disagreement.tif": result.mixture_disagreement,
                 "group_disagreement.tif": result.group_disagreement,
-                "posterior_variance.tif": result.posterior_variance,
+                "prior_regularized_variance_proxy.tif": (
+                    result.prior_regularized_variance_proxy
+                ),
             }
         )
     raster_encodings = {}
@@ -1024,14 +1040,20 @@ def write_semantic_tdom(
             "render_palette": palette_payload,
             "unknown_gate": config.to_dict(),
             "unknown_reason_bits": {
-                item.name.lower(): int(item) for item in UnknownReason
+                item.name.lower(): int(item)
+                for item in (
+                    UnknownReason.LOW_COVERAGE,
+                    UnknownReason.LOW_ABSOLUTE_SUPPORT,
+                    UnknownReason.LOW_SUPPORT_RATIO,
+                    UnknownReason.NO_SEMANTIC_EVIDENCE,
+                )
             },
             "uncertainty_definitions": {
                 "semantic_entropy": "categorical entropy in nats; range [0, ln(K)]",
                 "normalized_entropy": "semantic_entropy / ln(K); range [0, 1]",
                 "mixture_disagreement": "weighted E[||mu_g||^2] - ||E[mu_g]||^2",
                 "group_disagreement": "weighted mean trace of per-Gaussian flight-group variance",
-                "posterior_variance": "squared semantic-weight propagation of independent Dirichlet trace variance",
+                "prior_regularized_variance_proxy": "uncalibrated squared semantic-weight propagation of independent Dirichlet trace variance",
             },
             "product_statistics": {
                 "class_pixel_counts": {

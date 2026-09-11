@@ -6,7 +6,10 @@ from typing import Dict, Mapping, NamedTuple, Optional, Sequence, Tuple
 
 import torch
 
-from semantic_atdom.semantics.reference import aggregate_observation_group
+from semantic_atdom.semantics.reference import (
+    aggregate_observation_group,
+    evidence_conditioned_belief,
+)
 from semantic_atdom.semantics.schema import (
     LedgerEntry,
     SemanticDataset,
@@ -79,7 +82,11 @@ class FinalSemanticRebuilder:
         semantic_support = torch.zeros(
             gaussian_count, dtype=state.dtype, device=device
         )
-        disagreement = torch.zeros_like(raw)
+        group_weight = torch.zeros(
+            gaussian_count, dtype=state.dtype, device=device
+        )
+        group_first_moment = torch.zeros_like(raw)
+        group_second_moment = torch.zeros_like(raw)
         ledger = SemanticLedger()
         provenance = {"schema_version": 1, "versions": {}}
         label_seconds = 0.0
@@ -104,6 +111,13 @@ class FinalSemanticRebuilder:
             raw.add_(evidence)
             group_count.add_((stats.support > self.config.eps).long())
             semantic_support.add_(raw_support)
+            group_weight.add_(stats.support)
+            group_first_moment.add_(
+                stats.support.unsqueeze(1) * stats.distribution
+            )
+            group_second_moment.add_(
+                stats.support.unsqueeze(1) * stats.distribution.square()
+            )
             self._synchronize(device)
             fusion_seconds += time.monotonic() - fusion_start
 
@@ -129,34 +143,47 @@ class FinalSemanticRebuilder:
                 distributions, supports, eps=self.config.eps
             )
             evidence = stats.support.unsqueeze(1) * stats.distribution
-            leave_one_out = raw - evidence
+            leave_one_out = (raw - state.prior()) - evidence
+            leave_out_support = leave_one_out.sum(dim=1)
             consensus = leave_one_out / (
-                leave_one_out.sum(dim=1, keepdim=True) + self.config.eps
+                leave_out_support.unsqueeze(1) + self.config.eps
             )
             js = self._js_divergence(stats.distribution, consensus)
             candidate = self.config.reliability_floor + (
                 1.0 - self.config.reliability_floor
             ) * torch.exp(-js / self.config.temperature)
-            eligible = (group_count >= 3) & (
+            other_group_count = group_count - (
                 stats.support > self.config.eps
+            ).long()
+            eligible = (
+                (other_group_count >= 2)
+                & (leave_out_support >= self.config.min_consensus_support)
+                & (stats.support > self.config.eps)
             )
             reliability = torch.where(
                 eligible, candidate, torch.ones_like(candidate)
             )
             robust.add_(reliability.unsqueeze(1) * evidence)
-            disagreement.add_(
-                stats.support.unsqueeze(1)
-                * (stats.distribution - consensus).square()
-            )
             self._synchronize(device)
             fusion_seconds += time.monotonic() - fusion_start
 
-        divisor = group_count.clamp_min(1).to(state.dtype).unsqueeze(1)
+        group_mean = group_first_moment / (
+            group_weight.unsqueeze(1) + self.config.eps
+        )
+        disagreement = (
+            group_second_moment
+            / (group_weight.unsqueeze(1) + self.config.eps)
+            - group_mean.square()
+        ).clamp_min(0.0)
         state.alpha_raw = raw
         state.alpha_robust = robust
-        state.group_variance = disagreement / divisor
+        state.group_variance = disagreement
         state.group_count = group_count
         state.semantic_support = semantic_support
+        state.group_disagreement_available = bool(
+            ((group_count == 0) | (group_count >= 2)).all()
+        )
+        state.mark_historical_evidence_current()
         state.mark_dirty()
         state._validate()
         comparison = self._compare_online(online_state, state)
@@ -330,12 +357,16 @@ class FinalSemanticRebuilder:
         ):
             return {}
         eps = self.config.eps
-        online = online_state.alpha_robust / (
-            online_state.alpha_robust.sum(dim=1, keepdim=True) + eps
-        )
-        exact = final_state.alpha_robust / (
-            final_state.alpha_robust.sum(dim=1, keepdim=True) + eps
-        )
+        online = evidence_conditioned_belief(
+            online_state.alpha_robust,
+            prior_total=online_state.prior_total,
+            eps=eps,
+        ).distribution
+        exact = evidence_conditioned_belief(
+            final_state.alpha_robust,
+            prior_total=final_state.prior_total,
+            eps=eps,
+        ).distribution
         js = self._js_divergence(online, exact)
         observed = final_state.group_count > 0
         if not bool(observed.any()):

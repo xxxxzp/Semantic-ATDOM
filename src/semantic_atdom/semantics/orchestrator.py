@@ -169,6 +169,7 @@ class OnlineSemanticConfig:
     max_group_size: int = 4
     reliability_floor: float = 0.1
     temperature: float = 0.1
+    min_consensus_support: float = 1.0
     prior_total: float = 1.0
     boundary_bandwidth: float = 2.0
     boundary_floor: float = 0.25
@@ -183,6 +184,8 @@ class OnlineSemanticConfig:
             raise ValueError("reliability_floor must be in [0, 1]")
         if self.temperature <= 0 or self.prior_total <= 0 or self.eps <= 0:
             raise ValueError("temperature, prior_total, and eps must be positive")
+        if self.min_consensus_support < 0:
+            raise ValueError("min_consensus_support must be non-negative")
         if self.boundary_bandwidth < 0:
             raise ValueError("boundary_bandwidth must be non-negative")
         if not 0 <= self.boundary_floor <= 1:
@@ -196,6 +199,7 @@ class OnlineSemanticConfig:
             "max_group_size": self.max_group_size,
             "reliability_floor": self.reliability_floor,
             "temperature": self.temperature,
+            "min_consensus_support": self.min_consensus_support,
             "prior_total": self.prior_total,
             "boundary_bandwidth": self.boundary_bandwidth,
             "boundary_floor": self.boundary_floor,
@@ -217,6 +221,8 @@ class SemanticSyncResult(NamedTuple):
     lag_batches: int
     within_lag_budget: bool
     errors: Tuple[str, ...]
+    status: str = "approx_online"
+    historical_evidence_stale: bool = False
 
 
 class FrozenGaussianSnapshot:
@@ -582,14 +588,20 @@ class OnlineSemanticOrchestrator:
         else:
             closed_raw = self.state.alpha_raw - self.state.open_raw_evidence
             closed_count = self.state.group_count - self.state.open_group_count
-        consensus = closed_raw / (
-            closed_raw.sum(dim=1, keepdim=True) + self.config.eps
+        closed_evidence = (closed_raw - self.state.prior()).clamp_min(0.0)
+        closed_support = closed_evidence.sum(dim=1)
+        consensus = closed_evidence / (
+            closed_support.unsqueeze(1) + self.config.eps
         )
         js = self._js_divergence(group.distribution, consensus)
         reliability = self.config.reliability_floor + (
             1.0 - self.config.reliability_floor
         ) * torch.exp(-js / self.config.temperature)
-        eligible = (closed_count >= 2) & (group.support > self.config.eps)
+        eligible = (
+            (closed_count >= 2)
+            & (closed_support >= self.config.min_consensus_support)
+            & (group.support > self.config.eps)
+        )
         reliability = torch.where(
             eligible, reliability, torch.ones_like(reliability)
         )
@@ -660,7 +672,7 @@ class OnlineSemanticOrchestrator:
         distributions = self.state.open_distributions.clone()
         supports = self.state.open_supports.clone()
         semantic_supports = self.state.open_semantic_supports.clone()
-        dirty = self.state.dirty
+        dirty = self.state.active_projection_dirty
         for index, image_id in enumerate(representatives):
             projection = projections[image_id]
             distribution = projection.distribution.detach().to(
@@ -687,8 +699,10 @@ class OnlineSemanticOrchestrator:
         raw_evidence = group.support.unsqueeze(1) * group.distribution
         closed_raw = self.state.alpha_raw - self.state.open_raw_evidence
         closed_count = self.state.group_count - self.state.open_group_count
-        consensus = closed_raw / (
-            closed_raw.sum(dim=1, keepdim=True) + self.config.eps
+        closed_evidence = (closed_raw - self.state.prior()).clamp_min(0.0)
+        closed_support = closed_evidence.sum(dim=1)
+        consensus = closed_evidence / (
+            closed_support.unsqueeze(1) + self.config.eps
         )
         reliability = self.config.reliability_floor + (
             1.0 - self.config.reliability_floor
@@ -696,7 +710,11 @@ class OnlineSemanticOrchestrator:
             -self._js_divergence(group.distribution, consensus)
             / self.config.temperature
         )
-        eligible = (closed_count >= 2) & (group.support > self.config.eps)
+        eligible = (
+            (closed_count >= 2)
+            & (closed_support >= self.config.min_consensus_support)
+            & (group.support > self.config.eps)
+        )
         reliability = torch.where(
             eligible, reliability, torch.ones_like(reliability)
         )
@@ -710,7 +728,7 @@ class OnlineSemanticOrchestrator:
         )
         self.open_group["projection_topology_version"] = self.state.topology_version
         self.open_group["projection_geometry_stage"] = self.current_geometry_stage
-        self.state.mark_clean(dirty)
+        self.state.mark_active_projection_current(dirty)
         return True
 
     def recovery_context(self) -> Dict[str, object]:
@@ -916,8 +934,20 @@ class ProgressiveSemanticHook:
         tdom_alignment: Optional[Mapping[str, object]] = None,
     ) -> SemanticSyncResult:
         geometry_stage = int(geometry_stage)
-        if geometry_stage != self.orchestrator.current_geometry_stage:
+        online_usable = self.orchestrator.state.is_valid
+        if (
+            online_usable
+            and geometry_stage != self.orchestrator.current_geometry_stage
+        ):
+            closed_count = (
+                self.orchestrator.state.group_count
+                - self.orchestrator.state.open_group_count
+            )
+            if bool((closed_count > 0).any()):
+                self.orchestrator.state.mark_historical_evidence_stale()
             self.orchestrator.state.mark_dirty()
+            if self.orchestrator.open_group is not None:
+                self.orchestrator.state.mark_active_projection_dirty()
         self.orchestrator.current_geometry_stage = geometry_stage
         overlap = AcquisitionOverlap.load(snapshot_root)
         camera_by_id = {
@@ -939,6 +969,12 @@ class ProgressiveSemanticHook:
         processed = []
         errors = []
         deferred = []
+        if not online_usable:
+            errors.append(
+                "online semantic state unavailable: {}".format(
+                    self.orchestrator.state.invalid_reason or "unknown failure"
+                )
+            )
         if final:
             missing_cameras = tuple(
                 image_id
@@ -952,14 +988,15 @@ class ProgressiveSemanticHook:
                     )
                 )
                 deferred.extend(missing_cameras)
-        try:
-            self._refresh_active_window(camera_by_id, gaussians)
-        except Exception as error:
-            errors.append("active-window refresh: {}".format(error))
+        if online_usable:
+            try:
+                self._refresh_active_window(camera_by_id, gaussians)
+            except Exception as error:
+                errors.append("active-window refresh: {}".format(error))
         ledger_images = {
             entry.image_id for entry in self.orchestrator.ledger.entries
         }
-        for position, image_id in enumerate(ordered):
+        for position, image_id in enumerate(ordered if online_usable else ()):
             if image_id in ledger_images:
                 try:
                     self._verify_recorded_metadata(image_id)
@@ -988,16 +1025,36 @@ class ProgressiveSemanticHook:
                 deferred.extend(ordered[position:])
                 break
         exact_rebuilt = False
+        exact_complete = False
         if final:
-            self.orchestrator.close_group()
-            if ordered and not deferred and not errors:
+            if online_usable:
+                self.orchestrator.close_group()
+            final_ready = []
+            final_missing = []
+            for image_id in all_ordered:
+                label_path = (
+                    self.dataset.semantic_root / "labels" / (image_id + ".png")
+                )
+                metadata_path = (
+                    self.dataset.semantic_root
+                    / "metadata"
+                    / (image_id + ".json")
+                )
+                if image_id not in camera_by_id:
+                    final_missing.append(image_id)
+                elif label_path.is_file() and metadata_path.is_file():
+                    final_ready.append(image_id)
+                else:
+                    final_missing.append(image_id)
+            deferred = list(dict.fromkeys(deferred + final_missing))
+            if final_ready:
                 try:
                     rebuilt = FinalSemanticRebuilder(
                         self.dataset,
                         self.projector,
                         self.orchestrator.config,
                     ).rebuild(
-                        ordered,
+                        tuple(final_ready),
                         camera_by_id,
                         gaussians,
                         overlap,
@@ -1035,8 +1092,11 @@ class ProgressiveSemanticHook:
                         entry.image_id for entry in rebuilt.ledger.entries
                     }
                     exact_rebuilt = True
+                    exact_complete = not final_missing
                 except Exception as error:
                     errors.append("final exact rebuild: {}".format(error))
+            else:
+                errors.append("final exact rebuild has no valid observations")
 
         through_index = 0
         for image_id in ordered:
@@ -1052,6 +1112,25 @@ class ProgressiveSemanticHook:
                 _acquisition_key(boundary) > through_key
                 for boundary in self._stage_boundaries
             )
+        historical_stale = (
+            self.orchestrator.state.historical_evidence_stale
+            if self.orchestrator.state.is_valid
+            else True
+        )
+        if exact_rebuilt:
+            status = "exact_final" if exact_complete else "exact_partial"
+        elif final:
+            status = (
+                "online_fallback"
+                if self.orchestrator.state.is_valid
+                else "failed"
+            )
+        elif not self.orchestrator.state.is_valid:
+            status = "failed"
+        elif historical_stale or deferred or errors or lag > 1:
+            status = "stale_online"
+        else:
+            status = "approx_online"
         result = SemanticSyncResult(
             int(geometry_stage),
             semantic_through,
@@ -1060,8 +1139,14 @@ class ProgressiveSemanticHook:
             lag,
             lag <= 1,
             tuple(errors),
+            status,
+            historical_stale,
         )
-        if tdom_camera is not None and tdom_output_root is not None:
+        if (
+            result.status != "failed"
+            and tdom_camera is not None
+            and tdom_output_root is not None
+        ):
             try:
                 tdom_result = rasterize_semantic_tdom(
                     gaussians,
@@ -1092,14 +1177,9 @@ class ProgressiveSemanticHook:
                         "semantic_quality": {
                             "final_requested": bool(final),
                             "exact_rebuild_succeeded": bool(exact_rebuilt),
-                            "status": (
-                                "exact_final"
-                                if exact_rebuilt
-                                else (
-                                    "online_fallback"
-                                    if final
-                                    else "online"
-                                )
+                            "status": result.status,
+                            "historical_evidence_stale": (
+                                result.historical_evidence_stale
                             ),
                             "deferred_image_ids": list(deferred),
                             "errors_before_tdom": list(errors),
@@ -1122,8 +1202,14 @@ class ProgressiveSemanticHook:
                 self.orchestrator.state.mark_clean()
             except Exception as error:
                 errors.append("semantic TDOM render: {}".format(error))
-                result = result._replace(errors=tuple(errors))
-        self._persist(gaussians, result)
+                result = result._replace(
+                    errors=tuple(errors), status="failed"
+                )
+        if self.orchestrator.state.is_valid:
+            self._persist(gaussians, result)
+        else:
+            self.output_root.mkdir(parents=True, exist_ok=True)
+            self._write_sync_status(result)
         return result
 
     def begin_final(self) -> None:
@@ -1259,6 +1345,9 @@ class ProgressiveSemanticHook:
         )
         self.orchestrator.state.recovery_context = context
         self.orchestrator.ledger.save(self.output_root / "ledger.json")
+        self._write_sync_status(result)
+
+    def _write_sync_status(self, result: SemanticSyncResult) -> None:
         payload = {
             "schema_version": 2,
             "semantic_method_version": SEMANTIC_METHOD_VERSION,
@@ -1270,6 +1359,8 @@ class ProgressiveSemanticHook:
             "lag_batches": result.lag_batches,
             "within_lag_budget": result.within_lag_budget,
             "errors": list(result.errors),
+            "status": result.status,
+            "historical_evidence_stale": result.historical_evidence_stale,
             "stage_boundaries": list(self._stage_boundaries),
         }
         self._save_json_atomic(
@@ -1387,7 +1478,8 @@ class AsyncProgressiveSemanticHook:
     ) -> SemanticSyncResult:
         if self._closed:
             raise RuntimeError("asynchronous semantic hook is closed")
-        self._raise_background_error()
+        if not final:
+            self._raise_background_error()
         camera_ids = tuple(_image_id(item.image_name) for item in cameras)
         if camera_ids:
             boundary = max(
@@ -1437,7 +1529,6 @@ class AsyncProgressiveSemanticHook:
             try:
                 self._idle_event.wait()
                 self._executor.submit(lambda: None).result()
-                self._raise_background_error()
                 result = self._executor.submit(
                     self.core.synchronize,
                     geometry_stage,
@@ -1523,6 +1614,13 @@ class AsyncProgressiveSemanticHook:
         )
         if self._error is not None:
             errors = errors + (str(self._error),)
+        historical_stale = self.orchestrator.state.historical_evidence_stale
+        if not self.is_valid:
+            status = "failed"
+        elif historical_stale or errors or lag > 1:
+            status = "stale_online"
+        else:
+            status = "approx_online"
         return SemanticSyncResult(
             int(geometry_stage),
             through,
@@ -1531,4 +1629,6 @@ class AsyncProgressiveSemanticHook:
             lag,
             lag <= 1,
             errors,
+            status,
+            historical_stale,
         )

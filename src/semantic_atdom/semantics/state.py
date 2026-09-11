@@ -56,6 +56,9 @@ class SemanticGaussianState:
         open_distributions: Optional[torch.Tensor] = None,
         open_supports: Optional[torch.Tensor] = None,
         open_semantic_supports: Optional[torch.Tensor] = None,
+        historical_evidence_stale: bool = False,
+        group_disagreement_available: bool = False,
+        active_projection_dirty: Optional[torch.Tensor] = None,
     ):
         self.alpha_raw = alpha_raw.detach()
         self.alpha_robust = alpha_robust.detach()
@@ -63,6 +66,11 @@ class SemanticGaussianState:
         self.group_count = group_count.detach()
         self.semantic_support = semantic_support.detach()
         self.dirty = dirty.detach()
+        if active_projection_dirty is None:
+            active_projection_dirty = torch.zeros_like(self.dirty)
+        self.active_projection_dirty = active_projection_dirty.detach().to(
+            device=self.alpha_raw.device, dtype=torch.bool
+        )
         self.gaussian_ids = gaussian_ids.detach()
         self.prior_total = float(prior_total)
         self.topology_version = int(topology_version)
@@ -112,6 +120,8 @@ class SemanticGaussianState:
         )
         self.is_valid = True
         self.invalid_reason = None
+        self.historical_evidence_stale = bool(historical_evidence_stale)
+        self.group_disagreement_available = bool(group_disagreement_available)
         self._validate()
 
     @classmethod
@@ -254,6 +264,7 @@ class SemanticGaussianState:
             changed |= validated_increment > 0
         self.alpha_raw.add_(raw)
         self.alpha_robust.add_(robust)
+        self.group_disagreement_available = False
         if validated_support is not None:
             self.semantic_support.add_(validated_support)
         if validated_increment is not None:
@@ -346,6 +357,7 @@ class SemanticGaussianState:
 
         self.alpha_raw = new_alpha_raw
         self.alpha_robust = new_alpha_robust
+        self.group_disagreement_available = False
         self.group_count = new_group_count
         self.semantic_support = new_semantic_support
         self.open_raw_evidence = new_open_raw
@@ -392,6 +404,8 @@ class SemanticGaussianState:
             )
         if delta.is_noop:
             return
+        if bool((self.group_count - self.open_group_count > 0).any()):
+            self.mark_historical_evidence_stale()
         sources = delta.source_indices.to(device=self.device)
         weights = delta.evidence_weights.to(device=self.device, dtype=self.dtype)
         preserve_ids = delta.preserve_source_ids.to(device=self.device)
@@ -431,6 +445,9 @@ class SemanticGaussianState:
         new_dirty = torch.ones(
             delta.new_count, dtype=torch.bool, device=self.device
         )
+        new_active_projection_dirty = torch.zeros(
+            delta.new_count, dtype=torch.bool, device=self.device
+        )
         new_ids = torch.full(
             (delta.new_count,), -1, dtype=torch.long, device=self.device
         )
@@ -442,10 +459,10 @@ class SemanticGaussianState:
             old_prior = self.prior()
             new_raw[inherited] += (
                 self.alpha_raw[old_indices] - old_prior[old_indices]
-            ) * row_weights.unsqueeze(1)
+            )
             new_robust[inherited] += (
                 self.alpha_robust[old_indices] - old_prior[old_indices]
-            ) * row_weights.unsqueeze(1)
+            )
             new_variance[inherited] = self.group_variance[old_indices]
             new_group_count[inherited] = self.group_count[old_indices]
             new_support[inherited] = (
@@ -453,11 +470,9 @@ class SemanticGaussianState:
             )
             new_open_raw[inherited] = (
                 self.open_raw_evidence[old_indices]
-                * row_weights.unsqueeze(1)
             )
             new_open_robust[inherited] = (
                 self.open_robust_evidence[old_indices]
-                * row_weights.unsqueeze(1)
             )
             new_open_group_count[inherited] = self.open_group_count[
                 old_indices
@@ -475,6 +490,10 @@ class SemanticGaussianState:
                     * row_weights.unsqueeze(0)
                 )
             new_dirty[inherited] = self.dirty[old_indices] | changed[inherited]
+            new_active_projection_dirty[inherited] = (
+                self.active_projection_dirty[old_indices]
+                | (changed[inherited] & (open_view_count > 0))
+            )
 
         retained = valid & preserve_ids
         if bool(retained.any()):
@@ -502,6 +521,7 @@ class SemanticGaussianState:
         self.open_supports = new_open_supports
         self.open_semantic_supports = new_open_semantic_supports
         self.dirty = new_dirty
+        self.active_projection_dirty = new_active_projection_dirty
         self.gaussian_ids = new_ids
         if delta.kind != "identity":
             self.topology_version += 1
@@ -528,6 +548,43 @@ class SemanticGaussianState:
         if mask.shape != (self.num_gaussians,):
             raise SemanticStateError("clean mask must have shape [num_gaussians]")
         self.dirty[mask] = False
+
+    def mark_active_projection_dirty(
+        self, mask: Optional[torch.Tensor] = None
+    ) -> None:
+        self._require_valid()
+        if mask is None:
+            self.active_projection_dirty.fill_(True)
+            return
+        mask = mask.detach().to(device=self.device, dtype=torch.bool)
+        if mask.shape != (self.num_gaussians,):
+            raise SemanticStateError(
+                "active projection mask must have shape [num_gaussians]"
+            )
+        self.active_projection_dirty[mask] = True
+
+    def mark_active_projection_current(
+        self, mask: Optional[torch.Tensor] = None
+    ) -> None:
+        self._require_valid()
+        if mask is None:
+            self.active_projection_dirty.zero_()
+            return
+        mask = mask.detach().to(device=self.device, dtype=torch.bool)
+        if mask.shape != (self.num_gaussians,):
+            raise SemanticStateError(
+                "active projection mask must have shape [num_gaussians]"
+            )
+        self.active_projection_dirty[mask] = False
+
+    def mark_historical_evidence_stale(self) -> None:
+        self._require_valid()
+        self.historical_evidence_stale = True
+        self.group_disagreement_available = False
+
+    def mark_historical_evidence_current(self) -> None:
+        self._require_valid()
+        self.historical_evidence_stale = False
 
     def state_dict(
         self,
@@ -585,6 +642,9 @@ class SemanticGaussianState:
             "open_supports": self.open_supports,
             "open_semantic_supports": self.open_semantic_supports,
             "dirty": self.dirty,
+            "active_projection_dirty": self.active_projection_dirty,
+            "historical_evidence_stale": self.historical_evidence_stale,
+            "group_disagreement_available": self.group_disagreement_available,
             "gaussian_ids": self.gaussian_ids,
         }
 
@@ -661,6 +721,9 @@ class SemanticGaussianState:
             "group_count",
             "semantic_support",
             "dirty",
+            "active_projection_dirty",
+            "historical_evidence_stale",
+            "group_disagreement_available",
             "gaussian_ids",
             "prior_total",
             "topology_version",
@@ -690,6 +753,14 @@ class SemanticGaussianState:
                 raise SemanticStateError(
                     "semantic state {} is corrupted".format(name)
                 )
+        for name in (
+            "historical_evidence_stale",
+            "group_disagreement_available",
+        ):
+            if not isinstance(value[name], bool):
+                raise SemanticStateError(
+                    "semantic state {} must be a boolean".format(name)
+                )
         try:
             context = cls._validated_recovery_context(
                 value["recovery_context"],
@@ -713,6 +784,7 @@ class SemanticGaussianState:
                 group_count=value["group_count"],
                 semantic_support=value["semantic_support"],
                 dirty=value["dirty"],
+                active_projection_dirty=value["active_projection_dirty"],
                 gaussian_ids=value["gaussian_ids"],
                 prior_total=value["prior_total"],
                 topology_version=value["topology_version"],
@@ -724,6 +796,10 @@ class SemanticGaussianState:
                 open_distributions=value.get("open_distributions"),
                 open_supports=value.get("open_supports"),
                 open_semantic_supports=value.get("open_semantic_supports"),
+                historical_evidence_stale=value["historical_evidence_stale"],
+                group_disagreement_available=value[
+                    "group_disagreement_available"
+                ],
             )
         except (KeyError, TypeError, ValueError) as error:
             if isinstance(error, SemanticStateError):
@@ -1152,6 +1228,7 @@ class SemanticGaussianState:
             ("group_count", self.group_count),
             ("semantic_support", self.semantic_support),
             ("dirty", self.dirty),
+            ("active_projection_dirty", self.active_projection_dirty),
             ("gaussian_ids", self.gaussian_ids),
             ("open_group_count", self.open_group_count),
         ):
@@ -1184,6 +1261,10 @@ class SemanticGaussianState:
             )
         if self.dirty.dtype != torch.bool:
             raise SemanticStateError("dirty must use torch.bool")
+        if self.active_projection_dirty.dtype != torch.bool:
+            raise SemanticStateError(
+                "active_projection_dirty must use torch.bool"
+            )
         if self.gaussian_ids.dtype != torch.long:
             raise SemanticStateError("gaussian_ids must use torch.long")
         if self.gaussian_ids.numel() != torch.unique(self.gaussian_ids).numel():

@@ -258,12 +258,13 @@ RGB/Semantic 产品使用共同 `projection_geometry_hash`，完整 RGB 另有 `
 | CPU reference/tests | 已完成 |
 | G1 state/recovery/product schema | 已完成 |
 | CUDA V2 实现 | 已完成 |
-| online 状态/paired publication | 未开始 |
+| online 状态与独立 final recovery | 已完成 |
+| paired publication | 未开始 |
 | read-only preflight/cache | 未开始 |
 | 正式 `semantic-atdom` 环境 | 未建立 |
 | stage 30→31 / 30→100 | 未验证 |
 
-当前 online/product 源码的已知差距包括包含先验的 LOO 共识、online 历史证据陈旧、group disagreement 零值、动态跨阶段网格、非原子 RGB/Semantic 配对、仍复制无关 SH 的 snapshot，以及 online hook 失败后无法独立 final rebuild。CPU/CUDA evidence renderer、三条件 gate 和新版本 schema 已完成对齐。
+当前 product/scheduling 源码的已知差距包括动态跨阶段网格、非原子 RGB/Semantic 配对、仍复制无关 SH 的 snapshot，以及尚未确定 GPU 资源/过载策略。CPU/CUDA evidence renderer、prior-free LOO、在线陈旧度/状态机、独立 final recovery 和新版本 schema 已完成对齐；online group disagreement 在 exact rebuild 前明确为不可用而不是伪零。
 
 实施任务与顺序见 [G1 Evidence V2 active plan](../../plans/active/2026-09-11-g1-evidence-v2.md)。在 CPU 数学合同稳定前不修改 CUDA。
 

@@ -87,8 +87,6 @@ class GaussianTopologyIntegrationTests(unittest.TestCase):
         }
         self.assertNotIn(id(state.alpha_raw), optimizer_tensor_ids)
         self.assertNotIn(id(state.alpha_robust), optimizer_tensor_ids)
-        evidence_before = (state.alpha_raw - 0.5).sum(dim=0)
-
         model.xyz_gradient_accum[:] = torch.tensor(
             [[1.0], [1.0], [0.0]], device=state.device
         )
@@ -104,12 +102,9 @@ class GaussianTopologyIntegrationTests(unittest.TestCase):
         self.assertEqual(state.num_gaussians, 5)
         self.assertEqual(events, ["clone", "split"])
         torch.testing.assert_close(
-            (state.alpha_raw - 0.5).sum(dim=0), evidence_before
-        )
-        torch.testing.assert_close(
             state.alpha_raw - 0.5,
             torch.tensor(
-                [[2.0, 0.5], [2.0, 2.0], [2.0, 0.5], [0.0, 1.5], [0.0, 1.5]],
+                [[4.0, 1.0], [2.0, 2.0], [4.0, 1.0], [0.0, 3.0], [0.0, 3.0]],
                 device=state.device,
             ),
         )

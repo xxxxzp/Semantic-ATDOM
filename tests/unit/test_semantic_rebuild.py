@@ -11,6 +11,7 @@ from semantic_atdom.semantics.orchestrator import (
     ProjectedObservation,
 )
 from semantic_atdom.semantics.rebuild import FinalSemanticRebuilder
+from semantic_atdom.semantics.reference import exact_robust_posterior
 from semantic_atdom.semantics.schema import (
     ObservationKey,
     SemanticClassSpec,
@@ -133,6 +134,15 @@ class FinalSemanticRebuilderTests(unittest.TestCase):
         self.assertGreater(result.state.alpha_robust[0, 1].item(), 0.5)
         self.assertEqual(len(result.ledger.entries), 3)
         self.assertEqual(result.metrics.image_count, 3)
+        reference = exact_robust_posterior(
+            torch.tensor([[[1.0, 0.0]], [[1.0, 0.0]], [[0.0, 1.0]]]),
+            torch.ones((3, 1)),
+            min_consensus_support=1.0,
+        )
+        torch.testing.assert_close(
+            result.state.alpha_robust, reference.robust_alpha
+        )
+        self.assertTrue(result.state.group_disagreement_available)
 
 
 if __name__ == "__main__":

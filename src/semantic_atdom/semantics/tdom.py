@@ -804,7 +804,23 @@ def rasterize_semantic_tdom(
             ),
         }
     )
-    return result._replace(metrics=updated_metrics)
+    group_disagreement = result.group_disagreement
+    if (
+        group_disagreement is not None
+        and not semantic_state.group_disagreement_available
+    ):
+        group_disagreement = torch.full_like(
+            group_disagreement, float("nan")
+        )
+    updated_metrics["group_disagreement_status"] = (
+        "exact_rebuild"
+        if semantic_state.group_disagreement_available
+        else "unavailable"
+    )
+    return result._replace(
+        group_disagreement=group_disagreement,
+        metrics=updated_metrics,
+    )
 
 
 def _save_image_atomic(path: Path, array: np.ndarray, image_format: str) -> None:

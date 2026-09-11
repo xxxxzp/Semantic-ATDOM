@@ -17,6 +17,7 @@ from semantic_atdom.semantics.orchestrator import (
     OnlineSemanticOrchestrator,
     ProgressiveSemanticHook,
     ProjectedObservation,
+    SemanticSyncResult,
     label_boundary_weights,
 )
 from semantic_atdom.semantics.schema import (
@@ -207,6 +208,47 @@ class OnlineSemanticOrchestratorTests(unittest.TestCase):
         self.assertGreaterEqual(state.alpha_robust[0, 1].item(), 0.6)
         self.assertLess(state.alpha_robust[0, 1].item(), 1.5)
 
+    def test_online_loo_consensus_excludes_prior_and_requires_support(self):
+        config = OnlineSemanticConfig(
+            max_group_size=1,
+            reliability_floor=0.1,
+            temperature=0.1,
+            min_consensus_support=1.0,
+        )
+        state = SemanticGaussianState.initialize(1, 2)
+        runner = OnlineSemanticOrchestrator(state, CLASS_SPEC, config)
+        matrix = overlap(["000001", "000002", "000003"])
+
+        runner.ingest(observation("000001"), projection([1, 0], 1), matrix)
+        runner.ingest(observation("000002"), projection([1, 0], 1), matrix)
+        runner.ingest(observation("000003"), projection([0, 1], 1), matrix)
+
+        expected_reliability = 0.1 + 0.9 * torch.exp(
+            torch.tensor(-torch.log(torch.tensor(2.0)).item() / 0.1)
+        )
+        self.assertAlmostEqual(
+            float(state.alpha_robust[0, 1] - 0.5),
+            float(expected_reliability),
+            places=5,
+        )
+
+        low_support_state = SemanticGaussianState.initialize(1, 2)
+        low_support_runner = OnlineSemanticOrchestrator(
+            low_support_state, CLASS_SPEC, config
+        )
+        low_support_runner.ingest(
+            observation("000001"), projection([1, 0], 0.2), matrix
+        )
+        low_support_runner.ingest(
+            observation("000002"), projection([1, 0], 0.2), matrix
+        )
+        low_support_runner.ingest(
+            observation("000003"), projection([0, 1], 1.0), matrix
+        )
+        torch.testing.assert_close(
+            low_support_state.alpha_robust, low_support_state.alpha_raw
+        )
+
     def test_ledger_is_idempotent_and_rejects_changed_hash_for_same_key(self):
         state = SemanticGaussianState.initialize(1, 2)
         runner = OnlineSemanticOrchestrator(
@@ -290,7 +332,7 @@ class OnlineSemanticOrchestratorTests(unittest.TestCase):
             state.open_supports, torch.tensor([[0.4, 0.4]])
         )
         torch.testing.assert_close(
-            state.open_raw_evidence.sum(dim=0), torch.tensor([0.6, 0.2])
+            state.open_raw_evidence.sum(dim=0), torch.tensor([1.2, 0.4])
         )
 
         runner.refresh_open_group(
@@ -309,7 +351,8 @@ class OnlineSemanticOrchestratorTests(unittest.TestCase):
         torch.testing.assert_close(
             state.semantic_support, torch.tensor([3.0, 2.0])
         )
-        self.assertFalse(bool(state.dirty.any()))
+        self.assertFalse(bool(state.active_projection_dirty.any()))
+        self.assertTrue(bool(state.dirty.any()))
         self.assertEqual(len(runner.ledger.entries), 1)
 
     def test_invalid_projection_does_not_partially_mutate_open_group(self):
@@ -418,6 +461,13 @@ class ProgressiveSemanticHookTests(unittest.TestCase):
                 dataset, runner, projector, root / "output"
             )
 
+            preview = hook.synchronize(
+                3,
+                [Camera("000001"), Camera("000002"), Camera("000003")],
+                Gaussians(),
+                root / "3",
+            )
+            self.assertEqual(preview.status, "approx_online")
             result = hook.synchronize(
                 3,
                 [Camera("000001"), Camera("000002"), Camera("000003")],
@@ -427,12 +477,21 @@ class ProgressiveSemanticHookTests(unittest.TestCase):
             )
 
             self.assertEqual(result.errors, ())
+            self.assertEqual(result.status, "exact_final")
             self.assertEqual(projector.calls, 9)
             self.assertTrue(
                 (root / "output" / "final_rebuild_metrics.json").is_file()
             )
             self.assertEqual(hook.orchestrator.state.group_count.item(), 3)
             self.assertEqual(hook.orchestrator.open_member_ids, ())
+            stale_result = hook.synchronize(
+                4,
+                [Camera("000001"), Camera("000002"), Camera("000003")],
+                Gaussians(),
+                root / "3",
+            )
+            self.assertEqual(stale_result.status, "stale_online")
+            self.assertTrue(stale_result.historical_evidence_stale)
 
             missing_projector = Projector()
             missing_runner = OnlineSemanticOrchestrator(
@@ -454,8 +513,9 @@ class ProgressiveSemanticHookTests(unittest.TestCase):
                 final=True,
             )
             self.assertIn("missing cameras", missing_result.errors[0])
-            self.assertEqual(missing_projector.calls, 2)
-            self.assertFalse(
+            self.assertEqual(missing_result.status, "exact_partial")
+            self.assertEqual(missing_projector.calls, 6)
+            self.assertTrue(
                 (root / "missing-output" / "final_rebuild_metrics.json").exists()
             )
 
@@ -490,7 +550,32 @@ class ProgressiveSemanticHookTests(unittest.TestCase):
                 final=True,
             )
             self.assertIn("injected metrics failure", failing_result.errors[0])
+            self.assertEqual(failing_result.status, "online_fallback")
             self.assertIs(failing_hook.orchestrator.state, online_state)
+
+            recovery_projector = Projector()
+            recovery_state = SemanticGaussianState.initialize(1, 2)
+            recovery_state.invalidate("injected online failure")
+            recovery_hook = ProgressiveSemanticHook(
+                dataset,
+                OnlineSemanticOrchestrator(
+                    recovery_state,
+                    dataset.class_spec,
+                    OnlineSemanticConfig(max_group_size=1),
+                ),
+                recovery_projector,
+                root / "recovery-output",
+            )
+            recovery_result = recovery_hook.synchronize(
+                3,
+                [Camera("000001"), Camera("000002"), Camera("000003")],
+                Gaussians(),
+                root / "3",
+                final=True,
+            )
+            self.assertEqual(recovery_result.status, "exact_final")
+            self.assertEqual(recovery_projector.calls, 6)
+            self.assertTrue(recovery_hook.orchestrator.state.is_valid)
 
     def test_missing_offline_label_is_deferred_without_projection(self):
         class NeverProject:
@@ -546,6 +631,7 @@ class ProgressiveSemanticHookTests(unittest.TestCase):
             self.assertEqual(result.deferred_image_ids, ("000001",))
             self.assertEqual(result.lag_batches, 1)
             self.assertTrue(result.within_lag_budget)
+            self.assertEqual(result.status, "stale_online")
             self.assertTrue((root / "output" / "latest.json").is_file())
             self.assertTrue(
                 any((root / "output").glob("semantic_state.*.pt"))
@@ -591,6 +677,17 @@ class ProgressiveSemanticHookTests(unittest.TestCase):
                 projector=NeverProject(),
             )
             self.assertEqual(recovered.orchestrator.state.num_gaussians, 1)
+            recovered.orchestrator.state.invalidate("injected unrecoverable state")
+            failed = recovered.synchronize(
+                3, [Camera()], Gaussians(), root / "1", final=True
+            )
+            self.assertEqual(failed.status, "failed")
+            persisted_status = json.loads(
+                (root / "output" / "sync_status.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(persisted_status["status"], "failed")
 
     def test_async_hook_returns_before_semantic_projection_finishes(self):
         started = threading.Event()
@@ -652,6 +749,65 @@ class ProgressiveSemanticHookTests(unittest.TestCase):
         hook.close()
         with self.assertRaisesRegex(RuntimeError, "closed"):
             hook.synchronize(1, [Camera()], Gaussians(), Path("unused"))
+
+    def test_async_final_rebuild_runs_after_online_worker_failure(self):
+        class Core:
+            def __init__(self):
+                class Runner:
+                    state = SemanticGaussianState.initialize(1, 2)
+
+                self.orchestrator = Runner()
+
+            def synchronize(
+                self, stage, cameras, gaussians, root, final, boundaries, *tdom
+            ):
+                if not final:
+                    raise RuntimeError("injected online failure")
+                self.orchestrator.state = SemanticGaussianState.initialize(1, 2)
+                return SemanticSyncResult(
+                    stage,
+                    "000001",
+                    (),
+                    (),
+                    0,
+                    True,
+                    (),
+                    "exact_final",
+                    False,
+                )
+
+            def begin_final(self):
+                return None
+
+        class Camera:
+            image_name = "000001"
+            image_height = 1
+            image_width = 1
+            FoVx = 1.0
+            FoVy = 1.0
+            world_view_transform = torch.eye(4)
+            full_proj_transform = torch.eye(4)
+            camera_center = torch.zeros(3)
+            Tri_Mask = None
+
+        class Gaussians:
+            _xyz = torch.zeros((1, 3))
+            _features_dc = torch.zeros((1, 1, 3))
+            _features_rest = torch.zeros((1, 0, 3))
+            _opacity = torch.zeros((1, 1))
+            _scaling = torch.zeros((1, 3))
+            _rotation = torch.tensor([[1.0, 0.0, 0.0, 0.0]])
+
+        hook = AsyncProgressiveSemanticHook(Core())
+        hook.synchronize(1, [Camera()], Gaussians(), Path("unused"))
+        self.assertTrue(hook._idle_event.wait(timeout=2))
+        self.assertFalse(hook.is_valid)
+
+        result = hook.synchronize(
+            1, [Camera()], Gaussians(), Path("unused"), final=True
+        )
+
+        self.assertEqual(result.status, "exact_final")
 
     def test_async_hook_applies_topology_only_through_each_frozen_snapshot(self):
         started = threading.Event()

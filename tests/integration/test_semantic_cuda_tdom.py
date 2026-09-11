@@ -108,11 +108,17 @@ class SemanticCudaTdomTests(unittest.TestCase):
             state,
             camera,
             self._two_class_spec(),
-            config=SemanticTdomConfig(min_free_cuda_bytes=0),
+            config=SemanticTdomConfig(
+                min_free_cuda_bytes=0, save_diagnostics=True
+            ),
         )
         self.assertEqual(float(prior_only.absolute_support.max()), 0.0)
         self.assertTrue(bool((prior_only.class_ids == 255).all()))
         self.assertTrue(bool(torch.isnan(prior_only.entropy).all()))
+        self.assertTrue(bool(torch.isnan(prior_only.group_disagreement).all()))
+        self.assertEqual(
+            prior_only.metrics["group_disagreement_status"], "unavailable"
+        )
 
         state.add_evidence(
             torch.tensor([[4.0, 1.0], [1.0, 4.0]], device="cuda")

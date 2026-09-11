@@ -4,6 +4,7 @@ import json
 import threading
 import time
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 from PIL import Image
@@ -13,6 +14,8 @@ from semantic_atdom.semantics.orchestrator import (
     AcquisitionOverlap,
     AsyncProgressiveSemanticHook,
     FrozenGaussianSnapshot,
+    FrozenSemanticSnapshot,
+    MapPublicationRequest,
     OnlineSemanticConfig,
     OnlineSemanticOrchestrator,
     ProgressiveSemanticHook,
@@ -20,6 +23,11 @@ from semantic_atdom.semantics.orchestrator import (
     SemanticSyncResult,
     label_boundary_weights,
 )
+from semantic_atdom.semantics.publication import (
+    MapGridSpec,
+    MapPublicationPolicy,
+)
+from semantic_atdom.semantics.tdom import SemanticTdomConfig, finalize_semantic_tdom
 from semantic_atdom.semantics.schema import (
     ObservationKey,
     SemanticClassSpec,
@@ -396,6 +404,204 @@ class ProgressiveSemanticHookTests(unittest.TestCase):
         self.assertEqual(payload["schema_version"], 2)
         self.assertEqual(payload["semantic_method_version"], "g1-evidence-v2")
 
+    def test_semantic_snapshot_omits_appearance_but_pair_snapshot_can_render_rgb(self):
+        class Gaussians:
+            active_sh_degree = 2
+            max_sh_degree = 3
+            _xyz = torch.zeros((1, 3))
+            _features_dc = torch.ones((1, 1, 3))
+            _features_rest = torch.ones((1, 15, 3))
+            _opacity = torch.zeros((1, 1))
+            _scaling = torch.zeros((1, 3))
+            _rotation = torch.tensor([[1.0, 0.0, 0.0, 0.0]])
+
+        semantic = FrozenSemanticSnapshot(Gaussians())
+        paired = FrozenGaussianSnapshot(Gaussians())
+
+        self.assertEqual(
+            set(semantic._values), {"xyz", "opacity", "scaling", "rotation"}
+        )
+        self.assertFalse(hasattr(semantic, "get_features_dc"))
+        self.assertEqual(paired.active_sh_degree, 2)
+        self.assertEqual(paired.max_sh_degree, 3)
+        torch.testing.assert_close(paired.get_features_dc, torch.ones((1, 1, 3)))
+        torch.testing.assert_close(paired.get_features, torch.ones((1, 16, 3)))
+
+    def test_core_publishes_rgb_and_semantics_from_the_same_frozen_snapshot(self):
+        class Camera:
+            image_name = "000001"
+            image_height = 1
+            image_width = 1
+            FoVx = 1.0
+            FoVy = 1.0
+            world_view_transform = torch.eye(4)
+            full_proj_transform = torch.eye(4)
+            camera_center = torch.zeros(3)
+            Tri_Mask = None
+
+        class Gaussians:
+            active_sh_degree = 0
+            max_sh_degree = 0
+            _xyz = torch.zeros((1, 3))
+            _features_dc = torch.ones((1, 1, 3))
+            _features_rest = torch.zeros((1, 0, 3))
+            _opacity = torch.zeros((1, 1))
+            _scaling = torch.zeros((1, 3))
+            _rotation = torch.tensor([[1.0, 0.0, 0.0, 0.0]])
+
+            @property
+            def get_xyz(self):
+                return self._xyz
+
+        class NeverProject:
+            def project(self, *args):
+                raise AssertionError("missing labels must not be projected")
+
+        class Pipeline:
+            compute_cov3D_python = False
+            GetNormal = False
+
+        grid = MapGridSpec.create(
+            plane_normal_world=(0.0, 0.0, 1.0),
+            pixel_x_axis_world=(1.0, 0.0, 0.0),
+            pixel_y_axis_world=(0.0, 1.0, 0.0),
+            plane_offset_world=0.0,
+            first_bounds=(0.0, 1.0, 0.0, 1.0),
+            requested_gsd=(1.0, 1.0),
+            tile_shape=(1, 1),
+        )
+        window = grid.window_for_bounds((0.0, 1.0, 0.0, 1.0))
+
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            semantic_root = root / "semantic"
+            semantic_root.mkdir()
+            (semantic_root / "class_spec.json").write_text(
+                json.dumps(CLASS_SPEC_VALUE), encoding="utf-8"
+            )
+            sparse = root / "1" / "sparse" / "0"
+            sparse.mkdir(parents=True)
+            (sparse / "imagesNames.txt").write_text(
+                "000001.jpg\n", encoding="utf-8"
+            )
+            (sparse / "imageMatchMatrix.txt").write_text(
+                "100\n", encoding="utf-8"
+            )
+            dataset = SemanticDataset(root)
+            state = SemanticGaussianState.initialize(1, 2)
+            runner = OnlineSemanticOrchestrator(
+                state, dataset.class_spec, OnlineSemanticConfig()
+            )
+            hook = ProgressiveSemanticHook(
+                dataset,
+                runner,
+                NeverProject(),
+                root / "state",
+                publication_policy=MapPublicationPolicy(
+                    checkpoint_stage_interval=5
+                ),
+            )
+            frozen = FrozenGaussianSnapshot(Gaussians())
+            rendered_models = []
+
+            def rgb_renderer(camera, model, pipeline, background, **kwargs):
+                rendered_models.append(model)
+                return {"render": torch.tensor([[[0.0]], [[0.5]], [[1.0]]])}
+
+            publication = MapPublicationRequest(
+                product_key="stage_000001",
+                output_root=root / "products" / "stage_000001",
+                camera=Camera(),
+                alignment={"grid": grid.to_dict(), "window": window.to_dict()},
+                rgb_renderer=rgb_renderer,
+                rgb_pipeline=Pipeline(),
+                rgb_background=torch.zeros(3),
+                semantic_config=SemanticTdomConfig(),
+            )
+            semantic_result = finalize_semantic_tdom(
+                torch.zeros((3, 1, 1)),
+                torch.zeros((1, 1)),
+                CLASS_SPEC,
+                SemanticTdomConfig(),
+            )
+            with patch(
+                "semantic_atdom.semantics.orchestrator.rasterize_semantic_tdom",
+                return_value=semantic_result,
+            ):
+                result = hook.synchronize(
+                    1,
+                    [Camera()],
+                    frozen,
+                    root / "1",
+                    publication_request=publication,
+                )
+                first_slot = json.loads(
+                    (root / "state" / "latest.json").read_text(encoding="utf-8")
+                )["slot"]
+                second_sparse = root / "2" / "sparse" / "0"
+                second_sparse.mkdir(parents=True)
+                (second_sparse / "imagesNames.txt").write_text(
+                    "000001.jpg\n", encoding="utf-8"
+                )
+                (second_sparse / "imageMatchMatrix.txt").write_text(
+                    "100\n", encoding="utf-8"
+                )
+                second_publication = MapPublicationRequest(
+                    product_key="stage_000002",
+                    output_root=root / "products" / "stage_000002",
+                    camera=Camera(),
+                    alignment={
+                        "grid": grid.to_dict(),
+                        "window": window.to_dict(),
+                    },
+                    rgb_renderer=rgb_renderer,
+                    rgb_pipeline=Pipeline(),
+                    rgb_background=torch.zeros(3),
+                    semantic_config=SemanticTdomConfig(),
+                )
+                second_result = hook.synchronize(
+                    2,
+                    [Camera()],
+                    FrozenGaussianSnapshot(Gaussians()),
+                    root / "2",
+                    publication_request=second_publication,
+                )
+
+            pair = json.loads(
+                (
+                    root
+                    / "products"
+                    / "stage_000001"
+                    / "pair_manifest.json"
+                ).read_text(encoding="utf-8")
+            )
+            self.assertEqual(result.publication_status, "complete")
+            self.assertEqual(second_result.publication_status, "complete")
+            self.assertEqual(rendered_models[0], frozen)
+            self.assertEqual(len(rendered_models), 2)
+            self.assertEqual(
+                pair["projection_geometry_hash"],
+                frozen.semantic_projection_sha256(),
+            )
+            self.assertEqual(pair["rgb_model_hash"], frozen.rgb_model_sha256())
+            second_pair = json.loads(
+                (
+                    root
+                    / "products"
+                    / "stage_000002"
+                    / "pair_manifest.json"
+                ).read_text(encoding="utf-8")
+            )
+            self.assertIsNone(second_pair["semantic_checkpoint_hash"])
+            self.assertEqual(
+                json.loads(
+                    (root / "state" / "latest.json").read_text(
+                        encoding="utf-8"
+                    )
+                )["slot"],
+                first_slot,
+            )
+
     def test_final_hook_rebuilds_every_ready_label_exactly_twice(self):
         class Camera:
             def __init__(self, image_name):
@@ -639,7 +845,7 @@ class ProgressiveSemanticHookTests(unittest.TestCase):
             latest = json.loads(
                 (root / "output" / "latest.json").read_text(encoding="utf-8")
             )
-            self.assertEqual(latest["schema_version"], 3)
+            self.assertEqual(latest["schema_version"], 5)
             self.assertEqual(
                 latest["semantic_method_version"], "g1-evidence-v2"
             )
@@ -651,15 +857,25 @@ class ProgressiveSemanticHookTests(unittest.TestCase):
             )
             self.assertIn("projection_geometry_hash", latest)
             self.assertIn("rgb_model_hash", latest)
+            self.assertIsNone(latest["rgb_model_hash"])
+            self.assertEqual(
+                latest["semantic_state_sha256"],
+                sha256_file(root / "output" / latest["semantic_state"]),
+            )
             self.assertTrue(
                 (root / "output" / latest["geometry_checkpoint"]).is_file()
             )
             first_slot = latest["slot"]
+            appearance_changed = Gaussians()
+            appearance_changed._features_dc = torch.ones((1, 1, 3))
             restored = ProgressiveSemanticHook.create(
                 root,
                 root / "output",
-                Gaussians(),
+                appearance_changed,
                 projector=NeverProject(),
+                publication_policy=MapPublicationPolicy(
+                    checkpoint_stage_interval=1
+                ),
             )
             self.assertEqual(restored._stage_boundaries, ["000001"])
             restored.synchronize(2, [Camera()], Gaussians(), root / "1")
@@ -688,21 +904,43 @@ class ProgressiveSemanticHookTests(unittest.TestCase):
                 )
             )
             self.assertEqual(persisted_status["status"], "failed")
+            fresh = ProgressiveSemanticHook.create(
+                root,
+                root / "output",
+                Gaussians(),
+                projector=NeverProject(),
+                resume=False,
+            )
+            self.assertTrue(fresh.orchestrator.state.is_valid)
+            self.assertEqual(fresh._stage_boundaries, [])
 
     def test_async_hook_returns_before_semantic_projection_finishes(self):
         started = threading.Event()
         release = threading.Event()
+        snapshot_types = []
 
         class Core:
             def __init__(self):
                 class Runner:
                     state = SemanticGaussianState.initialize(1, 2)
 
+                class ClassSpec:
+                    num_classes = 2
+
+                class Dataset:
+                    class_spec = ClassSpec()
+
                 self.orchestrator = Runner()
+                self.dataset = Dataset()
+                self.publication_policy = MapPublicationPolicy()
+
+            def checkpoint_required(self, *args):
+                return True
 
             def synchronize(
                 self, stage, cameras, gaussians, root, final, boundaries, *tdom
             ):
+                snapshot_types.append(type(gaussians))
                 started.set()
                 release.wait(timeout=2)
                 return type_result(stage)
@@ -746,9 +984,247 @@ class ProgressiveSemanticHookTests(unittest.TestCase):
             1, [Camera()], Gaussians(), Path("unused"), final=True
         )
         self.assertEqual(final.semantic_through_image, "000001")
+        self.assertEqual(snapshot_types, [FrozenSemanticSnapshot] * 2)
         hook.close()
         with self.assertRaisesRegex(RuntimeError, "closed"):
             hook.synchronize(1, [Camera()], Gaussians(), Path("unused"))
+
+    def test_latest_wins_skips_old_maps_but_newest_stage_keeps_all_cameras(self):
+        started = threading.Event()
+        release = threading.Event()
+        observed = []
+
+        class Core:
+            def __init__(self):
+                class Runner:
+                    state = SemanticGaussianState.initialize(1, 2)
+
+                class ClassSpec:
+                    num_classes = 2
+
+                class Dataset:
+                    class_spec = ClassSpec()
+
+                self.orchestrator = Runner()
+                self.dataset = Dataset()
+                self.publication_policy = MapPublicationPolicy()
+
+            def checkpoint_required(self, *args):
+                return False
+
+            def synchronize(
+                self, stage, cameras, gaussians, root, final, boundaries, publication
+            ):
+                observed.append(
+                    (
+                        stage,
+                        tuple(camera.image_name for camera in cameras),
+                        None if publication is None else publication.product_key,
+                    )
+                )
+                if stage == 1:
+                    started.set()
+                    release.wait(timeout=2)
+                return SemanticSyncResult(
+                    stage,
+                    cameras[-1].image_name,
+                    tuple(camera.image_name for camera in cameras),
+                    (),
+                    0,
+                    True,
+                    (),
+                )
+
+            def begin_final(self):
+                return None
+
+        class Camera:
+            image_height = 1
+            image_width = 1
+            FoVx = 1.0
+            FoVy = 1.0
+            world_view_transform = torch.eye(4)
+            full_proj_transform = torch.eye(4)
+            camera_center = torch.zeros(3)
+            Tri_Mask = None
+
+            def __init__(self, image_name):
+                self.image_name = image_name
+
+        class Gaussians:
+            _xyz = torch.zeros((1, 3))
+            _features_dc = torch.zeros((1, 1, 3))
+            _features_rest = torch.zeros((1, 0, 3))
+            _opacity = torch.zeros((1, 1))
+            _scaling = torch.zeros((1, 3))
+            _rotation = torch.tensor([[1.0, 0.0, 0.0, 0.0]])
+
+            @property
+            def get_xyz(self):
+                return self._xyz
+
+        class Pipeline:
+            compute_cov3D_python = False
+            GetNormal = False
+
+        hook = AsyncProgressiveSemanticHook(Core())
+        hook.synchronize(1, [Camera("000001")], Gaussians(), Path("unused"))
+        self.assertTrue(started.wait(timeout=1))
+        hook.synchronize(
+            2,
+            [Camera("000001"), Camera("000002")],
+            Gaussians(),
+            Path("unused"),
+            publication_request=MapPublicationRequest(
+                product_key="stage_000002",
+                output_root=Path("unused") / "stage_000002",
+                camera=Camera("semantic_tdom"),
+                alignment={
+                    "geometry_stage": 2,
+                    "grid": {"grid_id": "fixed"},
+                    "window": {"grid_id": "fixed"},
+                },
+                rgb_renderer=lambda *args, **kwargs: None,
+                rgb_pipeline=Pipeline(),
+                rgb_background=torch.zeros(3),
+                semantic_config=SemanticTdomConfig(),
+            ),
+        )
+        hook.synchronize(
+            3,
+            [Camera("000001"), Camera("000002"), Camera("000003")],
+            Gaussians(),
+            Path("unused"),
+            publication_request=MapPublicationRequest(
+                product_key="stage_000003",
+                output_root=Path("unused") / "stage_000003",
+                camera=Camera("semantic_tdom"),
+                alignment={
+                    "geometry_stage": 3,
+                    "grid": {"grid_id": "fixed"},
+                    "window": {"grid_id": "fixed"},
+                },
+                rgb_renderer=lambda *args, **kwargs: None,
+                rgb_pipeline=Pipeline(),
+                rgb_background=torch.zeros(3),
+                semantic_config=SemanticTdomConfig(),
+                publication_due=False,
+            ),
+        )
+        hook.synchronize(
+            4,
+            [
+                Camera("000001"),
+                Camera("000002"),
+                Camera("000003"),
+                Camera("000004"),
+            ],
+            Gaussians(),
+            Path("unused"),
+        )
+        release.set()
+        hook.synchronize(
+            5,
+            [
+                Camera("000001"),
+                Camera("000002"),
+                Camera("000003"),
+                Camera("000004"),
+                Camera("000005"),
+            ],
+            Gaussians(),
+            Path("unused"),
+            final=True,
+        )
+
+        self.assertEqual([stage for stage, _, _ in observed], [1, 3, 4, 5])
+        self.assertEqual(
+            observed[1][1], ("000001", "000002", "000003")
+        )
+        self.assertEqual(observed[1][2], "stage_000003")
+        self.assertEqual(
+            observed[2][1],
+            ("000001", "000002", "000003", "000004"),
+        )
+        self.assertIsNone(observed[2][2])
+
+    def test_output_preflight_skips_full_rgb_snapshot(self):
+        observed = []
+
+        class Core:
+            def __init__(self):
+                class Runner:
+                    state = SemanticGaussianState.initialize(1, 2)
+
+                class ClassSpec:
+                    num_classes = 2
+
+                class Dataset:
+                    class_spec = ClassSpec()
+
+                self.orchestrator = Runner()
+                self.dataset = Dataset()
+                self.publication_policy = MapPublicationPolicy(
+                    max_pair_output_bytes=1
+                )
+
+            def synchronize(
+                self, stage, cameras, gaussians, root, final, boundaries, publication
+            ):
+                observed.append((type(gaussians), publication))
+                return SemanticSyncResult(stage, "000001", (), (), 0, True, ())
+
+        class Camera:
+            image_name = "000001"
+            image_height = 1
+            image_width = 1
+            FoVx = 1.0
+            FoVy = 1.0
+            world_view_transform = torch.eye(4)
+            full_proj_transform = torch.eye(4)
+            camera_center = torch.zeros(3)
+            Tri_Mask = None
+
+        class Gaussians:
+            _xyz = torch.zeros((1, 3))
+            _features_dc = torch.zeros((1, 1, 3))
+            _features_rest = torch.zeros((1, 0, 3))
+            _opacity = torch.zeros((1, 1))
+            _scaling = torch.zeros((1, 3))
+            _rotation = torch.tensor([[1.0, 0.0, 0.0, 0.0]])
+
+            @property
+            def get_xyz(self):
+                return self._xyz
+
+        class Pipeline:
+            compute_cov3D_python = False
+            GetNormal = False
+
+        hook = AsyncProgressiveSemanticHook(Core())
+        result = hook.synchronize(
+            1,
+            [Camera()],
+            Gaussians(),
+            Path("unused"),
+            publication_request=MapPublicationRequest(
+                product_key="stage_000001",
+                output_root=Path("unused") / "stage_000001",
+                camera=Camera(),
+                alignment={
+                    "grid": {"grid_id": "fixed"},
+                    "window": {"grid_id": "fixed"},
+                },
+                rgb_renderer=lambda *args, **kwargs: None,
+                rgb_pipeline=Pipeline(),
+                rgb_background=torch.zeros(3),
+                semantic_config=SemanticTdomConfig(),
+            ),
+        )
+        self.assertEqual(result.publication_status, "skipped_output_budget")
+        self.assertTrue(hook._idle_event.wait(timeout=2))
+        self.assertEqual(observed, [(FrozenSemanticSnapshot, None)])
+        hook.close()
 
     def test_async_final_rebuild_runs_after_online_worker_failure(self):
         class Core:

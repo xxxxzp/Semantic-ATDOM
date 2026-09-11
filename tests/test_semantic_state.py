@@ -213,7 +213,7 @@ class SemanticGaussianStateTests(unittest.TestCase):
                 )
 
             payload = torch.load(str(path), map_location="cpu")
-            self.assertEqual(payload["schema_version"], 3)
+            self.assertEqual(payload["schema_version"], 4)
             self.assertEqual(
                 payload["semantic_method_version"], SEMANTIC_METHOD_VERSION
             )
@@ -246,7 +246,7 @@ class SemanticGaussianStateTests(unittest.TestCase):
                     recovery_hash,
                 )
 
-            payload["schema_version"] = 3
+            payload["schema_version"] = 4
             payload["semantic_method_version"] = "g1-alpha-v1"
             torch.save(payload, str(path))
             with self.assertRaisesRegex(SemanticStateError, "method version"):

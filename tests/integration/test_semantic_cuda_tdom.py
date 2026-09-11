@@ -4,6 +4,9 @@ import numpy as np
 import torch
 
 from semantic_atdom.scene.cameras import DummyCamera
+from semantic_atdom.scene.cameras import DummyPipeline
+from semantic_atdom.gaussian_renderer import render
+from semantic_atdom.semantics.orchestrator import FrozenGaussianSnapshot
 from semantic_atdom.semantics.schema import SemanticClassSpec
 from semantic_atdom.semantics.state import SemanticGaussianState
 from semantic_atdom.semantics.tdom import (
@@ -43,6 +46,53 @@ class SemanticCudaTdomTests(unittest.TestCase):
                 ],
             }
         )
+
+    def test_complete_frozen_snapshot_is_accepted_by_rgb_tdom_renderer(self):
+        class Gaussians:
+            active_sh_degree = 0
+            max_sh_degree = 0
+            _xyz = torch.tensor(
+                [[0.0, 0.0, 1.0]], dtype=torch.float32, device="cuda"
+            )
+            _features_dc = torch.zeros(
+                (1, 1, 3), dtype=torch.float32, device="cuda"
+            )
+            _features_rest = torch.zeros(
+                (1, 0, 3), dtype=torch.float32, device="cuda"
+            )
+            _opacity = torch.zeros(
+                (1, 1), dtype=torch.float32, device="cuda"
+            )
+            _scaling = torch.full(
+                (1, 3), -1.5, dtype=torch.float32, device="cuda"
+            )
+            _rotation = torch.tensor(
+                [[1.0, 0.0, 0.0, 0.0]],
+                dtype=torch.float32,
+                device="cuda",
+            )
+
+        camera = DummyCamera(
+            np.eye(3, dtype=np.float32),
+            np.zeros(3, dtype=np.float32),
+            1.0,
+            1.0,
+            16,
+            16,
+        )
+        snapshot = FrozenGaussianSnapshot(Gaussians())
+        snapshot.wait_ready()
+        result = render(
+            camera,
+            snapshot,
+            DummyPipeline(),
+            torch.zeros(3, dtype=torch.float32, device="cuda"),
+            Render_Mask=torch.ones(1, dtype=torch.bool, device="cuda"),
+            TDOM=True,
+        )
+
+        self.assertEqual(tuple(result["render"].shape), (3, 16, 16))
+        self.assertTrue(bool(torch.isfinite(result["render"]).all()))
 
     def test_high_level_renderer_enforces_memory_budget(self):
         class Gaussians:

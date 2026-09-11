@@ -419,13 +419,29 @@ manifest 必须将其定义为 `independence-approximation, prior-regularized Di
 
 未知完整范围时，通过固定 origin/GSD 的 tile index 向外扩展，不能移动或缩放已经发布的网格。尚未实现固定网格时，产品只能标为 `pair-aligned`，不能声称不同 stage 之间已经对齐。
 
-地图发布事件与几何阶段分开。latest-wins 调度可以跳过旧的地图渲染请求，但不能丢弃标签观测。每个发布事件冻结一个共同 snapshot，并原子发布：
+地图发布事件与几何阶段分开。latest-wins 调度可以用更新的发布事件替换旧事件，但普通非发布 stage 不能取消尚未开始的 cadence 发布意图；该意图会迁移到最新 snapshot。标签观测始终独立累计，不能因地图请求合并而丢弃。每个发布事件冻结一个共同 snapshot，并原子发布：
 
 - RGB TDOM 与 sidecar；
 - Semantic TDOM 与 manifest；
 - 引用两侧 manifest/hash 的 `pair_manifest.json`。
 
-两侧必须共享 `product_key`、`projection_geometry_hash`、相机、grid、extent、GSD、尺寸和几何阶段。`projection_geometry_hash` 只覆盖语义投影相关的 `xyz/opacity/scale/rotation` 与相机版本；`rgb_model_hash` 另含 SH/appearance。Semantic manifest 另记录 semantic state hash、method/schema version、label version 和所有产物 hash。
+两侧必须共享 `product_key`、`projection_geometry_hash`、相机、grid、extent、GSD、尺寸和实际渲染所用几何阶段。`projection_geometry_hash` 只覆盖语义投影相关的 `xyz/opacity/scale/rotation`；相机、grid 和 window 的完整 JSON 另由共同的 `alignment_sha256` 绑定。`rgb_model_hash` 另含 SH/appearance。Semantic manifest 另记录由语义张量与 recovery context 计算的不可变 `semantic_state_hash`、method/schema version、label version 和所有产物 hash；pair 不引用会被双槽 checkpoint 后续覆盖的 state 文件。
+
+当前 pair 的提交布局为：
+
+```text
+Map_Products/
+├── map_grid.json
+├── latest.json
+└── <product_key>/
+    ├── rgb/tdom.png
+    ├── rgb/manifest.json
+    ├── semantic/...
+    ├── semantic/manifest.json
+    └── pair_manifest.json
+```
+
+消费者只接受 hash 校验通过的 `latest.json -> pair_manifest.json`。`pair_manifest.json` 直接记录 projection/RGB/state hash、两侧 manifest hash 及两侧所有产品文件 hash；任何 `.publishing` 或 `.previous` 目录都不是已提交产品。
 
 ## 产物分级
 
@@ -490,11 +506,12 @@ semantic method/config versions
 ## 准实时资源合同
 
 - 正式开发硬件基线为单张 24 GB RTX 4090。
-- semantic projection snapshot 只复制 `xyz/opacity/scale/rotation` 和必要相机数据，不复制无关 SH。
+- 非发布 stage 的 semantic projection snapshot 只复制 `xyz/opacity/scale/rotation` 和必要相机数据，不复制无关 SH；paired publication 的共同 snapshot 为渲染 RGB 必须额外包含 SH。
 - 语义 GPU 工作使用显式低优先级 CUDA stream 和 snapshot-ready event；CPU worker 异步本身不代表 GPU 隔离。
 - 必须配置显存 headroom、单次预算和 checkpoint cadence。
 - 超预算时依次停止中间诊断写盘、跳过过时 TDOM、合并到最新 snapshot；不得丢弃未计账标签或阻塞几何。
-- 不默认每个阶段保存完整 RGB geometry checkpoint；语义 sidecar 使用周期 checkpoint 与最终原子 checkpoint。
+- 不默认每个阶段保存完整 RGB geometry checkpoint；语义 sidecar 使用周期 checkpoint 与最终原子 checkpoint。sidecar checkpoint 只保存语义投影所需四个几何字段，`rgb_model_hash` 允许为空；只有 paired publication 的冻结快照包含 SH。
+- full RGB snapshot 复制前先按模型 tensor 字节数检查剩余显存，并按未压缩上界预检输出预算；先关闭可选 diagnostics/probabilities，仍超限才跳过地图。在线时间预算在 semantic raster 后、RGB raster 前再次检查；单个不可中断 CUDA 调用本身不宣称硬 deadline。
 - final exact rebuild 的耗时单独统计，不计入在线 SLO。
 - 在干净环境完成 stage 30 到 100 profile 前，不固定具体在线耗时百分比。
 
@@ -534,4 +551,4 @@ semantic method/config versions
 
 在 CPU 数学合同稳定前不得继续修改 CUDA。单元测试通过不等于端到端能力可运行；每项未完成验证必须显式标为“未验证”。
 
-当前实现仍与本文存在多项差距，包括 prior-contaminated 类别 numerator、包含先验的 LOO 共识、诊断 gate、旧 schema、含 SH 的快照/hash、动态跨阶段网格、非原子 RGB/Semantic 配对，以及 online hook 失败后无法独立 final rebuild。实施状态以 [全局认知](../project/global-context.md) 的当前状态表和 active plan 为准。
+当前实现已经覆盖 evidence-conditioned numerator、prior-free LOO、三条件 gate、新 schema、投影专用 snapshot、固定本地网格、原子 RGB/Semantic pair 和独立 final rebuild。仍未完成的合同项是只读 dataset preflight、正式环境复现和 Phantom3 真实 CUDA 渐进验证；实施状态以 [全局认知](../project/global-context.md) 的当前状态表和 active plan 为准。

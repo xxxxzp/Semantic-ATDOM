@@ -198,7 +198,7 @@ RGB、SfM 和 semantic roots 是只读输入。派生 PLY、索引和转换结�
 
 - 在线状态随几何阶段更新，但历史投影不会天然变成精确；在线产品一律是有界近似。
 - 活动窗口保存开放组和有限最近闭合组；manifest 记录证据 geometry version/staleness。
-- 几何阶段与地图发布事件分开；latest-wins 可以跳过过时地图请求，不能丢弃标签观测。
+- 几何阶段与地图发布事件分开；latest-wins 可以用更新发布事件替换旧事件，但非发布 stage 不得取消尚未开始的 cadence 发布意图；标签观测独立累计。
 - 一旦发布产品对，RGB 与 semantic 必须来自同一冻结 snapshot。
 - final exact rebuilder 必须能在 online hook 已失败时独立从零启动。
 
@@ -213,9 +213,9 @@ RGB、SfM 和 semantic roots 是只读输入。派生 PLY、索引和转换结�
 | `exact_final` | 唯一完整权威结果 |
 | `failed` | 不发布类别产品 |
 
-同一任务固定局部 grid direction/origin/GSD/pixel convention；未知范围通过固定 tile index 扩展。尚未实现时只能声称同一产品对 `pair-aligned`，不能声称跨 stage 对齐或具有 GIS CRS。
+同一任务首次发布时固定局部 grid direction/origin/GSD/pixel convention，并将 `map_grid.json` 写入输出根；未知范围只通过固定 tile index 扩展。当前是无 GIS CRS 的本地固定网格，不能声称具有世界坐标系。
 
-RGB/Semantic 产品使用共同 `projection_geometry_hash`，完整 RGB 另有 `rgb_model_hash`，语义另有 `semantic_state_hash`。两侧 manifest 由最后原子发布的 `pair_manifest.json` 引用。
+RGB/Semantic 产品使用共同 `projection_geometry_hash`，完整 RGB 另有 `rgb_model_hash`，语义另有由状态内容计算的不可变 `semantic_state_hash`。pair 不引用会被轮换覆盖的 sidecar slot；两侧 manifest 由最后原子发布的 `pair_manifest.json` 引用。
 
 在线核心产物只保存 hard/color/unknown/evidence-support/entropy/schema/manifest；final 默认增加 coverage、support ratio、Top-1、margin、mixture/group disagreement 和 variance proxy。完整概率栅格始终可选。文件精确定义见权威数学合同。
 
@@ -235,9 +235,11 @@ RGB/Semantic 产品使用共同 `projection_geometry_hash`，完整 RGB 另有 `
 ## 准实时资源原则
 
 - 正式硬件基线是单张 24 GB RTX 4090。
-- semantic snapshot 只包含投影需要的几何与相机，不复制无关 SH。
-- 使用显式低优先级 CUDA stream、ready event、显存 headroom、时间预算和 checkpoint cadence。
+- 非发布 stage 的 semantic snapshot 只包含投影需要的几何与相机，不复制无关 SH；paired publication 的共同 snapshot 为渲染 RGB 必须额外包含 SH。
+- 使用显式低优先级 CUDA stream、ready event、full-snapshot 复制前显存预检、保守输出预算、时间预算和 checkpoint cadence。
 - 超预算时依次停止中间诊断写盘、跳过过时地图渲染并合并到最新 snapshot；不阻塞几何、不丢标签。
+- sidecar checkpoint 只保存 `xyz/opacity/scale/rotation`，不复制 SH；其 `rgb_model_hash` 可以为空。只有 paired publication 的共同冻结快照包含 RGB appearance。
+- 当前未校准运行默认值为：地图每 1 个 stage 候选发布、sidecar 每 5 个 stage checkpoint、512 像素 tile、512 MiB CUDA headroom、8 GiB pair 输出上限、30 秒在线时间预算；final 总是尝试发布和 checkpoint。时间预算是 CUDA 调用边界上的 best-effort gate，不是对单个不可中断 kernel 的硬 deadline。
 - final exact rebuild 单独统计，不计入在线 SLO。
 - `lag<=1` 和具体耗时比例在真实 profile 前只是目标，不能写成已保证事实。
 
@@ -259,12 +261,12 @@ RGB/Semantic 产品使用共同 `projection_geometry_hash`，完整 RGB 另有 `
 | G1 state/recovery/product schema | 已完成 |
 | CUDA V2 实现 | 已完成 |
 | online 状态与独立 final recovery | 已完成 |
-| paired publication | 未开始 |
+| fixed-grid paired publication | 已完成单元/集成边界测试，真实 Phantom3 CUDA 运行待 Task 9 |
 | read-only preflight/cache | 未开始 |
 | 正式 `semantic-atdom` 环境 | 未建立 |
 | stage 30→31 / 30→100 | 未验证 |
 
-当前 product/scheduling 源码的已知差距包括动态跨阶段网格、非原子 RGB/Semantic 配对、仍复制无关 SH 的 snapshot，以及尚未确定 GPU 资源/过载策略。CPU/CUDA evidence renderer、prior-free LOO、在线陈旧度/状态机、独立 final recovery 和新版本 schema 已完成对齐；online group disagreement 在 exact rebuild 前明确为不可用而不是伪零。
+当前 product/scheduling 已建立固定本地网格、同一冻结快照的 RGB/Semantic 原子 pair、latest-wins 请求、投影专用轻量 snapshot，以及显式 stream/headroom/time/output/checkpoint 策略。尚未完成的是只读 dataset preflight、正式环境重建和真实 Phantom3 CUDA 端到端验证；因此当前只声称实现边界通过测试，不声称实时预算或地图轴向已由实测校准。online group disagreement 在 exact rebuild 前明确为不可用而不是伪零。
 
 实施任务与顺序见 [G1 Evidence V2 active plan](../../plans/active/2026-09-11-g1-evidence-v2.md)。在 CPU 数学合同稳定前不修改 CUDA。
 

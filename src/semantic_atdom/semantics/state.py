@@ -25,7 +25,7 @@ class SemanticStateError(ValueError):
 class SemanticGaussianState:
     """Mutable sidecar tensors that are deliberately outside the RGB optimizer."""
 
-    SCHEMA_VERSION = 3
+    SCHEMA_VERSION = 4
     RECOVERY_SCHEMA_VERSION = 2
     RECOVERY_CONTEXT_KEYS = (
         "schema_version",
@@ -589,7 +589,7 @@ class SemanticGaussianState:
     def state_dict(
         self,
         projection_geometry_hash: str,
-        rgb_model_hash: str,
+        rgb_model_hash: Optional[str],
         ontology_hash: str,
         palette_hash: str,
         recovery_context: Mapping[str, object],
@@ -599,8 +599,11 @@ class SemanticGaussianState:
             raise SemanticStateError(
                 "projection_geometry_hash must be a lowercase SHA-256 digest"
             )
+        if rgb_model_hash is not None and not self._is_sha256(rgb_model_hash):
+            raise SemanticStateError(
+                "rgb_model_hash must be null or a lowercase SHA-256 digest"
+            )
         for name, value in (
-            ("rgb_model_hash", rgb_model_hash),
             ("ontology_hash", ontology_hash),
             ("palette_hash", palette_hash),
         ):
@@ -652,7 +655,7 @@ class SemanticGaussianState:
         self,
         path: Path,
         projection_geometry_hash: str,
-        rgb_model_hash: str,
+        rgb_model_hash: Optional[str],
         ontology_hash: str,
         palette_hash: str,
         recovery_context: Mapping[str, object],
@@ -748,7 +751,12 @@ class SemanticGaussianState:
             raise SemanticStateError(
                 "semantic state is missing fields: {}".format(missing)
             )
-        for name in ("rgb_model_hash", "palette_hash"):
+        rgb_hash = value["rgb_model_hash"]
+        if rgb_hash is not None and not cls._is_sha256(rgb_hash):
+            raise SemanticStateError(
+                "semantic state rgb_model_hash is corrupted"
+            )
+        for name in ("palette_hash",):
             if not cls._is_sha256(value[name]):
                 raise SemanticStateError(
                     "semantic state {} is corrupted".format(name)

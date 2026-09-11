@@ -38,7 +38,12 @@ from skimage.metrics import structural_similarity as ssim
 import lpips
 from semantic_atdom.semantics.orchestrator import (
     AsyncProgressiveSemanticHook,
+    MapPublicationRequest,
     OnlineSemanticConfig,
+)
+from semantic_atdom.semantics.publication import (
+    MapGridSpec,
+    MapPublicationPolicy,
 )
 from semantic_atdom.semantics.schema import SemanticClassSpec
 from semantic_atdom.semantics.tdom import (
@@ -943,6 +948,9 @@ class GaussianTrainer(mp.Process):
         self.imagenum = self.args.StartFromImageNo
 
         self.TDOM_Cam = None
+        self.TDOM_alignment = None
+        self.TDOM_pipeline = None
+        self.TDOM_grid = None
 
         self.TimeCost = {"GaussianInitial": 0.0, "ProgressiveTrain": 0.0, "FinalRefinement": 0.0}
 
@@ -956,8 +964,51 @@ class GaussianTrainer(mp.Process):
         # Optional WP3 sidecar. It is deliberately outside every RGB optimizer.
         self.semantic_hook = None
         self.semantic_tdom_config = None
+        self.semantic_publication_policy = None
+        self.semantic_map_error = None
+        if self.args.enable_semantics:
+            try:
+                self.semantic_publication_policy = MapPublicationPolicy(
+                    publication_stage_interval=(
+                        self.args.semantic_map_publication_interval
+                    ),
+                    checkpoint_stage_interval=(
+                        self.args.semantic_checkpoint_interval
+                    ),
+                    min_free_cuda_bytes=(
+                        self.args.semantic_tdom_min_free_cuda_bytes
+                    ),
+                    max_pair_output_bytes=(
+                        self.args.semantic_tdom_max_output_bytes
+                    ),
+                    online_time_budget_seconds=(
+                        self.args.semantic_online_time_budget_seconds
+                    ),
+                    cuda_stream_priority=(
+                        self.args.semantic_cuda_stream_priority
+                    ),
+                )
+            except Exception as error:
+                self.semantic_map_error = str(error)
+                SemanticWarning(
+                    "semantic publication policy is invalid; RGB geometry "
+                    "continues: {}".format(error)
+                )
+        grid_path = os.path.join(
+            self.args.Model_Path_Dir, "Map_Products", "map_grid.json"
+        )
+        if os.path.isfile(grid_path):
+            try:
+                self.TDOM_grid = MapGridSpec.load(grid_path)
+            except Exception as error:
+                self.semantic_map_error = str(error)
+                SemanticWarning(
+                    "fixed map grid is invalid; RGB geometry continues: {}".format(
+                        error
+                    )
+                )
 
-    def _initialize_semantic_hook(self):
+    def _initialize_semantic_hook(self, force_fresh=False):
         if not self.args.enable_semantics:
             return
         try:
@@ -1039,6 +1090,8 @@ class GaussianTrainer(mp.Process):
                 gaussians=self.gaussians,
                 config=config,
                 semantic_dataset_root=semantic_dataset_root,
+                publication_policy=self.semantic_publication_policy,
+                resume=not force_fresh,
             )
             self.gaussians.set_topology_observer(
                 self.semantic_hook.apply_topology, owner=self.semantic_hook
@@ -1072,13 +1125,34 @@ class GaussianTrainer(mp.Process):
             and alignment.get("geometry_stage") == int(self.imagenum)
             and alignment.get("training_type") == expected_training_type
         )
-        tdom_output_root = None
-        if render_semantic_tdom:
-            tdom_output_root = os.path.join(
-                self.args.Model_Path_Dir,
-                "Semantic_TDOM",
-                "stage_{:06d}".format(int(self.imagenum)),
-                alignment["product_key"],
+        publication_request = None
+        try:
+            if render_semantic_tdom:
+                pair_output_root = os.path.join(
+                    self.args.Model_Path_Dir,
+                    "Map_Products",
+                    alignment["product_key"],
+                )
+                publication_request = MapPublicationRequest(
+                    product_key=alignment["product_key"],
+                    output_root=pair_output_root,
+                    camera=self.TDOM_Cam,
+                    alignment=self.TDOM_alignment,
+                    rgb_renderer=render,
+                    rgb_pipeline=self.TDOM_pipeline,
+                    rgb_background=self.background,
+                    semantic_config=self.semantic_tdom_config,
+                    publication_due=(
+                        final
+                        or self.semantic_publication_policy.should_publish(
+                            self.imagenum, final
+                        )
+                    ),
+                )
+        except Exception as error:
+            SemanticWarning(
+                "map publication request is invalid; semantic fusion "
+                "continues: {}".format(error)
             )
         try:
             result = hook.synchronize(
@@ -1087,17 +1161,15 @@ class GaussianTrainer(mp.Process):
                 gaussians=self.gaussians,
                 snapshot_root=snapshot_root,
                 final=final,
-                tdom_camera=(self.TDOM_Cam if render_semantic_tdom else None),
-                tdom_output_root=tdom_output_root,
-                tdom_config=self.semantic_tdom_config,
-                tdom_alignment=self.TDOM_alignment,
+                publication_request=publication_request,
             )
             print(
-                "Semantic sync [{}]: geometry={}, through={}, lag={}".format(
+                "Semantic sync [{}]: geometry={}, through={}, lag={}, map={}".format(
                     stage_name,
                     result.geometry_stage,
                     result.semantic_through_image,
                     result.lag_batches,
+                    result.publication_status,
                 )
             )
             if result.errors:
@@ -1162,6 +1234,11 @@ class GaussianTrainer(mp.Process):
         self.TimeCost["GaussianInitial"] = time2 - time1
 
         # WP3 synchronization point: initialization/densify/prune is complete.
+        if self.args.render_TDOM and self.TDOM_Cam is None:
+            with torch.no_grad():
+                self._prepare_semantic_map_safely("Initialization")
+                if not self.args.enable_semantics:
+                    self._render_legacy_tdom()
         self._initialize_semantic_hook()
         self._run_semantic_hook("initialization")
 
@@ -1208,14 +1285,165 @@ class GaussianTrainer(mp.Process):
             msg = ["Progressive", TrainCamsDict]
             self.DataPreProccesser_queue.put(msg)
 
+    def _prepare_tdom_publication(self, training_type):
+        """Create one fixed-grid map event without rendering either product."""
+        if not self.args.render_TDOM:
+            return
+        final = training_type == "Final_Refinement"
+        if self.args.enable_semantics and (
+            self.semantic_publication_policy is None
+            or (self.args.semantic_tdom_final_only and not final)
+        ):
+            return
+
+        cameras = self.scene.getTrainCameras()
+        if not cameras:
+            raise RuntimeError("TDOM publication requires at least one camera")
+        reference_camera = min(cameras, key=lambda item: str(item.image_name))
+        points = self.gaussians.get_xyz
+
+        if self.TDOM_grid is None:
+            reference_rotation = torch.tensor(reference_camera.R)
+            reference_translation = torch.tensor(reference_camera.T)
+            rectangle = camera_orthogonal_bounding_rectangle(
+                points, reference_rotation, reference_translation
+            )
+            ymin, ymax, xmin, xmax = rectangle["xy_max_min"]
+            normal = rectangle["normal"].detach().cpu().tolist()
+            # The historical TDOM camera maps its image columns to v and rows
+            # to u.  Make that formerly implicit axis swap part of the grid.
+            pixel_x = rectangle["v"].detach().cpu().tolist()
+            pixel_y = rectangle["u"].detach().cpu().tolist()
+            plane_offset = float(
+                torch.median(points @ rectangle["normal"]).item()
+            )
+            self.TDOM_grid = MapGridSpec.create(
+                plane_normal_world=normal,
+                pixel_x_axis_world=pixel_x,
+                pixel_y_axis_world=pixel_y,
+                plane_offset_world=plane_offset,
+                first_bounds=(ymin, ymax, xmin, xmax),
+                requested_gsd=(self.GSD_x, self.GSD_y),
+                tile_shape=(
+                    self.args.semantic_map_tile_size,
+                    self.args.semantic_map_tile_size,
+                ),
+            )
+            self.TDOM_grid.save(
+                os.path.join(
+                    self.args.Model_Path_Dir,
+                    "Map_Products",
+                    "map_grid.json",
+                )
+            )
+
+        grid = self.TDOM_grid
+        pixel_x = torch.tensor(
+            grid.pixel_x_axis_world, device=points.device, dtype=points.dtype
+        )
+        pixel_y = torch.tensor(
+            grid.pixel_y_axis_world, device=points.device, dtype=points.dtype
+        )
+        projected_x = points @ pixel_x
+        projected_y = points @ pixel_y
+        inlier = remove_outliers_quantile(projected_x, projected_y, q=0.9995)
+        projected_x = projected_x[inlier]
+        projected_y = projected_y[inlier]
+        bounds = (
+            float(projected_x.min().item()),
+            float(projected_x.max().item()),
+            float(projected_y.min().item()),
+            float(projected_y.max().item()),
+        )
+        window = grid.window_for_bounds(bounds)
+
+        normal = np.asarray(grid.plane_normal_world, dtype=np.float64)
+        image_x = np.asarray(grid.pixel_x_axis_world, dtype=np.float64)
+        image_y = np.asarray(grid.pixel_y_axis_world, dtype=np.float64)
+        # getWorld2View2_TDOM transposes R, so camera axes must be columns.
+        rotation = np.stack((-image_x, image_y, normal), axis=1)
+        translation = torch.tensor(reference_camera.T).clone()
+        center_x, center_y = window.center_plane
+        translation[0] = center_x
+        translation[1] = -center_y
+        scale = 0.13
+        far = 1.0
+        fov_x = 2 * math.atan(window.width_world * scale / (2 * far))
+        fov_y = 2 * math.atan(window.height_world * scale / (2 * far))
+        self.TDOM_Cam = DummyCamera(
+            rotation,
+            translation,
+            fov_x,
+            fov_y,
+            window.width_pixels,
+            window.height_pixels,
+        )
+        self.TDOM_pipeline = DummyPipeline()
+        product_key = "stage_{:06d}_{}".format(
+            int(self.imagenum), training_type.lower()
+        )
+        self.TDOM_alignment = {
+            "schema_version": 2,
+            "product_key": product_key,
+            "geometry_stage": int(self.imagenum),
+            "training_type": training_type,
+            "grid": grid.to_dict(),
+            "window": window.to_dict(),
+            "image_width": int(self.TDOM_Cam.image_width),
+            "image_height": int(self.TDOM_Cam.image_height),
+            "fov_x_radians": float(self.TDOM_Cam.FoVx),
+            "fov_y_radians": float(self.TDOM_Cam.FoVy),
+            "requested_gsd": {"x": float(self.GSD_x), "y": float(self.GSD_y)},
+            "effective_gsd": {"x": grid.gsd[0], "y": grid.gsd[1]},
+            "extent": {
+                "plane_bounds": list(window.plane_bounds),
+                "width_world": window.width_world,
+                "height_world": window.height_world,
+            },
+            "crs": grid.crs,
+        }
+
+    def _prepare_semantic_map_safely(self, training_type):
+        """Keep every semantic map-preparation failure outside geometry."""
+        try:
+            if self.semantic_map_error is not None:
+                raise RuntimeError(self.semantic_map_error)
+            self._prepare_tdom_publication(training_type)
+        except Exception as error:
+            self.TDOM_Cam = None
+            self.TDOM_alignment = None
+            self.TDOM_pipeline = None
+            SemanticWarning(
+                "TDOM map preparation failed; RGB geometry continues: {}".format(
+                    error
+                )
+            )
+
+    def _render_legacy_tdom(self):
+        """Preserve the RGB-only path when semantic pairing is disabled."""
+        if self.TDOM_Cam is None:
+            return
+        tdom = render(
+            self.TDOM_Cam,
+            self.gaussians,
+            self.TDOM_pipeline,
+            self.background,
+            Render_Mask=torch.ones(1, dtype=torch.bool).cuda(),
+            TDOM=True,
+        )["render"]
+        output = tdom_to_uint8(tdom)
+        del tdom
+        self.DataSaver_queue.put(["SaveTDOM", output, self.TDOM_alignment])
+
     # 3DGS模型训练核心函数
     def Train_Gaussians(self, iteration, Training_Type):
         # self.Diary.write('\n')
 
-        # A semantic stage may only use a TDOM camera created by this exact
-        # RGB render.  Clear previous-stage data before any possible failure.
+        # A map request may only use a TDOM camera created by this exact stage.
+        # The task-level grid remains fixed while per-event camera data resets.
         self.TDOM_Cam = None
         self.TDOM_alignment = None
+        self.TDOM_pipeline = None
 
         Start_From_Its = self.AlreadyTrainingIterations
 
@@ -1482,135 +1710,13 @@ class GaussianTrainer(mp.Process):
                     self.DataSaver_queue.put(["SaveImage", image])
                     self.DataSaver_queue.put(["SaveGT", self.NewCams[i].image_name])
         if self.args.render_TDOM:
-            print("GaussianTrainer: Save TDOM Results...")
-            time1 = time.time()
+            print("GaussianTrainer: Prepare TDOM publication...")
             with torch.no_grad():
-                # W, H = 4000, 5000
-                #
-                # if self.TDOM_Cam is None:
-                #     T = torch.tensor([10.0379, 58.1547, -0.5450])  # 平移向量，表示相机位置
-                #     R = np.array([[0.98391801, 0.17848249, 0.00702562],
-                #                   [-0.17858312, 0.98375663, 0.01819236],
-                #                   [-0.00366448, -0.01915445, 0.99980982]])
-                #
-                #     FoVx = self.args.TDOM_FoVx
-                #     aspect_ratio = 8000 / 10000
-                #     FoVy = 2 * math.atan((1 / aspect_ratio) * math.tan(FoVx / 2))
-                #
-                #     # 创建 DummyCamera 实例
-                #     self.TDOM_Cam = DummyCamera(R, T, FoVx, FoVy, W, H)
-                #     # 创建 DummyPipeline 实例
-                #     self.TDOM_pipeline = DummyPipeline()
-                #
-                # TDOM = render(self.TDOM_Cam, self.gaussians, self.TDOM_pipeline, self.background, Render_Mask=torch.ones(1, dtype=torch.bool).cuda(), TDOM=True)["render"]
-
-                Temp_Cam = self.scene.getTrainCameras().copy()[0]
-                R = Temp_Cam.R
-                T = torch.tensor(Temp_Cam.T)
-                R_torch = torch.tensor([[R[0][0], R[0][1], R[0][2]],
-                                        [R[1][0], R[1][1], R[1][2]],
-                                        [R[2][0], R[2][1], R[2][2]]])
-                rectangle = camera_orthogonal_bounding_rectangle(self.gaussians.get_xyz, R_torch, T)
-                T[0] = rectangle["Gaussians_center"][0]
-                T[1] = rectangle["Gaussians_center"][1]
-
-                scale = 0.13 * 1.2
-                far = 1.0
-                ratio = 1.0
-                FoVx = 2 * math.atan((rectangle["width"] * scale) / (2 * far * ratio))
-                FoVy = 2 * math.atan((rectangle["height"] * scale) / (2 * far * ratio))
-                if self.GSD_x == 0.00 or self.GSD_y == 0.00:
-                    aspect_ratio = rectangle["width"] / rectangle["height"]
-                    W, H = 4000, int(4000 / aspect_ratio)
+                if self.args.enable_semantics:
+                    self._prepare_semantic_map_safely(Training_Type)
                 else:
-                    W = rectangle["width"] / self.GSD_x
-                    H = rectangle["height"] / self.GSD_y
-
-                W, H = int(round(float(W))), int(round(float(H)))
-
-                # 创建 DummyCamera 实例
-                self.TDOM_Cam = DummyCamera(R, T, FoVx, FoVy, W, H)
-                # 创建 DummyPipeline 实例
-                self.TDOM_pipeline = DummyPipeline()
-                product_key = "stage_{:06d}_{}".format(
-                    int(self.imagenum), Training_Type.lower()
-                )
-                self.TDOM_alignment = {
-                    "product_key": product_key,
-                    "rgb_tdom_product_key": product_key,
-                    "rgb_tdom_manifest_lookup": {
-                        "directory": "Intermediate_Results/TDOM",
-                        "product_key": product_key,
-                    },
-                    "geometry_stage": int(self.imagenum),
-                    "training_type": Training_Type,
-                    "image_width": int(self.TDOM_Cam.image_width),
-                    "image_height": int(self.TDOM_Cam.image_height),
-                    "fov_x_radians": float(self.TDOM_Cam.FoVx),
-                    "fov_y_radians": float(self.TDOM_Cam.FoVy),
-                    "world_view_transform": (
-                        self.TDOM_Cam.world_view_transform.detach()
-                        .cpu()
-                        .tolist()
-                    ),
-                    "full_projection_transform": (
-                        self.TDOM_Cam.full_proj_transform.detach()
-                        .cpu()
-                        .tolist()
-                    ),
-                    "camera_center": (
-                        self.TDOM_Cam.camera_center.detach().cpu().tolist()
-                    ),
-                    "extent": {
-                        "width_world": float(rectangle["width"]),
-                        "height_world": float(rectangle["height"]),
-                        "center_plane_coordinates": [
-                            float(item)
-                            for item in rectangle["Gaussians_center"]
-                        ],
-                        "projection_plane_center_world": rectangle["center"]
-                        .detach()
-                        .cpu()
-                        .tolist(),
-                        "projection_plane_normal_world": rectangle["normal"]
-                        .detach()
-                        .cpu()
-                        .tolist(),
-                        "projection_plane_u_world": rectangle["u"]
-                        .detach()
-                        .cpu()
-                        .tolist(),
-                        "projection_plane_v_world": rectangle["v"]
-                        .detach()
-                        .cpu()
-                        .tolist(),
-                        "projection_plane_corners_world": rectangle["corners"]
-                        .detach()
-                        .cpu()
-                        .tolist(),
-                    },
-                    "requested_gsd": {
-                        "x": float(self.GSD_x),
-                        "y": float(self.GSD_y),
-                    },
-                    "effective_gsd": {
-                        "x": float(rectangle["width"]) / W,
-                        "y": float(rectangle["height"]) / H,
-                    },
-                    # The current RGB TDOM pipeline has no world CRS contract.
-                    # An explicit null prevents consumers from assuming one.
-                    "crs": None,
-                }
-
-                TDOM = render(self.TDOM_Cam, self.gaussians, self.TDOM_pipeline, self.background, Render_Mask=torch.ones(1, dtype=torch.bool).cuda(), TDOM=True)["render"]
-                TDOM_output = tdom_to_uint8(TDOM)
-                del TDOM
-
-                time2 = time.time()
-                print(f"Time cost of TDOM rendering: {time2 - time1}s")
-                self.DataSaver_queue.put(
-                    ["SaveTDOM", TDOM_output, self.TDOM_alignment]
-                )
+                    self._prepare_tdom_publication(Training_Type)
+                    self._render_legacy_tdom()
 
     # 对当前高斯模型进行一次评估
     def Evaluate(self, Training_Type, EvaluateRender):
@@ -1884,6 +1990,11 @@ class GaussianTrainer(mp.Process):
                     self.TimeCost["ProgressiveTrain"] += time2 - time1
 
                     # WP3 synchronization point: one progressive RGB batch ended.
+                    if self.args.render_TDOM and self.TDOM_Cam is None:
+                        with torch.no_grad():
+                            self._prepare_semantic_map_safely("On_The_Fly")
+                            if not self.args.enable_semantics:
+                                self._render_legacy_tdom()
                     self._run_semantic_hook("progressive")
 
                     # 等待self.RenderNewDone变为True
@@ -1916,6 +2027,8 @@ class GaussianTrainer(mp.Process):
                     self.TDOM_Cam = None
                     self.TDOM_alignment = None
                     self.scene.model_path = Commond_from_DataPreProccesser[1]
+                    if self.args.enable_semantics and self.semantic_hook is None:
+                        self._initialize_semantic_hook(force_fresh=True)
                     if self.semantic_hook is not None:
                         try:
                             self.semantic_hook.begin_final()
@@ -1932,6 +2045,13 @@ class GaussianTrainer(mp.Process):
                     self.TimeCost["FinalRefinement"] += time2 - time1
 
                     # WP3 closes the online group here; WP5 will rebuild exactly.
+                    if self.args.render_TDOM and self.TDOM_Cam is None:
+                        with torch.no_grad():
+                            self._prepare_semantic_map_safely(
+                                "Final_Refinement"
+                            )
+                            if not self.args.enable_semantics:
+                                self._render_legacy_tdom()
                     self._run_semantic_hook("final_refinement", final=True)
 
                     self.Finish = True

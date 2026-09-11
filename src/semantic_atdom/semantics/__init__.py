@@ -34,10 +34,13 @@ from semantic_atdom.semantics.provenance import (
     SEMANTIC_PROJECTION_ATTRIBUTE_NAMES,
     rgb_model_sha256,
     semantic_projection_sha256,
+    semantic_state_sha256,
 )
 from semantic_atdom.semantics.orchestrator import (
     AcquisitionOverlap,
     AsyncProgressiveSemanticHook,
+    FrozenSemanticSnapshot,
+    MapPublicationRequest,
     CudaSemanticProjector,
     OnlineSemanticConfig,
     OnlineSemanticOrchestrator,
@@ -45,6 +48,12 @@ from semantic_atdom.semantics.orchestrator import (
     ProjectedObservation,
     SemanticSyncResult,
     label_boundary_weights,
+)
+from semantic_atdom.semantics.publication import (
+    MapGridSpec,
+    MapGridWindow,
+    MapPublicationPolicy,
+    publish_tdom_pair,
 )
 from semantic_atdom.semantics.cuda_observation import (
     CudaObservationStats,
@@ -80,8 +89,15 @@ __all__ = [
     "SEMANTIC_PROJECTION_ATTRIBUTE_NAMES",
     "rgb_model_sha256",
     "semantic_projection_sha256",
+    "semantic_state_sha256",
     "AcquisitionOverlap",
     "AsyncProgressiveSemanticHook",
+    "FrozenSemanticSnapshot",
+    "MapPublicationRequest",
+    "MapGridSpec",
+    "MapGridWindow",
+    "MapPublicationPolicy",
+    "publish_tdom_pair",
     "CudaSemanticProjector",
     "OnlineSemanticConfig",
     "OnlineSemanticOrchestrator",

@@ -1,6 +1,6 @@
 """Stage-synchronous online semantic fusion for progressive A-TDOM."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from concurrent.futures import ThreadPoolExecutor
 import json
 import math
@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import re
 import threading
+import time
 from typing import Dict, Mapping, NamedTuple, Optional, Sequence, Tuple
 
 import numpy as np
@@ -30,15 +31,21 @@ from semantic_atdom.semantics.schema import (
 from semantic_atdom.semantics.state import SemanticGaussianState
 from semantic_atdom.semantics.provenance import (
     RGB_MODEL_ATTRIBUTE_NAMES,
+    SEMANTIC_PROJECTION_ATTRIBUTE_NAMES,
     SEMANTIC_METHOD_VERSION,
     rgb_model_sha256,
     semantic_projection_sha256,
+    semantic_state_sha256,
+)
+from semantic_atdom.semantics.publication import (
+    MapPublicationPolicy,
+    publish_tdom_pair,
 )
 from semantic_atdom.semantics.tdom import (
     SemanticTdomConfig,
     rasterize_semantic_tdom,
-    write_semantic_tdom,
 )
+from semantic_atdom.utils.image_utils import tdom_to_uint8
 
 
 def _image_id(value: object) -> str:
@@ -58,28 +65,63 @@ def _acquisition_key(image_id: str):
 _GEOMETRY_ATTRIBUTE_NAMES = RGB_MODEL_ATTRIBUTE_NAMES
 
 
-def _geometry_attributes(gaussians) -> Dict[str, torch.Tensor]:
+def _model_attributes(
+    gaussians, names: Sequence[str]
+) -> Dict[str, torch.Tensor]:
     cached = getattr(gaussians, "geometry_attributes_cpu", None)
     if callable(cached):
-        return cached()
+        values = cached()
+        return {name: values[name] for name in names}
     if hasattr(gaussians, "_values"):
         source = gaussians._values
         return {
             name: source[name].detach().cpu().contiguous()
-            for name in _GEOMETRY_ATTRIBUTE_NAMES
+            for name in names
         }
     return {
         name: getattr(gaussians, "_" + name).detach().cpu().contiguous()
-        for name in _GEOMETRY_ATTRIBUTE_NAMES
+        for name in names
     }
+
+
+def _projection_attributes(gaussians) -> Dict[str, torch.Tensor]:
+    return _model_attributes(gaussians, SEMANTIC_PROJECTION_ATTRIBUTE_NAMES)
+
+
+def _rgb_attributes(gaussians) -> Dict[str, torch.Tensor]:
+    return _model_attributes(gaussians, RGB_MODEL_ATTRIBUTE_NAMES)
+
+
+def _model_snapshot_nbytes(gaussians, names: Sequence[str]) -> int:
+    return sum(
+        int(getattr(gaussians, "_" + name).numel())
+        * int(getattr(gaussians, "_" + name).element_size())
+        for name in names
+    )
+
+
+def _estimated_pair_output_bytes(
+    request: "MapPublicationRequest", num_classes: int
+) -> int:
+    """Conservative uncompressed product estimate used before GPU cloning."""
+    pixels = int(request.camera.image_width) * int(request.camera.image_height)
+    config = request.semantic_config
+    diagnostic_bytes = 2 if config.quantize_diagnostics else 4
+    # RGB, semantic id/color, unknown mask/reason and two mandatory rasters.
+    bytes_per_pixel = 3 + 1 + 3 + 1 + 1 + 2 * diagnostic_bytes
+    if config.save_diagnostics:
+        bytes_per_pixel += 8 * diagnostic_bytes
+    if config.save_probabilities:
+        bytes_per_pixel += 2 * int(num_classes)
+    return pixels * bytes_per_pixel + 1024**2
 
 
 def _tdom_alignment(camera, supplied: Optional[Mapping[str, object]] = None):
     """Return JSON-safe camera data shared by RGB and semantic TDOM products."""
     alignment = dict(supplied or {})
+    alignment.setdefault("schema_version", 1)
     alignment.update(
         {
-            "schema_version": 1,
             "image_width": int(camera.image_width),
             "image_height": int(camera.image_height),
             "fov_x_radians": float(camera.FoVx),
@@ -223,10 +265,63 @@ class SemanticSyncResult(NamedTuple):
     errors: Tuple[str, ...]
     status: str = "approx_online"
     historical_evidence_stale: bool = False
+    publication_status: str = "not_requested"
+    published_product_key: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class MapPublicationRequest:
+    """A map event independent from the geometry-stage synchronization event."""
+
+    product_key: str
+    output_root: Path
+    camera: object
+    alignment: Mapping[str, object]
+    rgb_renderer: object
+    rgb_pipeline: object
+    rgb_background: torch.Tensor
+    semantic_config: SemanticTdomConfig
+    publication_due: bool = True
+    diagnostics_degraded: bool = False
+
+    def __post_init__(self) -> None:
+        if not self.product_key or Path(self.product_key).name != self.product_key:
+            raise ValueError("product_key must be one safe path component")
+        if not callable(self.rgb_renderer):
+            raise ValueError("rgb_renderer must be callable")
+        if not isinstance(self.publication_due, bool):
+            raise ValueError("publication_due must be a boolean")
+        if not isinstance(self.diagnostics_degraded, bool):
+            raise ValueError("diagnostics_degraded must be a boolean")
+        if not isinstance(self.alignment, Mapping):
+            raise ValueError("map alignment must be an object")
+        grid = self.alignment.get("grid")
+        window = self.alignment.get("window")
+        if not isinstance(grid, Mapping) or not isinstance(window, Mapping):
+            raise ValueError("map alignment requires a fixed grid and window")
+        if grid.get("grid_id") != window.get("grid_id"):
+            raise ValueError("map grid/window identity mismatch")
+        if getattr(self.rgb_pipeline, "compute_cov3D_python", False):
+            raise ValueError("paired RGB TDOM requires CUDA covariance computation")
+        if getattr(self.rgb_pipeline, "GetNormal", False):
+            raise ValueError("paired RGB TDOM does not render normal maps")
+
+
+@dataclass(frozen=True)
+class _PendingStageRequest:
+    args: Tuple[object, ...]
+    publication_status_override: Optional[str] = None
+
+
+class SemanticCheckpoint(NamedTuple):
+    state_path: Path
+    state_sha256: str
+    projection_geometry_hash: str
+    rgb_model_hash: Optional[str]
 
 
 class FrozenGaussianSnapshot:
-    """Detached geometry copy that remains stable while RGB training continues."""
+    """Detached complete RGB model for one paired map publication."""
 
     _ATTRIBUTE_NAMES = _GEOMETRY_ATTRIBUTE_NAMES
 
@@ -238,6 +333,14 @@ class FrozenGaussianSnapshot:
         self._cpu_values = None
         self._projection_hash = None
         self._rgb_model_hash = None
+        self.active_sh_degree = int(getattr(gaussians, "active_sh_degree", 0))
+        self.max_sh_degree = int(
+            getattr(gaussians, "max_sh_degree", self.active_sh_degree)
+        )
+        self._ready_event = None
+        if self.get_xyz.is_cuda:
+            self._ready_event = torch.cuda.Event()
+            self._ready_event.record(torch.cuda.current_stream(self.get_xyz.device))
 
     @property
     def get_xyz(self):
@@ -254,6 +357,24 @@ class FrozenGaussianSnapshot:
     @property
     def get_rotation(self):
         return torch.nn.functional.normalize(self._values["rotation"])
+
+    @property
+    def get_features_dc(self):
+        return self._values["features_dc"]
+
+    @property
+    def get_features_rest(self):
+        return self._values["features_rest"]
+
+    @property
+    def get_features(self):
+        return torch.cat((self.get_features_dc, self.get_features_rest), dim=1)
+
+    def wait_ready(self, stream=None) -> None:
+        if self._ready_event is not None:
+            (stream or torch.cuda.current_stream(self.get_xyz.device)).wait_event(
+                self._ready_event
+            )
 
     def semantic_projection_sha256(self) -> str:
         if self._projection_hash is None:
@@ -272,6 +393,61 @@ class FrozenGaussianSnapshot:
     def geometry_sha256(self) -> str:
         """Deprecated complete-model hash alias kept for external callers."""
         return self.rgb_model_sha256()
+
+    def geometry_attributes_cpu(self) -> Dict[str, torch.Tensor]:
+        if self._cpu_values is None:
+            self._cpu_values = {
+                name: value.detach().cpu().contiguous()
+                for name, value in self._values.items()
+            }
+        return self._cpu_values
+
+
+class FrozenSemanticSnapshot:
+    """Projection-only snapshot; appearance is intentionally not copied."""
+
+    _ATTRIBUTE_NAMES = SEMANTIC_PROJECTION_ATTRIBUTE_NAMES
+
+    def __init__(self, gaussians):
+        self._values = {
+            name: getattr(gaussians, "_" + name).detach().clone()
+            for name in self._ATTRIBUTE_NAMES
+        }
+        self._cpu_values = None
+        self._projection_hash = None
+        self._ready_event = None
+        if self.get_xyz.is_cuda:
+            self._ready_event = torch.cuda.Event()
+            self._ready_event.record(torch.cuda.current_stream(self.get_xyz.device))
+
+    @property
+    def get_xyz(self):
+        return self._values["xyz"]
+
+    @property
+    def get_opacity(self):
+        return torch.sigmoid(self._values["opacity"])
+
+    @property
+    def get_scaling(self):
+        return torch.exp(self._values["scaling"])
+
+    @property
+    def get_rotation(self):
+        return torch.nn.functional.normalize(self._values["rotation"])
+
+    def wait_ready(self, stream=None) -> None:
+        if self._ready_event is not None:
+            (stream or torch.cuda.current_stream(self.get_xyz.device)).wait_event(
+                self._ready_event
+            )
+
+    def semantic_projection_sha256(self) -> str:
+        if self._projection_hash is None:
+            self._projection_hash = semantic_projection_sha256(
+                self.geometry_attributes_cpu()
+            )
+        return self._projection_hash
 
     def geometry_attributes_cpu(self) -> Dict[str, torch.Tensor]:
         if self._cpu_values is None:
@@ -757,13 +933,16 @@ class ProgressiveSemanticHook:
         orchestrator: OnlineSemanticOrchestrator,
         projector,
         output_root: Path,
+        publication_policy: Optional[MapPublicationPolicy] = None,
     ):
         self.dataset = dataset
         self.orchestrator = orchestrator
         self.projector = projector
         self.output_root = Path(output_root)
+        self.publication_policy = publication_policy or MapPublicationPolicy()
         self._stage_boundaries = []
         self._verified_recorded_files = {}
+        self._last_publication_seconds = 0.0
 
     @classmethod
     def create(
@@ -774,17 +953,19 @@ class ProgressiveSemanticHook:
         config: Optional[OnlineSemanticConfig] = None,
         projector=None,
         semantic_dataset_root: Optional[Path] = None,
+        publication_policy: Optional[MapPublicationPolicy] = None,
+        resume: bool = True,
     ) -> "ProgressiveSemanticHook":
         config = config or OnlineSemanticConfig()
         dataset = SemanticDataset(semantic_dataset_root or dataset_root)
         output_root = Path(output_root)
         latest_path = output_root / "latest.json"
-        if latest_path.is_file():
+        if resume and latest_path.is_file():
             try:
                 with latest_path.open("r", encoding="utf-8") as stream:
                     latest = json.load(stream)
                 if (
-                    latest.get("schema_version") != 3
+                    latest.get("schema_version") != 5
                     or latest.get("semantic_method_version")
                     != SEMANTIC_METHOD_VERSION
                     or latest.get("ontology_hash")
@@ -804,6 +985,14 @@ class ProgressiveSemanticHook:
                 )
             if not state_path.is_file():
                 raise SemanticSchemaError("latest semantic state file is missing")
+            if latest.get("semantic_state") != state_path.name:
+                raise SemanticSchemaError(
+                    "latest semantic state name does not match its slot"
+                )
+            if latest.get("semantic_state_sha256") != sha256_file(state_path):
+                raise SemanticSchemaError(
+                    "latest semantic state content hash does not match"
+                )
             if not geometry_path.is_file():
                 raise SemanticSchemaError("latest geometry checkpoint is missing")
             if latest.get("geometry_checkpoint") != geometry_path.name:
@@ -824,28 +1013,30 @@ class ProgressiveSemanticHook:
                 checkpoint_projection_hash = semantic_projection_sha256(
                     attributes
                 )
-                checkpoint_rgb_hash = rgb_model_sha256(attributes)
-                current_attributes = _geometry_attributes(gaussians)
+                checkpoint_rgb_hash = geometry_payload.get("rgb_model_hash")
+                if checkpoint_rgb_hash is not None and (
+                    not isinstance(checkpoint_rgb_hash, str)
+                    or re.fullmatch(r"[0-9a-f]{64}", checkpoint_rgb_hash) is None
+                ):
+                    raise ValueError("invalid optional RGB model hash")
+                current_attributes = _projection_attributes(gaussians)
                 current_projection_hash = semantic_projection_sha256(
                     current_attributes
                 )
-                current_rgb_hash = rgb_model_sha256(current_attributes)
             except (OSError, ValueError, RuntimeError, KeyError, TypeError) as error:
                 raise SemanticSchemaError(
                     "unable to validate geometry checkpoint: {}".format(error)
                 )
             if (
-                geometry_payload.get("schema_version") != 2
+                geometry_payload.get("schema_version") != 3
                 or geometry_payload.get("semantic_method_version")
                 != SEMANTIC_METHOD_VERSION
                 or geometry_payload.get("projection_geometry_hash")
                 != checkpoint_projection_hash
-                or geometry_payload.get("rgb_model_hash") != checkpoint_rgb_hash
                 or latest.get("projection_geometry_hash")
                 != checkpoint_projection_hash
                 or latest.get("rgb_model_hash") != checkpoint_rgb_hash
                 or current_projection_hash != checkpoint_projection_hash
-                or current_rgb_hash != checkpoint_rgb_hash
             ):
                 raise SemanticSchemaError(
                     "semantic recovery does not match the persisted geometry checkpoint"
@@ -875,7 +1066,7 @@ class ProgressiveSemanticHook:
             orchestrator = OnlineSemanticOrchestrator.from_state(
                 state, dataset.class_spec, config
             )
-        elif any(
+        elif resume and any(
             (output_root / name).exists()
             for name in (
                 "semantic_state.0.pt",
@@ -901,12 +1092,24 @@ class ProgressiveSemanticHook:
             )
         if projector is None:
             projector = CudaSemanticProjector(dataset.class_spec, config)
-        hook = cls(dataset, orchestrator, projector, output_root)
+        hook = cls(
+            dataset,
+            orchestrator,
+            projector,
+            output_root,
+            publication_policy=publication_policy,
+        )
         status_path = output_root / "sync_status.json"
-        if status_path.is_file():
+        if resume and status_path.is_file():
             try:
                 with status_path.open("r", encoding="utf-8") as stream:
                     status = json.load(stream)
+                if (
+                    status.get("schema_version") != 3
+                    or status.get("semantic_method_version")
+                    != SEMANTIC_METHOD_VERSION
+                ):
+                    raise ValueError("unsupported semantic sync status")
                 boundaries = status.get("stage_boundaries", [])
                 if (
                     not isinstance(boundaries, list)
@@ -920,6 +1123,18 @@ class ProgressiveSemanticHook:
                 )
         return hook
 
+    def checkpoint_required(
+        self,
+        geometry_stage: int,
+        final: bool,
+        publication_requested: bool,
+    ) -> bool:
+        return self.publication_policy.should_checkpoint(
+            geometry_stage,
+            final,
+            exists=(self.output_root / "latest.json").is_file(),
+        )
+
     def synchronize(
         self,
         geometry_stage: int,
@@ -928,10 +1143,7 @@ class ProgressiveSemanticHook:
         snapshot_root: Path,
         final: bool = False,
         stage_boundaries: Optional[Sequence[str]] = None,
-        tdom_camera: Optional[object] = None,
-        tdom_output_root: Optional[Path] = None,
-        tdom_config: Optional[SemanticTdomConfig] = None,
-        tdom_alignment: Optional[Mapping[str, object]] = None,
+        publication_request: Optional[MapPublicationRequest] = None,
     ) -> SemanticSyncResult:
         geometry_stage = int(geometry_stage)
         online_usable = self.orchestrator.state.is_valid
@@ -1076,10 +1288,12 @@ class ProgressiveSemanticHook:
                             "semantic_method_version": SEMANTIC_METHOD_VERSION,
                             "geometry_stage": geometry_stage,
                             "projection_geometry_hash": semantic_projection_sha256(
-                                _geometry_attributes(gaussians)
+                                _projection_attributes(gaussians)
                             ),
-                            "rgb_model_hash": rgb_model_sha256(
-                                _geometry_attributes(gaussians)
+                            "rgb_model_hash": (
+                                rgb_model_sha256(_rgb_attributes(gaussians))
+                                if isinstance(gaussians, FrozenGaussianSnapshot)
+                                else None
                             ),
                             "groups": [list(group) for group in rebuilt.image_groups],
                             "metrics": rebuilt.metrics.to_dict(),
@@ -1142,75 +1356,229 @@ class ProgressiveSemanticHook:
             status,
             historical_stale,
         )
-        if (
-            result.status != "failed"
-            and tdom_camera is not None
-            and tdom_output_root is not None
+        checkpoint = None
+        if self.orchestrator.state.is_valid and self.checkpoint_required(
+            geometry_stage,
+            final,
+            publication_request is not None,
         ):
             try:
-                tdom_result = rasterize_semantic_tdom(
-                    gaussians,
-                    self.orchestrator.state,
-                    tdom_camera,
-                    self.dataset.class_spec,
-                    config=tdom_config,
-                )
-                write_semantic_tdom(
-                    tdom_result,
-                    tdom_output_root,
-                    self.dataset.class_spec,
-                    {
-                        "geometry_stage": result.geometry_stage,
-                        "semantic_through_image": result.semantic_through_image,
-                        "label_version": self.orchestrator.label_version,
-                        "projection_geometry_hash": semantic_projection_sha256(
-                            _geometry_attributes(gaussians)
-                        ),
-                        "rgb_model_hash": rgb_model_sha256(
-                            _geometry_attributes(gaussians)
-                        ),
-                        "posterior": (
-                            "robust_exact_final"
-                            if exact_rebuilt
-                            else "robust_online"
-                        ),
-                        "semantic_quality": {
-                            "final_requested": bool(final),
-                            "exact_rebuild_succeeded": bool(exact_rebuilt),
-                            "status": result.status,
-                            "historical_evidence_stale": (
-                                result.historical_evidence_stale
-                            ),
-                            "deferred_image_ids": list(deferred),
-                            "errors_before_tdom": list(errors),
-                            "gaussian_ids_sha256": (
-                                self.orchestrator.state.gaussian_ids_sha256
-                            ),
-                            "topology_version": int(
-                                self.orchestrator.state.topology_version
-                            ),
-                            "num_gaussians": int(
-                                self.orchestrator.state.num_gaussians
-                            ),
-                        },
-                        "alignment": _tdom_alignment(
-                            tdom_camera, tdom_alignment
-                        ),
-                    },
-                    config=tdom_config,
-                )
-                self.orchestrator.state.mark_clean()
+                checkpoint = self._persist(gaussians, result)
             except Exception as error:
-                errors.append("semantic TDOM render: {}".format(error))
-                result = result._replace(
-                    errors=tuple(errors), status="failed"
-                )
-        if self.orchestrator.state.is_valid:
-            self._persist(gaussians, result)
-        else:
+                errors.append("semantic checkpoint: {}".format(error))
+                result = result._replace(errors=tuple(errors), status="failed")
+        elif self.orchestrator.state.is_valid:
             self.output_root.mkdir(parents=True, exist_ok=True)
+            self.orchestrator.ledger.save(self.output_root / "ledger.json")
+            self._write_sync_status(result)
+
+        if result.status != "failed" and publication_request is not None:
+            result = self._publish_pair(
+                gaussians,
+                result,
+                publication_request,
+                checkpoint,
+                exact_rebuilt,
+                final,
+            )
+        else:
+            if not self.orchestrator.state.is_valid:
+                self.output_root.mkdir(parents=True, exist_ok=True)
+                self._write_sync_status(result)
+        if self.orchestrator.state.is_valid:
             self._write_sync_status(result)
         return result
+
+    def _publish_pair(
+        self,
+        gaussians,
+        result: SemanticSyncResult,
+        request: MapPublicationRequest,
+        checkpoint: Optional[SemanticCheckpoint],
+        exact_rebuilt: bool,
+        final: bool,
+    ) -> SemanticSyncResult:
+        if not isinstance(gaussians, FrozenGaussianSnapshot):
+            raise SemanticSchemaError(
+                "paired publication requires one complete frozen RGB snapshot"
+            )
+        policy = self.publication_policy
+        if (
+            not final
+            and policy.online_time_budget_seconds > 0
+            and self._last_publication_seconds
+            > policy.online_time_budget_seconds
+        ):
+            self._last_publication_seconds = 0.0
+            return result._replace(publication_status="skipped_time_budget")
+
+        config = request.semantic_config
+        free_bytes = None
+        if gaussians.get_xyz.is_cuda:
+            free_bytes, _ = torch.cuda.mem_get_info(gaussians.get_xyz.device)
+            if not final and free_bytes < policy.min_free_cuda_bytes:
+                return result._replace(publication_status="skipped_memory_headroom")
+            if (
+                not final
+                and free_bytes < 2 * policy.min_free_cuda_bytes
+                and (config.save_diagnostics or config.save_probabilities)
+            ):
+                config = replace(
+                    config,
+                    save_diagnostics=False,
+                    save_probabilities=False,
+                )
+        estimated_output = _estimated_pair_output_bytes(
+            replace(request, semantic_config=config),
+            self.dataset.class_spec.num_classes,
+        )
+        if (
+            not final
+            and estimated_output > policy.max_pair_output_bytes
+            and (config.save_diagnostics or config.save_probabilities)
+        ):
+            config = replace(
+                config,
+                save_diagnostics=False,
+                save_probabilities=False,
+            )
+            estimated_output = _estimated_pair_output_bytes(
+                replace(request, semantic_config=config),
+                self.dataset.class_spec.num_classes,
+            )
+        if not final and estimated_output > policy.max_pair_output_bytes:
+            return result._replace(publication_status="skipped_output_budget")
+        config = replace(
+            config,
+            max_output_bytes=min(
+                config.max_output_bytes, policy.max_pair_output_bytes
+            ),
+            min_free_cuda_bytes=max(
+                config.min_free_cuda_bytes, policy.min_free_cuda_bytes
+            ),
+        )
+
+        started = time.perf_counter()
+        errors = list(result.errors)
+        try:
+            projection_hash = gaussians.semantic_projection_sha256()
+            rgb_hash = gaussians.rgb_model_sha256()
+            if checkpoint is not None:
+                if projection_hash != checkpoint.projection_geometry_hash:
+                    raise SemanticSchemaError(
+                        "map snapshot does not match its semantic checkpoint"
+                    )
+                if (
+                    checkpoint.rgb_model_hash is not None
+                    and rgb_hash != checkpoint.rgb_model_hash
+                ):
+                    raise SemanticSchemaError(
+                        "map RGB snapshot does not match its semantic checkpoint"
+                    )
+            state_hash = semantic_state_sha256(
+                self.orchestrator.state,
+                self.orchestrator.recovery_context(),
+                projection_hash,
+                self.dataset.class_spec.ontology_fingerprint,
+            )
+            semantic_result = rasterize_semantic_tdom(
+                gaussians,
+                self.orchestrator.state,
+                request.camera,
+                self.dataset.class_spec,
+                config=config,
+            )
+            elapsed = time.perf_counter() - started
+            if (
+                not final
+                and policy.online_time_budget_seconds > 0
+                and elapsed > policy.online_time_budget_seconds
+            ):
+                self._last_publication_seconds = elapsed
+                return result._replace(
+                    publication_status="skipped_time_budget"
+                )
+            render_mask = torch.ones(
+                1, dtype=torch.bool, device=request.rgb_background.device
+            )
+            rgb_result = request.rgb_renderer(
+                request.camera,
+                gaussians,
+                request.rgb_pipeline,
+                request.rgb_background,
+                Render_Mask=render_mask,
+                TDOM=True,
+            )["render"]
+            rgb_image = tdom_to_uint8(rgb_result)
+            del rgb_result
+            alignment = _tdom_alignment(request.camera, request.alignment)
+            shared_manifest = {
+                "product_key": request.product_key,
+                "geometry_stage": result.geometry_stage,
+                "semantic_through_image": result.semantic_through_image,
+                "label_version": self.orchestrator.label_version,
+                "projection_geometry_hash": projection_hash,
+                "rgb_model_hash": rgb_hash,
+                "semantic_state_hash": state_hash,
+                "semantic_checkpoint_hash": (
+                    checkpoint.state_sha256 if checkpoint is not None else None
+                ),
+                "semantic_status": result.status,
+                "posterior": (
+                    "robust_exact_final" if exact_rebuilt else "robust_online"
+                ),
+                "semantic_quality": {
+                    "final_requested": bool(final),
+                    "exact_rebuild_succeeded": bool(exact_rebuilt),
+                    "status": result.status,
+                    "historical_evidence_stale": (
+                        result.historical_evidence_stale
+                    ),
+                    "deferred_image_ids": list(result.deferred_image_ids),
+                    "errors_before_publication": list(result.errors),
+                    "gaussian_ids_sha256": (
+                        self.orchestrator.state.gaussian_ids_sha256
+                    ),
+                    "topology_version": int(
+                        self.orchestrator.state.topology_version
+                    ),
+                    "num_gaussians": int(
+                        self.orchestrator.state.num_gaussians
+                    ),
+                },
+                "alignment": alignment,
+                "publication_policy": policy.to_dict(),
+                "publication_resources": {
+                    "free_cuda_bytes_before_render": free_bytes,
+                    "diagnostics_degraded": (
+                        request.diagnostics_degraded
+                        or config != request.semantic_config
+                    ),
+                },
+            }
+            publish_tdom_pair(
+                output_root=request.output_root,
+                rgb_image=rgb_image,
+                semantic_result=semantic_result,
+                class_spec=self.dataset.class_spec,
+                semantic_config=config,
+                shared_manifest=shared_manifest,
+            )
+            self.orchestrator.state.mark_clean()
+            self._last_publication_seconds = time.perf_counter() - started
+            return result._replace(
+                publication_status="complete",
+                published_product_key=request.product_key,
+            )
+        except Exception as error:
+            self.orchestrator.state.mark_dirty()
+            self._last_publication_seconds = time.perf_counter() - started
+            errors.append("paired TDOM publication: {}".format(error))
+            return result._replace(
+                errors=tuple(errors),
+                status="failed",
+                publication_status="failed",
+            )
 
     def begin_final(self) -> None:
         """Close provisional evidence before final geometry refinement starts."""
@@ -1275,16 +1643,20 @@ class ProgressiveSemanticHook:
         self.orchestrator.ledger.record(candidate)
         self._verified_recorded_files[image_id] = signature
 
-    def _persist(self, gaussians, result: SemanticSyncResult) -> None:
+    def _persist(
+        self, gaussians, result: SemanticSyncResult
+    ) -> SemanticCheckpoint:
         self.output_root.mkdir(parents=True, exist_ok=True)
-        attributes = _geometry_attributes(gaussians)
+        attributes = _projection_attributes(gaussians)
         projection_geometry_hash = semantic_projection_sha256(attributes)
-        rgb_hash = rgb_model_sha256(attributes)
-        current_attributes = _geometry_attributes(gaussians)
-        if (
-            projection_geometry_hash
-            != semantic_projection_sha256(current_attributes)
-            or rgb_hash != rgb_model_sha256(current_attributes)
+        rgb_hash = (
+            gaussians.rgb_model_sha256()
+            if isinstance(gaussians, FrozenGaussianSnapshot)
+            else None
+        )
+        current_attributes = _projection_attributes(gaussians)
+        if projection_geometry_hash != semantic_projection_sha256(
+            current_attributes
         ):
             raise SemanticSchemaError(
                 "frozen geometry changed while semantic state was persisted"
@@ -1310,6 +1682,7 @@ class ProgressiveSemanticHook:
             palette_hash=self.dataset.class_spec.palette_fingerprint,
             recovery_context=context,
         )
+        state_hash = sha256_file(state_path)
         context_hash = SemanticGaussianState.validated_recovery_context_sha256(
             context,
             ontology_hash=self.dataset.class_spec.ontology_fingerprint,
@@ -1320,7 +1693,7 @@ class ProgressiveSemanticHook:
         self._save_torch_atomic(
             geometry_path,
             {
-                "schema_version": 2,
+                "schema_version": 3,
                 "semantic_method_version": SEMANTIC_METHOD_VERSION,
                 "projection_geometry_hash": projection_geometry_hash,
                 "rgb_model_hash": rgb_hash,
@@ -1331,7 +1704,7 @@ class ProgressiveSemanticHook:
         self._save_json_atomic(
             latest_path,
             {
-                "schema_version": 3,
+                "schema_version": 5,
                 "semantic_method_version": SEMANTIC_METHOD_VERSION,
                 "slot": slot,
                 "projection_geometry_hash": projection_geometry_hash,
@@ -1340,16 +1713,24 @@ class ProgressiveSemanticHook:
                 "palette_hash": self.dataset.class_spec.palette_fingerprint,
                 "geometry_checkpoint": geometry_path.name,
                 "geometry_checkpoint_sha256": geometry_checkpoint_hash,
+                "semantic_state": state_path.name,
+                "semantic_state_sha256": state_hash,
                 "recovery_context_sha256": context_hash,
             },
         )
         self.orchestrator.state.recovery_context = context
         self.orchestrator.ledger.save(self.output_root / "ledger.json")
         self._write_sync_status(result)
+        return SemanticCheckpoint(
+            state_path,
+            state_hash,
+            projection_geometry_hash,
+            rgb_hash,
+        )
 
     def _write_sync_status(self, result: SemanticSyncResult) -> None:
         payload = {
-            "schema_version": 2,
+            "schema_version": 3,
             "semantic_method_version": SEMANTIC_METHOD_VERSION,
             "geometry_stage": result.geometry_stage,
             "semantic_through_image": result.semantic_through_image,
@@ -1361,6 +1742,9 @@ class ProgressiveSemanticHook:
             "errors": list(result.errors),
             "status": result.status,
             "historical_evidence_stale": result.historical_evidence_stale,
+            "publication_status": result.publication_status,
+            "published_product_key": result.published_product_key,
+            "publication_policy": self.publication_policy.to_dict(),
             "stage_boundaries": list(self._stage_boundaries),
         }
         self._save_json_atomic(
@@ -1407,6 +1791,13 @@ class AsyncProgressiveSemanticHook:
         self._lock = threading.Lock()
         self._idle_event = threading.Event()
         self._idle_event.set()
+        self._semantic_stream = None
+        state_device = getattr(self.orchestrator.state, "device", torch.device("cpu"))
+        if torch.device(state_device).type == "cuda":
+            self._semantic_stream = torch.cuda.Stream(
+                device=state_device,
+                priority=core.publication_policy.cuda_stream_priority,
+            )
 
     @classmethod
     def create(cls, *args, **kwargs) -> "AsyncProgressiveSemanticHook":
@@ -1443,14 +1834,14 @@ class AsyncProgressiveSemanticHook:
             )
         self._expected_gaussian_count = delta.new_count
         future = self._executor.submit(
-            self.orchestrator.state.apply_topology, delta
+            self._execute_callable, self.orchestrator.state.apply_topology, delta
         )
         future.add_done_callback(self._background_done)
 
     def begin_final(self) -> None:
         if self._closed:
             raise RuntimeError("asynchronous semantic hook is closed")
-        future = self._executor.submit(self.core.begin_final)
+        future = self._executor.submit(self._execute_callable, self.core.begin_final)
         future.add_done_callback(self._background_done)
 
     def close(self, reason: Optional[object] = None, wait: bool = True) -> None:
@@ -1471,10 +1862,7 @@ class AsyncProgressiveSemanticHook:
         gaussians,
         snapshot_root: Path,
         final: bool = False,
-        tdom_camera: Optional[object] = None,
-        tdom_output_root: Optional[Path] = None,
-        tdom_config: Optional[SemanticTdomConfig] = None,
-        tdom_alignment: Optional[Mapping[str, object]] = None,
+        publication_request: Optional[MapPublicationRequest] = None,
     ) -> SemanticSyncResult:
         if self._closed:
             raise RuntimeError("asynchronous semantic hook is closed")
@@ -1488,60 +1876,130 @@ class AsyncProgressiveSemanticHook:
             if not self._stage_boundaries or self._stage_boundaries[-1] != boundary:
                 self._stage_boundaries.append(boundary)
 
-        frozen_cameras = tuple(FrozenCameraSnapshot(item) for item in cameras)
-        frozen_tdom_camera = (
-            None if tdom_camera is None else FrozenCameraSnapshot(tdom_camera)
-        )
-        snapshot = FrozenGaussianSnapshot(gaussians)
-        request = (
-            geometry_stage,
-            frozen_cameras,
-            snapshot,
-            snapshot_root,
-            False,
-            tuple(self._stage_boundaries),
-            frozen_tdom_camera,
-            tdom_output_root,
-            tdom_config,
-            tdom_alignment,
-        )
         if not final:
             with self._lock:
-                # Submit an ordered marker for every snapshot.  The marker may
-                # skip obsolete semantic work, but its position in the single
-                # worker queue prevents a frozen snapshot from crossing later
-                # topology events.
-                self._latest_stage_token += 1
-                token = self._latest_stage_token
-                # Retain only the newest heavyweight GPU snapshot.  Ordered
-                # markers carry a token, not a second reference to old tensors.
-                self._latest_stage_request = request
+                pending_publication = (
+                    None
+                    if self._latest_stage_request is None
+                    else self._latest_stage_request.args[6]
+                )
+                if publication_request is None and pending_publication is not None:
+                    frozen_cameras = tuple(
+                        FrozenCameraSnapshot(item) for item in cameras
+                    )
+                    request = _PendingStageRequest(
+                        (
+                            geometry_stage,
+                            frozen_cameras,
+                            FrozenSemanticSnapshot(gaussians),
+                            snapshot_root,
+                            False,
+                            tuple(self._stage_boundaries),
+                            None,
+                        )
+                    )
+                    token = None
+                    queued_product_key = pending_publication.product_key
+                elif (
+                    publication_request is not None
+                    and not publication_request.publication_due
+                ):
+                    publication_request = (
+                        replace(publication_request, publication_due=True)
+                        if pending_publication is not None
+                        else None
+                    )
+                if not (
+                    publication_request is None
+                    and pending_publication is not None
+                ):
+                    frozen_publication, publication_status_override = (
+                        self._freeze_publication_request(
+                            publication_request, gaussians, final=False
+                        )
+                    )
+                    frozen_cameras = tuple(
+                        FrozenCameraSnapshot(item) for item in cameras
+                    )
+                    snapshot = (
+                        FrozenGaussianSnapshot(gaussians)
+                        if frozen_publication is not None
+                        else FrozenSemanticSnapshot(gaussians)
+                    )
+                    request = _PendingStageRequest(
+                        (
+                            geometry_stage,
+                            frozen_cameras,
+                            snapshot,
+                            snapshot_root,
+                            False,
+                            tuple(self._stage_boundaries),
+                            frozen_publication,
+                        ),
+                        publication_status_override,
+                    )
+                    # Submit an ordered marker for every replaceable snapshot.
+                    # Its queue position prevents crossing later topology events.
+                    self._latest_stage_token += 1
+                    token = self._latest_stage_token
+                    self._latest_stage_request = request
+                    queued_product_key = (
+                        None
+                        if frozen_publication is None
+                        else frozen_publication.product_key
+                    )
                 self._pending_stage_count += 1
                 self._stage_pending = True
                 self._idle_event.clear()
             future = self._executor.submit(
-                self._run_stage_marker, token
+                self._run_stage_marker if token is not None else self._run_stage,
+                token if token is not None else request,
             )
             future.add_done_callback(self._stage_done)
-            return self._current_status(geometry_stage)
+            status = self._current_status(geometry_stage)
+            if queued_product_key is not None:
+                status = status._replace(
+                    publication_status="queued",
+                    published_product_key=queued_product_key,
+                )
+            elif request.publication_status_override is not None:
+                status = status._replace(
+                    publication_status=request.publication_status_override
+                )
+            return status
 
         if final:
+            frozen_publication, publication_status_override = (
+                self._freeze_publication_request(
+                    publication_request, gaussians, final=True
+                )
+            )
+            frozen_cameras = tuple(FrozenCameraSnapshot(item) for item in cameras)
+            snapshot = (
+                FrozenGaussianSnapshot(gaussians)
+                if frozen_publication is not None
+                else FrozenSemanticSnapshot(gaussians)
+            )
             try:
                 self._idle_event.wait()
                 self._executor.submit(lambda: None).result()
                 result = self._executor.submit(
-                    self.core.synchronize,
+                    self._execute_core,
                     geometry_stage,
                     frozen_cameras,
                     snapshot,
                     snapshot_root,
                     True,
                     tuple(self._stage_boundaries),
-                    frozen_tdom_camera,
-                    tdom_output_root,
-                    tdom_config,
-                    tdom_alignment,
+                    frozen_publication,
                 ).result()
+                if publication_status_override is not None:
+                    result = result._replace(
+                        publication_status=publication_status_override
+                    )
+                    status_writer = getattr(self.core, "_write_sync_status", None)
+                    if callable(status_writer):
+                        status_writer(result)
                 self._last_result = result
                 self._stage_pending = False
                 return result
@@ -1551,22 +2009,99 @@ class AsyncProgressiveSemanticHook:
             finally:
                 self.close(wait=True)
 
+    def _freeze_publication_request(
+        self,
+        request: Optional[MapPublicationRequest],
+        gaussians,
+        final: bool,
+    ) -> Tuple[Optional[MapPublicationRequest], Optional[str]]:
+        if request is None:
+            return None, None
+        config = request.semantic_config
+        estimated_output = _estimated_pair_output_bytes(
+            request, self.core.dataset.class_spec.num_classes
+        )
+        if (
+            estimated_output > self.core.publication_policy.max_pair_output_bytes
+            and (config.save_diagnostics or config.save_probabilities)
+        ):
+            config = replace(
+                config,
+                save_diagnostics=False,
+                save_probabilities=False,
+            )
+            request = replace(
+                request,
+                semantic_config=config,
+                diagnostics_degraded=True,
+            )
+            estimated_output = _estimated_pair_output_bytes(
+                request, self.core.dataset.class_spec.num_classes
+            )
+        if estimated_output > self.core.publication_policy.max_pair_output_bytes:
+            return None, "skipped_output_budget"
+        if gaussians.get_xyz.is_cuda:
+            snapshot_bytes = _model_snapshot_nbytes(
+                gaussians, RGB_MODEL_ATTRIBUTE_NAMES
+            )
+            free_bytes, _ = torch.cuda.mem_get_info(gaussians.get_xyz.device)
+            if (
+                free_bytes
+                < self.core.publication_policy.min_free_cuda_bytes
+                + snapshot_bytes
+            ):
+                return None, "skipped_memory_headroom"
+        if isinstance(request.camera, FrozenCameraSnapshot):
+            return request, None
+        return (
+            replace(
+                request,
+                camera=FrozenCameraSnapshot(request.camera),
+                rgb_background=request.rgb_background.detach().clone(),
+                alignment=dict(request.alignment),
+            ),
+            None,
+        )
+
     def _run_stage_marker(self, token):
         with self._lock:
             if token != self._latest_stage_token:
                 return None
             request = self._latest_stage_request
+            self._latest_stage_request = None
         if request is None:
             return None
-        try:
+        return self._run_stage(request)
+
+    def _run_stage(self, request: _PendingStageRequest):
+        result = self._execute_core(*request.args)
+        if request.publication_status_override is not None:
+            result = result._replace(
+                publication_status=request.publication_status_override
+            )
+            status_writer = getattr(self.core, "_write_sync_status", None)
+            if callable(status_writer):
+                status_writer(result)
+        return result
+
+    def _execute_core(self, *request):
+        snapshot = request[2]
+        if self._semantic_stream is None:
+            snapshot.wait_ready()
             return self.core.synchronize(*request)
-        finally:
-            with self._lock:
-                if (
-                    token == self._latest_stage_token
-                    and self._latest_stage_request is request
-                ):
-                    self._latest_stage_request = None
+        with torch.cuda.stream(self._semantic_stream):
+            snapshot.wait_ready(self._semantic_stream)
+            result = self.core.synchronize(*request)
+        self._semantic_stream.synchronize()
+        return result
+
+    def _execute_callable(self, function, *args):
+        if self._semantic_stream is None:
+            return function(*args)
+        with torch.cuda.stream(self._semantic_stream):
+            result = function(*args)
+        self._semantic_stream.synchronize()
+        return result
 
     def _stage_done(self, future) -> None:
         try:

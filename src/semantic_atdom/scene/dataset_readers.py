@@ -936,6 +936,13 @@ def SingleImage_readColmapSceneInfo_Part1(path, images, eval, llffhold=8, Image_
 def SingleImage_readColmapSceneInfo_Part2(path, train_cam_infos, test_cam_infos, nerf_normalization, point3D_ids_list, xys_list, tri_list, NewCams, OriginImageHeight, OriginImageWidth, points_per_triangle=4, device="cuda", get_ply=True, Diary=None, Silence=False, NewInputFormat=False):
     all_points_3d_Stack = []
     all_colors_Stack = []
+    # A progressive checkpoint may update metadata without introducing a new
+    # image (for example phantom3 stages 399 and 400 contain the same 399
+    # images).  Treat that as an empty sparse-point batch instead of leaving
+    # these locals undefined.
+    all_points_3d = None
+    all_colors = None
+    pcd = None
 
     time1 = time.time()
     if not NewInputFormat:
@@ -1051,9 +1058,6 @@ def SingleImage_readColmapSceneInfo_Part2(path, train_cam_infos, test_cam_infos,
                 if all_points_3d is not None:
                     all_points_3d = all_points_3d.detach().cpu().numpy()
                     all_colors = all_colors.detach().cpu().numpy()
-                    if len(list(point3D_ids_list.keys())) >= 2:
-                        all_points_3d_Stack.append(all_points_3d)
-                        all_colors_Stack.append(all_colors)
                 time2 = time.time()
                 if not Silence:
                     print(f"GPU_tensor to CPU_numpy: {time2 - time1}s")
@@ -1062,9 +1066,17 @@ def SingleImage_readColmapSceneInfo_Part2(path, train_cam_infos, test_cam_infos,
                 # CPU方法
                 all_points_3d, all_colors = Get_3D_Sampled_Points(sampled_points, Tri_IDs, tri_list[key], xys_list[key], corresponding_3d_points, corresponding_3d_points_rgb, sampled_corresponding_3d_points, sampled_corresponding_3d_points_rgb)
 
-        if len(list(point3D_ids_list.keys())) >= 2:
-            all_points_3d = np.concatenate(all_points_3d_Stack, axis=0)
-            all_colors = np.concatenate(all_colors_Stack, axis=0)
+            if all_points_3d is not None and len(point3D_ids_list) >= 2:
+                all_points_3d_Stack.append(all_points_3d)
+                all_colors_Stack.append(all_colors)
+
+        if len(point3D_ids_list) >= 2:
+            if all_points_3d_Stack:
+                all_points_3d = np.concatenate(all_points_3d_Stack, axis=0)
+                all_colors = np.concatenate(all_colors_Stack, axis=0)
+            else:
+                all_points_3d = None
+                all_colors = None
 
         time1 = time.time()
         if all_points_3d is not None:

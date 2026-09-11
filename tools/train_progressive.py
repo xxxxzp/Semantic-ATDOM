@@ -654,8 +654,16 @@ class DataPreProccesser(mp.Process):
                 NewImageNames = NewImageNames + New_CamInfo.image_name + ", "
                 NewCamInfos.append(New_CamInfo)
                 CurrentNewImagesNum = CurrentNewImagesNum + 1
-            if CurrentNewImagesNum == self.NewImagesNum:
-                break
+
+        nominal_new_images = self.NewImagesNum
+        self.NewImagesNum = CurrentNewImagesNum
+        if nominal_new_images != CurrentNewImagesNum:
+            message = (
+                "Progressive stage-number delta ({}) differs from the actual "
+                "new-image count ({}); using the camera-set difference."
+            ).format(nominal_new_images, CurrentNewImagesNum)
+            print(message)
+            self.Diary.write(message + "\n")
 
         NewImageNames = NewImageNames + "]"
         if not self.Silence:
@@ -1793,9 +1801,11 @@ class GaussianTrainer(mp.Process):
                         self.NewCams = Commond_from_DataPreProccesser[2]
                         UpdatedTrainCamsPosList = Commond_from_DataPreProccesser[3]
                         self.scene.cameras_extent = Commond_from_DataPreProccesser[6]
-                        if not self.args.No_Sampling:
-                            self.gaussians.expand_from_pcd(Commond_from_DataPreProccesser[4], self.scene.cameras_extent)
-                        self.scene.basic_pcd = Commond_from_DataPreProccesser[4]
+                        progressive_pcd = Commond_from_DataPreProccesser[4]
+                        if not self.args.No_Sampling and progressive_pcd is not None:
+                            self.gaussians.expand_from_pcd(progressive_pcd, self.scene.cameras_extent)
+                        if progressive_pcd is not None:
+                            self.scene.basic_pcd = progressive_pcd
                         self.scene.model_path = Commond_from_DataPreProccesser[5]
                         NewImagesNum = Commond_from_DataPreProccesser[7]
 

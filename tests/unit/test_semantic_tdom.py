@@ -11,6 +11,7 @@ from semantic_atdom.semantics.tdom import (
     UnknownReason,
     _semantic_render_features,
     finalize_semantic_tdom,
+    load_semantic_tdom_palette,
     write_semantic_tdom,
 )
 from semantic_atdom.semantics.state import SemanticGaussianState
@@ -36,6 +37,72 @@ class SemanticTdomTests(unittest.TestCase):
             SemanticTdomConfig(min_free_cuda_bytes=-1)
         with self.assertRaisesRegex(ValueError, "max_group_disagreement"):
             SemanticTdomConfig(max_group_disagreement=2.01)
+
+    def test_render_palette_overrides_colors_without_changing_class_spec(self):
+        original_fingerprint = CLASS_SPEC.fingerprint
+        with TemporaryDirectory() as directory:
+            palette_path = Path(directory) / "tdom_palette.json"
+            palette_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "overrides": {"building": [255, 0, 0]},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            palette = load_semantic_tdom_palette(palette_path, CLASS_SPEC)
+
+        self.assertEqual(palette, ((10, 20, 30), (255, 0, 0)))
+        self.assertEqual(CLASS_SPEC.fingerprint, original_fingerprint)
+
+        result = finalize_semantic_tdom(
+            torch.tensor([[[0.1]], [[0.8]], [[0.9]]]),
+            torch.tensor([[0.95]]),
+            CLASS_SPEC,
+            SemanticTdomConfig(render_palette=palette),
+        )
+        self.assertEqual(result.class_ids.tolist(), [[1]])
+        self.assertEqual(result.colors[:, 0, 0].tolist(), [255, 0, 0])
+
+    def test_render_palette_rejects_unknown_class_and_invalid_color(self):
+        with TemporaryDirectory() as directory:
+            palette_path = Path(directory) / "tdom_palette.json"
+            palette_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": True,
+                        "overrides": {"building": [255, 0, 0]},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "schema_version 1"):
+                load_semantic_tdom_palette(palette_path, CLASS_SPEC)
+
+            palette_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "overrides": {"road": [128, 128, 128]},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "unknown classes: road"):
+                load_semantic_tdom_palette(palette_path, CLASS_SPEC)
+
+            palette_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "overrides": {"building": [256, 0, 0]},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "three integers"):
+                load_semantic_tdom_palette(palette_path, CLASS_SPEC)
 
     def test_soft_probabilities_are_mixed_before_unknown_gate(self):
         rendered = torch.tensor(
@@ -173,7 +240,10 @@ class SemanticTdomTests(unittest.TestCase):
 
     def test_writer_publishes_full_products_and_manifest(self):
         config = SemanticTdomConfig(
-            save_probabilities=True, save_diagnostics=True
+            save_probabilities=True,
+            save_diagnostics=True,
+            render_palette=((10, 20, 30), (255, 0, 0)),
+            render_palette_source="semantic/tdom_palette.json",
         )
         result = finalize_semantic_tdom(
             torch.tensor([[[0.8]], [[0.1]], [[0.9]]]),
@@ -213,6 +283,7 @@ class SemanticTdomTests(unittest.TestCase):
                 "posterior_variance.tif",
                 "semantic_probabilities.npy",
                 "class_spec.json",
+                "render_palette.json",
             }
             self.assertEqual(set(payload["files"]), expected)
             for name in expected:
@@ -220,6 +291,19 @@ class SemanticTdomTests(unittest.TestCase):
             self.assertEqual(payload["geometry_stage"], 31)
             self.assertEqual(payload["class_spec_sha256"], CLASS_SPEC.fingerprint)
             self.assertEqual(payload["class_spec"], CLASS_SPEC.to_dict())
+            self.assertEqual(
+                payload["render_palette_sha256"],
+                payload["files"]["render_palette.json"],
+            )
+            self.assertEqual(
+                payload["render_palette"]["classes"][1]["color"],
+                [255, 0, 0],
+            )
+            self.assertEqual(
+                payload["render_palette"]["source"],
+                "semantic/tdom_palette.json",
+            )
+            self.assertNotIn("render_palette", payload["unknown_gate"])
             self.assertEqual(
                 payload["raster_encodings"]["semantic_support.tif"]["dtype"],
                 "uint16",

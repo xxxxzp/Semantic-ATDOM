@@ -105,6 +105,28 @@ V1 类别映射固定为：
 }
 ```
 
+### Semantic TDOM 可视化调色板
+
+`class_spec.json` 是标签类别契约的一部分，其 fingerprint 会写入每张
+metadata；不能为了改显示颜色而修改它。可在同一 `semantic/` 目录放置可选的
+`tdom_palette.json`，只覆盖 Semantic TDOM 的可视化颜色：
+
+```json
+{
+  "schema_version": 1,
+  "overrides": {
+    "building": [255, 0, 0],
+    "road": [128, 128, 128]
+  }
+}
+```
+
+未列出的类别沿用 `class_spec.json` 的颜色。该文件不改变类别 ID、label、score、
+逐高斯概率、多视角融合或 unknown 判定，也不参与标签契约 fingerprint。渲染产物
+会另外写出完整的 `render_palette.json` 和哈希，确保地图配色可追溯。
+训练入口会自动读取 `<semantic_data_root>/semantic/tdom_palette.json`；也可通过
+`--semantic_tdom_palette_path` 显式指定其他文件。
+
 类别 ID 必须连续、从零开始，并与这里的顺序一致。修改类别、顺序、名称或颜色会改变类别规范哈希，必须作为新的标签版本发布。
 
 ## 每影像 metadata

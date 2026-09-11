@@ -172,6 +172,7 @@ class OptimizationParams(ParamGroup):
         self.semantic_boundary_bandwidth = 2.0
         self.semantic_boundary_floor = 0.25
         self.semantic_data_root = ""
+        self.semantic_tdom_palette_path = ""
         self.semantic_tdom_min_coverage = 0.05
         self.semantic_tdom_min_absolute_support = 0.01
         self.semantic_tdom_min_support_ratio = 0.05

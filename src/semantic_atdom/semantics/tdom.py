@@ -8,7 +8,7 @@ import os
 from pathlib import Path
 import shutil
 import time
-from typing import Dict, Mapping, NamedTuple, Optional
+from typing import Dict, Mapping, NamedTuple, Optional, Tuple
 
 import numpy as np
 from PIL import Image
@@ -50,6 +50,8 @@ class SemanticTdomConfig:
     validate_rendered_inputs: bool = False
     max_output_bytes: int = 8 * 1024**3
     min_free_cuda_bytes: int = 512 * 1024**2
+    render_palette: Optional[Tuple[Tuple[int, int, int], ...]] = None
+    render_palette_source: Optional[str] = None
 
     def __post_init__(self):
         for name in (
@@ -90,9 +92,125 @@ class SemanticTdomConfig:
             or self.min_free_cuda_bytes < 0
         ):
             raise ValueError("min_free_cuda_bytes must be a non-negative integer")
+        if self.render_palette is not None:
+            if not self.render_palette:
+                raise ValueError("render_palette must not be empty")
+            for color in self.render_palette:
+                if (
+                    not isinstance(color, (tuple, list))
+                    or len(color) != 3
+                    or any(
+                        isinstance(channel, bool)
+                        or not isinstance(channel, int)
+                        or channel < 0
+                        or channel > 255
+                        for channel in color
+                    )
+                ):
+                    raise ValueError(
+                        "render_palette colors must contain three integers in [0, 255]"
+                    )
+        if self.render_palette_source is not None and not isinstance(
+            self.render_palette_source, str
+        ):
+            raise ValueError("render_palette_source must be a string or None")
 
     def to_dict(self):
-        return asdict(self)
+        payload = asdict(self)
+        payload.pop("render_palette")
+        payload.pop("render_palette_source")
+        return payload
+
+
+def load_semantic_tdom_palette(
+    path: Path, class_spec: SemanticClassSpec
+) -> Tuple[Tuple[int, int, int], ...]:
+    """Load visualization-only class-color overrides.
+
+    The label class specification remains the authority for IDs and names.  A
+    render palette may change colors only, so changing map styling never
+    invalidates SAM label metadata or semantic evidence.
+    """
+    path = Path(path)
+    try:
+        with path.open("r", encoding="utf-8") as stream:
+            payload = json.load(stream)
+    except (OSError, ValueError) as error:
+        raise ValueError(
+            "unable to read Semantic TDOM palette {}: {}".format(path, error)
+        )
+    schema_version = (
+        payload.get("schema_version") if isinstance(payload, Mapping) else None
+    )
+    if isinstance(schema_version, bool) or schema_version != 1:
+        raise ValueError("Semantic TDOM palette requires schema_version 1")
+    overrides = payload.get("overrides")
+    if not isinstance(overrides, Mapping):
+        raise ValueError("Semantic TDOM palette overrides must be an object")
+
+    classes_by_name = {item.name: item for item in class_spec.classes}
+    unknown_names = sorted(set(overrides) - set(classes_by_name))
+    if unknown_names:
+        raise ValueError(
+            "Semantic TDOM palette contains unknown classes: {}".format(
+                ", ".join(unknown_names)
+            )
+        )
+    colors = [tuple(item.color) for item in class_spec.classes]
+    for name, color in overrides.items():
+        if (
+            not isinstance(color, (tuple, list))
+            or len(color) != 3
+            or any(
+                isinstance(channel, bool)
+                or not isinstance(channel, int)
+                or channel < 0
+                or channel > 255
+                for channel in color
+            )
+        ):
+            raise ValueError(
+                "Semantic TDOM palette color for {} must contain three "
+                "integers in [0, 255]".format(name)
+            )
+        colors[classes_by_name[name].class_id] = tuple(color)
+    return tuple(colors)
+
+
+def _effective_render_palette(
+    class_spec: SemanticClassSpec, config: SemanticTdomConfig
+) -> Tuple[Tuple[int, int, int], ...]:
+    colors = config.render_palette
+    if colors is None:
+        colors = tuple(tuple(item.color) for item in class_spec.classes)
+    if len(colors) != class_spec.num_classes:
+        raise ValueError(
+            "render_palette has {} colors, expected {}".format(
+                len(colors), class_spec.num_classes
+            )
+        )
+    return tuple(tuple(color) for color in colors)
+
+
+def _render_palette_payload(
+    class_spec: SemanticClassSpec, config: SemanticTdomConfig
+) -> Dict[str, object]:
+    colors = _effective_render_palette(class_spec, config)
+    return {
+        "schema_version": 1,
+        "class_spec_sha256": class_spec.fingerprint,
+        "source": config.render_palette_source,
+        "classes": [
+            {
+                "id": item.class_id,
+                "name": item.name,
+                "color": list(colors[item.class_id]),
+            }
+            for item in class_spec.classes
+        ],
+        "ignore_id": class_spec.ignore_id,
+        "ignore_color": [0, 0, 0],
+    }
 
 
 class SemanticTdomResult(NamedTuple):
@@ -307,7 +425,7 @@ def finalize_semantic_tdom(
     colors = None
     if create_colors:
         palette = torch.tensor(
-            [item.color for item in class_spec.classes],
+            _effective_render_palette(class_spec, config),
             dtype=torch.uint8,
             device=class_ids.device,
         )
@@ -776,8 +894,10 @@ def write_semantic_tdom(
     _save_image_atomic(id_path, class_ids, "PNG")
     record(id_path)
 
+    palette_payload = _render_palette_payload(class_spec, config)
     palette = np.asarray(
-        [item.color for item in class_spec.classes], dtype=np.uint8
+        [item["color"] for item in palette_payload["classes"]],
+        dtype=np.uint8,
     )
     safe_ids = np.minimum(class_ids, class_spec.num_classes - 1)
     color = palette[safe_ids]
@@ -846,6 +966,20 @@ def write_semantic_tdom(
         os.fsync(stream.fileno())
     record(class_spec_path)
 
+    render_palette_path = staging / "render_palette.json"
+    with render_palette_path.open("w", encoding="utf-8") as stream:
+        json.dump(
+            palette_payload,
+            stream,
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        )
+        stream.write("\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+    record(render_palette_path)
+
     if config.save_probabilities:
         if result.probabilities is None:
             raise ValueError(
@@ -882,6 +1016,8 @@ def write_semantic_tdom(
             "height": int(result.class_ids.shape[0]),
             "class_spec_sha256": class_spec.fingerprint,
             "class_spec": class_spec.to_dict(),
+            "render_palette_sha256": files["render_palette.json"],
+            "render_palette": palette_payload,
             "unknown_gate": config.to_dict(),
             "unknown_reason_bits": {
                 item.name.lower(): int(item) for item in UnknownReason

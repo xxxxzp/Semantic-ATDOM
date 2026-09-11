@@ -8,13 +8,26 @@ import os
 from pathlib import Path
 import shutil
 import time
-from typing import Dict, Mapping, NamedTuple, Optional
+from typing import Dict, Mapping, NamedTuple, Optional, Tuple
 
 import numpy as np
 from PIL import Image
 import torch
 
 from semantic_atdom.semantics.schema import SemanticClassSpec, sha256_file
+
+
+def _is_rgb_color(value: object) -> bool:
+    return (
+        isinstance(value, (tuple, list))
+        and len(value) == 3
+        and all(
+            not isinstance(channel, bool)
+            and isinstance(channel, int)
+            and 0 <= channel <= 255
+            for channel in value
+        )
+    )
 
 
 class UnknownReason(IntFlag):
@@ -50,6 +63,9 @@ class SemanticTdomConfig:
     validate_rendered_inputs: bool = False
     max_output_bytes: int = 8 * 1024**3
     min_free_cuda_bytes: int = 512 * 1024**2
+    max_gaussian_scale_ratio: float = 20.0
+    render_palette: Optional[Tuple[Tuple[int, int, int], ...]] = None
+    render_palette_source: Optional[str] = None
 
     def __post_init__(self):
         for name in (
@@ -90,9 +106,34 @@ class SemanticTdomConfig:
             or self.min_free_cuda_bytes < 0
         ):
             raise ValueError("min_free_cuda_bytes must be a non-negative integer")
+        if (
+            not math.isfinite(self.max_gaussian_scale_ratio)
+            or self.max_gaussian_scale_ratio < 0
+            or 0 < self.max_gaussian_scale_ratio <= 1
+        ):
+            raise ValueError(
+                "max_gaussian_scale_ratio must be zero (disabled) or greater "
+                "than one"
+            )
+        if self.render_palette is not None:
+            for color in self.render_palette:
+                if not _is_rgb_color(color):
+                    raise ValueError(
+                        "render_palette colors must contain three integers "
+                        "in [0, 255]"
+                    )
+        if self.render_palette_source is not None and (
+            not isinstance(self.render_palette_source, str)
+            or not self.render_palette_source.strip()
+        ):
+            raise ValueError("render_palette_source must be a non-empty string")
 
     def to_dict(self):
-        return asdict(self)
+        payload = asdict(self)
+        # Palette is a visualization concern, not an unknown-gate parameter.
+        payload.pop("render_palette")
+        payload.pop("render_palette_source")
+        return payload
 
 
 class SemanticTdomResult(NamedTuple):
@@ -119,15 +160,135 @@ def _empty_uncertainty(reference: torch.Tensor) -> torch.Tensor:
     return torch.full_like(reference, float("nan"))
 
 
+def load_semantic_tdom_palette(
+    path: Path, class_spec: SemanticClassSpec
+) -> Tuple[Tuple[int, int, int], ...]:
+    """Load name-based color overrides without changing the class ontology."""
+    path = Path(path)
+    try:
+        with path.open("r", encoding="utf-8") as stream:
+            payload = json.load(stream)
+    except (OSError, ValueError) as error:
+        raise ValueError(
+            "unable to read Semantic TDOM palette {}: {}".format(path, error)
+        )
+    if not isinstance(payload, Mapping):
+        raise ValueError("Semantic TDOM palette root must be a JSON object")
+    schema_version = payload.get("schema_version")
+    if isinstance(schema_version, bool) or schema_version != 1:
+        raise ValueError("Semantic TDOM palette schema_version must be 1")
+    overrides = payload.get("overrides")
+    if not isinstance(overrides, Mapping):
+        raise ValueError("Semantic TDOM palette overrides must be a JSON object")
+
+    by_name = {item.name: item for item in class_spec.classes}
+    invalid_names = [name for name in overrides if not isinstance(name, str)]
+    if invalid_names:
+        raise ValueError("Semantic TDOM palette class names must be strings")
+    unknown_names = sorted(set(overrides) - set(by_name))
+    if unknown_names:
+        raise ValueError(
+            "Semantic TDOM palette references unknown classes: {}".format(
+                ", ".join(str(name) for name in unknown_names)
+            )
+        )
+    palette = [item.color for item in class_spec.classes]
+    for name, color in overrides.items():
+        if not _is_rgb_color(color):
+            raise ValueError(
+                "Semantic TDOM palette color for {!r} must contain three "
+                "integers in [0, 255]".format(name)
+            )
+        palette[by_name[name].class_id] = tuple(color)
+    return tuple(tuple(color) for color in palette)
+
+
+def _effective_render_palette(
+    class_spec: SemanticClassSpec, config: SemanticTdomConfig
+) -> Tuple[Tuple[int, int, int], ...]:
+    palette = config.render_palette
+    if palette is None:
+        return tuple(item.color for item in class_spec.classes)
+    if len(palette) != class_spec.num_classes:
+        raise ValueError(
+            "render_palette length must match the number of semantic classes"
+        )
+    return tuple(tuple(color) for color in palette)
+
+
+def _render_palette_payload(
+    class_spec: SemanticClassSpec, config: SemanticTdomConfig
+) -> Dict[str, object]:
+    palette = _effective_render_palette(class_spec, config)
+    return {
+        "schema_version": 1,
+        "class_spec_sha256": class_spec.fingerprint,
+        "source": config.render_palette_source,
+        "ignore_id": class_spec.ignore_id,
+        "ignore_color": [0, 0, 0],
+        "classes": [
+            {
+                "id": item.class_id,
+                "name": item.name,
+                "color": list(palette[item.class_id]),
+            }
+            for item in class_spec.classes
+        ],
+    }
+
+
+def _trusted_geometry_mask(
+    scales: torch.Tensor, max_scale_ratio: float
+) -> Tuple[torch.Tensor, Dict[str, object]]:
+    """Select geometry whose largest world scale is not a robust outlier.
+
+    The returned mask is used only by the detached Semantic TDOM renderer.  It
+    never mutates, prunes, or feeds gradients into the authoritative Gaussian
+    geometry.
+    """
+    if scales.ndim != 2 or scales.shape[1] != 3:
+        raise ValueError("Gaussian scales must have shape [N, 3]")
+    maximum_scales = scales.detach().max(dim=1).values
+    finite = torch.isfinite(maximum_scales)
+    if not bool(finite.all()):
+        raise ValueError("Gaussian scales must be finite")
+    finite_scales = maximum_scales
+    median_scale = (
+        float(finite_scales.median().item()) if finite_scales.numel() else 0.0
+    )
+    enabled = max_scale_ratio > 0 and finite_scales.numel() > 0
+    scale_limit = median_scale * max_scale_ratio if enabled else None
+    trusted = torch.ones_like(finite)
+    if enabled:
+        trusted = trusted & (maximum_scales <= scale_limit)
+    input_count = int(maximum_scales.numel())
+    trusted_count = int(trusted.sum().item())
+    return trusted, {
+        "method": "max_world_scale_over_scene_median",
+        "enabled": bool(enabled),
+        "max_gaussian_scale_ratio": float(max_scale_ratio),
+        "median_max_world_scale": median_scale,
+        "max_trusted_world_scale": (
+            None if scale_limit is None else float(scale_limit)
+        ),
+        "input_gaussian_count": input_count,
+        "trusted_gaussian_count": trusted_count,
+        "excluded_gaussian_count": input_count - trusted_count,
+    }
+
+
 def _semantic_render_features(
     semantic_state,
     device: torch.device,
     use_robust: bool,
     eps: float,
+    gaussian_mask: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Build the K+4 per-Gaussian values consumed by the CUDA renderer."""
     alpha = semantic_state.alpha_robust if use_robust else semantic_state.alpha_raw
     alpha = alpha.detach().to(device=device, dtype=torch.float32)
+    if gaussian_mask is not None:
+        alpha = alpha[gaussian_mask]
     concentration = alpha.sum(dim=1)
     means = alpha / (concentration.unsqueeze(1) + eps)
     evidence_ratio = (
@@ -139,7 +300,10 @@ def _semantic_render_features(
     # (opposite one-hot vectors), so the flight-group trace must retain [0, 2].
     group_disagreement = semantic_state.group_variance.detach().to(
         device=device, dtype=torch.float32
-    ).sum(dim=1).clamp(min=0.0, max=2.0)
+    )
+    if gaussian_mask is not None:
+        group_disagreement = group_disagreement[gaussian_mask]
+    group_disagreement = group_disagreement.sum(dim=1).clamp(min=0.0, max=2.0)
     posterior_variance = (
         (1.0 - probability_second_moment).clamp_min(0.0)
         / (concentration + 1.0)
@@ -252,7 +416,12 @@ def finalize_semantic_tdom(
 
     semantic_evidence = absolute_support > config.eps
     add_reason(~semantic_evidence, UnknownReason.NO_SEMANTIC_EVIDENCE)
-    add_reason(coverage < config.min_coverage, UnknownReason.LOW_COVERAGE)
+    # A zero/effectively-zero coverage pixel has no geometric support even
+    # when the configurable coverage gate is explicitly disabled.
+    add_reason(
+        (coverage <= config.eps) | (coverage < config.min_coverage),
+        UnknownReason.LOW_COVERAGE,
+    )
     add_reason(
         absolute_support < config.min_absolute_support,
         UnknownReason.LOW_ABSOLUTE_SUPPORT,
@@ -307,7 +476,7 @@ def finalize_semantic_tdom(
     colors = None
     if create_colors:
         palette = torch.tensor(
-            [item.color for item in class_spec.classes],
+            _effective_render_palette(class_spec, config),
             dtype=torch.uint8,
             device=class_ids.device,
         )
@@ -465,6 +634,19 @@ def rasterize_semantic_tdom(
         raise ValueError("semantic state and geometry Gaussian counts differ")
     if semantic_state.num_classes != class_spec.num_classes:
         raise ValueError("semantic state and class spec widths differ")
+    opacities = gaussians.get_opacity.detach().to(dtype=torch.float32).contiguous()
+    scales = gaussians.get_scaling.detach().to(dtype=torch.float32).contiguous()
+    rotations = gaussians.get_rotation.detach().to(dtype=torch.float32).contiguous()
+    trusted_mask, geometry_validity = _trusted_geometry_mask(
+        scales, config.max_gaussian_scale_ratio
+    )
+    input_gaussian_count = int(means3d.shape[0])
+    filter_applied = geometry_validity["excluded_gaussian_count"] > 0
+    if filter_applied:
+        means3d = means3d[trusted_mask].contiguous()
+        opacities = opacities[trusted_mask].contiguous()
+        scales = scales[trusted_mask].contiguous()
+        rotations = rotations[trusted_mask].contiguous()
     # K class numerators plus support and three scalar uncertainty moments.
     feature_channels = class_spec.num_classes + 4
     if feature_channels > 20:
@@ -530,10 +712,8 @@ def rasterize_semantic_tdom(
         device=means3d.device,
         use_robust=use_robust,
         eps=config.eps,
+        gaussian_mask=(trusted_mask if filter_applied else None),
     )
-    opacities = gaussians.get_opacity.detach().to(dtype=torch.float32).contiguous()
-    scales = gaussians.get_scaling.detach().to(dtype=torch.float32).contiguous()
-    rotations = gaussians.get_rotation.detach().to(dtype=torch.float32).contiguous()
     empty = torch.empty(0, dtype=torch.float32, device=means3d.device)
     viewmatrix = camera.world_view_transform.detach().to(
         device=means3d.device, dtype=torch.float32
@@ -658,7 +838,14 @@ def rasterize_semantic_tdom(
         ),
         "feature_channels": int(feature_channels),
         "finalize_tile_rows": int(config.finalize_tile_rows),
+        "geometry_validity_filter": geometry_validity,
     }
+    if filter_applied and result is not None and result.radii is not None:
+        full_radii = torch.zeros(
+            input_gaussian_count, dtype=result.radii.dtype
+        )
+        full_radii[trusted_mask.detach().cpu()] = result.radii
+        result = result._replace(radii=full_radii)
     del features
     with torch.cuda.device(means3d.device):
         allocated_after_finalize = torch.cuda.memory_allocated()
@@ -776,9 +963,7 @@ def write_semantic_tdom(
     _save_image_atomic(id_path, class_ids, "PNG")
     record(id_path)
 
-    palette = np.asarray(
-        [item.color for item in class_spec.classes], dtype=np.uint8
-    )
+    palette = np.asarray(_effective_render_palette(class_spec, config), dtype=np.uint8)
     safe_ids = np.minimum(class_ids, class_spec.num_classes - 1)
     color = palette[safe_ids]
     color[class_ids == class_spec.ignore_id] = 0
@@ -794,9 +979,20 @@ def write_semantic_tdom(
     del unknown
 
     reason = result.unknown_reason.detach().cpu().contiguous()
+    reason_array = reason.numpy()
     reason_path = staging / "unknown_reason.png"
-    _save_image_atomic(reason_path, reason.numpy(), "PNG")
+    _save_image_atomic(reason_path, reason_array, "PNG")
     record(reason_path)
+
+    geometry_valid = (
+        reason_array & int(UnknownReason.LOW_COVERAGE)
+    ) == 0
+    geometry_valid_pixel_count = int(geometry_valid.sum())
+    geometry_valid_path = staging / "geometry_valid_mask.png"
+    _save_image_atomic(
+        geometry_valid_path, geometry_valid.astype(np.uint8) * 255, "PNG"
+    )
+    record(geometry_valid_path)
 
     tiff_writer = None
     diagnostic_tensors = {
@@ -846,6 +1042,21 @@ def write_semantic_tdom(
         os.fsync(stream.fileno())
     record(class_spec_path)
 
+    render_palette = _render_palette_payload(class_spec, config)
+    render_palette_path = staging / "render_palette.json"
+    with render_palette_path.open("w", encoding="utf-8") as stream:
+        json.dump(
+            render_palette,
+            stream,
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        )
+        stream.write("\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+    record(render_palette_path)
+
     if config.save_probabilities:
         if result.probabilities is None:
             raise ValueError(
@@ -882,6 +1093,8 @@ def write_semantic_tdom(
             "height": int(result.class_ids.shape[0]),
             "class_spec_sha256": class_spec.fingerprint,
             "class_spec": class_spec.to_dict(),
+            "render_palette_sha256": files["render_palette.json"],
+            "render_palette": render_palette,
             "unknown_gate": config.to_dict(),
             "unknown_reason_bits": {
                 item.name.lower(): int(item) for item in UnknownReason
@@ -900,6 +1113,10 @@ def write_semantic_tdom(
                 },
                 "unknown_pixel_count": int(
                     class_counts[class_spec.ignore_id].item()
+                ),
+                "geometry_valid_pixel_count": geometry_valid_pixel_count,
+                "geometry_invalid_pixel_count": int(
+                    geometry_valid.size - geometry_valid_pixel_count
                 ),
                 "unknown_reason_pixel_counts": _unknown_reason_counts(reason),
             },

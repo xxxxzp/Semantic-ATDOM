@@ -276,6 +276,14 @@ observer 必须绑定一个具有 `num_gaussians`、`is_valid` 和 `invalidate()
 
 ## Semantic TDOM 概率渲染
 
+Semantic TDOM 与同阶段 RGB TDOM 共享正射相机、范围、GSD、几何版本和像素坐标系，但语义产品使用一份只读、无梯度的几何视图。为避免异常膨胀的高斯用很暗的 SH 外观渲染成近黑 RGB、却凭高 opacity 将某一语义类别扩散到地图外缘，V1 默认仅让满足下式的高斯参与 Semantic TDOM 光栅化：
+
+\[
+\max(\mathbf s_g) \le 20\,\operatorname{median}_h\max(\mathbf s_h)
+\]
+
+这里的 `20` 是尚未经过真值校准的默认尺度比，可通过 `semantic_tdom_max_gaussian_scale_ratio` 配置，设为 `0` 可关闭。筛选只影响当前 Semantic TDOM 的几何支持域和覆盖率计算，不删除或修改高斯，不改变 RGB TDOM，不参与位置、尺度、旋转、opacity、SH、densification 或任何优化器更新。输出 manifest 必须记录输入、保留、排除高斯数量、中位尺度和实际尺度上限，以便复现实验。
+
 对选定的 Dirichlet 后验，定义：
 
 \[
@@ -317,11 +325,13 @@ P^{TDOM}_{pk}=\frac{N_{pk}}{U_p+\epsilon}
 
 一个跨越建筑和植被的大高斯必须保留软概率；渲染器先在 TDOM 像素级混合所有可见高斯的概率，再执行 argmax/unknown gate，不得先把每个高斯硬化成置信度更高的类别。
 
-默认产品为与 RGB TDOM 同正射相机、范围、GSD 和渲染节奏的 `semantic_id`、`semantic_color`、`unknown_mask`、`unknown_reason`、`semantic_support` 和 `semantic_entropy`。其余独立诊断栅格通过 `--semantic_tdom_save_diagnostics` 显式启用，完整 \(K\) 通道概率栅格仅作为可选调试/科研输出。具体 gate 阈值尚未校准，必须由配置提供。当前 RGB TDOM 没有 CRS，因此这里只保证像素级配准，不能宣称 GIS 地理参考已经完备。
+默认产品为与 RGB TDOM 同正射相机、范围、GSD 和渲染节奏的 `semantic_id`、`semantic_color`、`unknown_mask`、`unknown_reason`、`geometry_valid_mask`、`semantic_support` 和 `semantic_entropy`。`geometry_valid_mask` 由完成异常尺度筛选后的覆盖率 gate 生成：有效为 255，无有效几何支持为 0；无效像素在 `semantic_id` 中必须为 255、在 `semantic_color` 中必须为黑色。其余独立诊断栅格通过 `--semantic_tdom_save_diagnostics` 显式启用，完整 \(K\) 通道概率栅格仅作为可选调试/科研输出。具体 gate 阈值尚未校准，必须由配置提供。当前 RGB TDOM 没有 CRS，因此这里只保证像素级配准，不能宣称 GIS 地理参考已经完备。
+
+`semantic_color` 只是一项派生可视化产品。运行时可从语义数据根目录的 `semantic/tdom_palette.json` 按类别名称覆盖颜色；它不得修改 `class_spec.json`、类别 ID、类别概率、unknown gate、证据融合或类别规范哈希。每次产品发布都写出完整的 `render_palette.json` 及其 SHA256，未覆盖类别继续使用 `class_spec.json` 中的原颜色。调色板文件读取失败时只产生语义告警并回退到类别规范颜色，不能中断 RGB 几何或核心语义同步。
 
 WP4 使用独立的 forward-only CUDA kernel，在一次 TDOM 几何预处理和一次 alpha-T 遍历中渲染 `K+4` 个通道：类别分子、绝对语义支持、类别均值二阶矩、航片组分歧和 Dirichlet 方差传播项；方差传播项由 kernel 额外按平方后的 alpha-T 语义权重累积。不创建 autograd 图，也不写入几何参数。当前 kernel 支持最多 20 个 feature channels，因此本项目 8 类对应的 12 通道可直接运行。初始化、每个渐进阶段及最终 refinement 的现有 RGB TDOM 触发后，对应语义产品写入 `<Model_Path_Dir>/Semantic_TDOM/stage_<geometry_stage>/<product_key>/`。Schema V2 包含 hard map、unknown 原因、核心标量层、可选完整诊断层、完整 `class_spec.json` 和最后原子发布的 `manifest.json`；`semantic_probabilities.npy` 仅在显式启用时保存。诊断层默认量化为带显式 scale/nodata 元数据的 uint16 tiled lossless-compressed TIFF；量化误差不超过对应指标定义域跨度的 \(1/65534\)，也可配置为 float32。RGB sidecar 与语义 manifest 共享唯一 `product_key`，并记录正射相机矩阵、投影平面原点/法向/基向量/角点、视场角、范围、请求/实际 GSD、尺寸和显式 CRS；语义 manifest 另记录几何阶段、语义追踪到的影像、标签版本、几何哈希、类别规范、gate 参数、质量状态、渲染耗时及各文件 SHA256。消费者必须按 `product_key` 配对，不能仅依赖文件序号。
 
-未校准 gate 的暂定默认值为 `coverage=0.05`、`absolute_support=0.01`、`support_ratio=0.05`、`margin=0.05`。新增的 Top-1、归一化 entropy 和 group disagreement gate 分别以 `0`、`1`、`2` 处于兼容模式，不在无真值条件下武断改变 V1 覆盖率；它们全部可由命令行配置，后续必须依据真实场景诊断结果校准。
+未校准 gate 的暂定默认值为 `coverage=0.05`、`absolute_support=0.01`、`support_ratio=0.05`、`margin=0.05`。新增的 Top-1、归一化 entropy 和 group disagreement gate 分别以 `0`、`1`、`2` 处于兼容模式，不在无真值条件下武断改变 V1 覆盖率；异常尺度筛选比暂定为 `20`。它们全部可由命令行配置，后续必须依据真实场景诊断结果校准。
 
 渲染前按实际 feature channels、行带输出、tile finalize 工作集和每高斯状态保守估算显存，并同时检查实时空闲 CUDA 显存和默认 512 MiB headroom；CUDA 预处理得到当前行带真实的 Gaussian–tile 交集数后，还必须在分配 radix-sort/binning buffer 前校验剩余硬预算。默认优先一次性渲染；预算不足或显式设置 `render_tile_rows` 时，保持完整相机投影和全局深度顺序，以 16 像素对齐行带精确输出并逐带转移到 CPU。该降级路径会重复轻量 projection/preprocess，但每带只排序与本带相交的实例，优先保证全分辨率结果可生成和逐像素一致性，不使用半分辨率替代。
 
@@ -416,6 +426,7 @@ V1 的语义状态、融合和渲染计算默认使用 `float32`；产品诊断�
 3. 标签边界距离权重的带宽和下限；
 4. dirty 判定所需的位置、投影协方差和 opacity 变化阈值；
 5. CUDA 的最佳 tile、分块和常用 \(K\) 模板配置。
+6. Semantic TDOM 异常高斯尺度比阈值。
 
 第一阶段不制作人工真值，因此只验收几何隔离、幂等、证据守恒、顺序稳定、unknown 行为、遮挡/足迹正确性、恢复一致性、RGB/Semantic TDOM 配准和资源预算。SAM 模型选择、阈值精度校准、正式评价指标与消融设计留到后续阶段。
 

@@ -186,6 +186,8 @@ class OptimizationParams(ParamGroup):
         self.semantic_tdom_final_only = False
         self.semantic_tdom_max_output_bytes = 8 * 1024**3
         self.semantic_tdom_min_free_cuda_bytes = 512 * 1024**2
+        self.semantic_tdom_max_gaussian_scale_ratio = 20.0
+        self.semantic_tdom_palette_path = ""
 
         super().__init__(parser, "Optimization Parameters")
 

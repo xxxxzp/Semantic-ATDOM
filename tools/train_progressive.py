@@ -40,7 +40,11 @@ from semantic_atdom.semantics.orchestrator import (
     AsyncProgressiveSemanticHook,
     OnlineSemanticConfig,
 )
-from semantic_atdom.semantics.tdom import SemanticTdomConfig
+from semantic_atdom.semantics.schema import SemanticClassSpec
+from semantic_atdom.semantics.tdom import (
+    SemanticTdomConfig,
+    load_semantic_tdom_palette,
+)
 
 try:
     from torch.utils.tensorboard import SummaryWriter
@@ -957,6 +961,31 @@ class GaussianTrainer(mp.Process):
         if not self.args.enable_semantics:
             return
         try:
+            semantic_dataset_root = (
+                self.args.semantic_data_root or self.args.Source_Path_Dir
+            )
+            render_palette = None
+            render_palette_source = None
+            explicit_palette = self.args.semantic_tdom_palette_path
+            palette_path = explicit_palette or os.path.join(
+                semantic_dataset_root, "semantic", "tdom_palette.json"
+            )
+            if explicit_palette or os.path.isfile(palette_path):
+                try:
+                    class_spec = SemanticClassSpec.load(
+                        os.path.join(
+                            semantic_dataset_root, "semantic", "class_spec.json"
+                        )
+                    )
+                    render_palette = load_semantic_tdom_palette(
+                        palette_path, class_spec
+                    )
+                    render_palette_source = os.path.abspath(palette_path)
+                except Exception as error:
+                    SemanticWarning(
+                        "Semantic TDOM palette was ignored; class-spec colors "
+                        "remain active: {}".format(error)
+                    )
             config = OnlineSemanticConfig(
                 overlap_threshold=self.args.semantic_overlap_threshold,
                 max_group_size=self.args.semantic_max_group_size,
@@ -997,6 +1026,11 @@ class GaussianTrainer(mp.Process):
                 min_free_cuda_bytes=(
                     self.args.semantic_tdom_min_free_cuda_bytes
                 ),
+                max_gaussian_scale_ratio=(
+                    self.args.semantic_tdom_max_gaussian_scale_ratio
+                ),
+                render_palette=render_palette,
+                render_palette_source=render_palette_source,
             )
             self.semantic_hook = AsyncProgressiveSemanticHook.create(
                 dataset_root=self.args.Source_Path_Dir,
@@ -1005,9 +1039,7 @@ class GaussianTrainer(mp.Process):
                 ),
                 gaussians=self.gaussians,
                 config=config,
-                semantic_dataset_root=(
-                    self.args.semantic_data_root or self.args.Source_Path_Dir
-                ),
+                semantic_dataset_root=semantic_dataset_root,
             )
             self.gaussians.set_topology_observer(
                 self.semantic_hook.apply_topology, owner=self.semantic_hook

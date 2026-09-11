@@ -4,13 +4,16 @@ from tempfile import TemporaryDirectory
 import unittest
 
 import torch
+from PIL import Image
 
 from semantic_atdom.semantics.schema import SemanticClassSpec, sha256_file
 from semantic_atdom.semantics.tdom import (
     SemanticTdomConfig,
     UnknownReason,
     _semantic_render_features,
+    _trusted_geometry_mask,
     finalize_semantic_tdom,
+    load_semantic_tdom_palette,
     write_semantic_tdom,
 )
 from semantic_atdom.semantics.state import SemanticGaussianState
@@ -36,6 +39,69 @@ class SemanticTdomTests(unittest.TestCase):
             SemanticTdomConfig(min_free_cuda_bytes=-1)
         with self.assertRaisesRegex(ValueError, "max_group_disagreement"):
             SemanticTdomConfig(max_group_disagreement=2.01)
+        with self.assertRaisesRegex(ValueError, "max_gaussian_scale_ratio"):
+            SemanticTdomConfig(max_gaussian_scale_ratio=1.0)
+
+    def test_trusted_geometry_mask_rejects_only_scale_outliers(self):
+        mask, metrics = _trusted_geometry_mask(
+            torch.tensor(
+                [
+                    [0.2, 0.1, 0.1],
+                    [0.2, 0.2, 0.1],
+                    [0.2, 0.1, 0.2],
+                    [0.2, 0.2, 0.2],
+                    [5.0, 0.2, 0.2],
+                ]
+            ),
+            max_scale_ratio=20.0,
+        )
+
+        self.assertEqual(mask.tolist(), [True, True, True, True, False])
+        self.assertEqual(metrics["input_gaussian_count"], 5)
+        self.assertEqual(metrics["trusted_gaussian_count"], 4)
+        self.assertEqual(metrics["excluded_gaussian_count"], 1)
+        self.assertAlmostEqual(metrics["median_max_world_scale"], 0.2)
+        self.assertAlmostEqual(
+            metrics["max_trusted_world_scale"], 4.0, places=6
+        )
+
+    def test_render_palette_overrides_colors_without_changing_class_spec(self):
+        original_fingerprint = CLASS_SPEC.fingerprint
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "tdom_palette.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "overrides": {"building": [255, 0, 0]},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            palette = load_semantic_tdom_palette(path, CLASS_SPEC)
+
+        self.assertEqual(palette, ((10, 20, 30), (255, 0, 0)))
+        self.assertEqual(CLASS_SPEC.fingerprint, original_fingerprint)
+        result = finalize_semantic_tdom(
+            torch.tensor([[[0.1]], [[0.8]], [[0.9]]]),
+            torch.tensor([[0.95]]),
+            CLASS_SPEC,
+            SemanticTdomConfig(render_palette=palette),
+        )
+        self.assertEqual(result.colors[:, 0, 0].tolist(), [255, 0, 0])
+
+    def test_render_palette_rejects_invalid_schema_classes_and_colors(self):
+        invalid_payloads = (
+            {"schema_version": True, "overrides": {}},
+            {"schema_version": 1, "overrides": {"tree": [1, 2, 3]}},
+            {"schema_version": 1, "overrides": {"building": [256, 0, 0]}},
+        )
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "tdom_palette.json"
+            for payload in invalid_payloads:
+                path.write_text(json.dumps(payload), encoding="utf-8")
+                with self.assertRaises(ValueError):
+                    load_semantic_tdom_palette(path, CLASS_SPEC)
 
     def test_soft_probabilities_are_mixed_before_unknown_gate(self):
         rendered = torch.tensor(
@@ -94,6 +160,28 @@ class SemanticTdomTests(unittest.TestCase):
             int(result.unknown_reason[0, 1])
             & int(UnknownReason.NO_SEMANTIC_EVIDENCE)
         )
+
+    def test_zero_coverage_is_geometry_invalid_when_gate_is_disabled(self):
+        config = SemanticTdomConfig(
+            min_coverage=0.0,
+            min_absolute_support=0.0,
+            min_support_ratio=0.0,
+            min_margin=0.0,
+        )
+        result = finalize_semantic_tdom(
+            torch.zeros((CLASS_SPEC.num_classes + 1, 1, 1)),
+            torch.zeros((1, 1)),
+            CLASS_SPEC,
+            config,
+        )
+        self.assertTrue(
+            int(result.unknown_reason[0, 0]) & int(UnknownReason.LOW_COVERAGE)
+        )
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_semantic_tdom(result, root, CLASS_SPEC, {}, config)
+            with Image.open(root / "geometry_valid_mask.png") as image:
+                self.assertEqual(image.getpixel((0, 0)), 0)
 
     def test_enhanced_features_produce_separate_uncertainty_maps(self):
         # K class numerators, support, E[||mu||^2], group variance and
@@ -173,7 +261,10 @@ class SemanticTdomTests(unittest.TestCase):
 
     def test_writer_publishes_full_products_and_manifest(self):
         config = SemanticTdomConfig(
-            save_probabilities=True, save_diagnostics=True
+            save_probabilities=True,
+            save_diagnostics=True,
+            render_palette=((10, 20, 30), (255, 0, 0)),
+            render_palette_source="/dataset/semantic/tdom_palette.json",
         )
         result = finalize_semantic_tdom(
             torch.tensor([[[0.8]], [[0.1]], [[0.9]]]),
@@ -202,6 +293,7 @@ class SemanticTdomTests(unittest.TestCase):
                 "semantic_color.png",
                 "unknown_mask.png",
                 "unknown_reason.png",
+                "geometry_valid_mask.png",
                 "semantic_support.tif",
                 "semantic_entropy.tif",
                 "coverage.tif",
@@ -213,6 +305,7 @@ class SemanticTdomTests(unittest.TestCase):
                 "posterior_variance.tif",
                 "semantic_probabilities.npy",
                 "class_spec.json",
+                "render_palette.json",
             }
             self.assertEqual(set(payload["files"]), expected)
             for name in expected:
@@ -220,6 +313,22 @@ class SemanticTdomTests(unittest.TestCase):
             self.assertEqual(payload["geometry_stage"], 31)
             self.assertEqual(payload["class_spec_sha256"], CLASS_SPEC.fingerprint)
             self.assertEqual(payload["class_spec"], CLASS_SPEC.to_dict())
+            self.assertEqual(
+                payload["render_palette_sha256"],
+                sha256_file(root / "render_palette.json"),
+            )
+            self.assertEqual(
+                payload["render_palette"]["source"],
+                "/dataset/semantic/tdom_palette.json",
+            )
+            self.assertEqual(
+                payload["render_palette"]["classes"][1]["color"],
+                [255, 0, 0],
+            )
+            self.assertNotIn("render_palette", payload["unknown_gate"])
+            self.assertNotIn("render_palette_source", payload["unknown_gate"])
+            with Image.open(root / "geometry_valid_mask.png") as image:
+                self.assertEqual(image.getpixel((0, 0)), 255)
             self.assertEqual(
                 payload["raster_encodings"]["semantic_support.tif"]["dtype"],
                 "uint16",

@@ -105,7 +105,25 @@ V1 类别映射固定为：
 }
 ```
 
-类别 ID 必须连续、从零开始，并与这里的顺序一致。修改类别、顺序、名称或颜色会改变类别规范哈希，必须作为新的标签版本发布。
+类别 ID 必须连续、从零开始，并与这里的顺序一致。修改类别、顺序、名称或颜色会改变类别规范哈希，必须作为新的标签版本发布。若只是调整最终地图的显示颜色，不应修改该文件，应使用下面的独立调色板。
+
+## 可选 Semantic TDOM 显示调色板
+
+若需要改变 `semantic_color.png` 的显示颜色，可在同一 `semantic/` 目录下增加 `tdom_palette.json`：
+
+```json
+{
+  "schema_version": 1,
+  "overrides": {
+    "building": [255, 0, 0],
+    "road": [128, 128, 128]
+  }
+}
+```
+
+键必须是 `class_spec.json` 中已有的类别名称，RGB 通道必须是 `0..255` 的整数。未列出的类别保持原颜色。也可通过 `--semantic_tdom_palette_path` 显式指定其他文件；显式路径优先于自动发现的 `semantic/tdom_palette.json`。
+
+该文件只控制最终 Semantic TDOM 的彩色预览，不改变输入标签 PNG、类别 ID、类别概率、证据更新、unknown 判定或 `class_spec.json` 的指纹。每个输出产品会保存解析后的完整 `render_palette.json` 和哈希，便于追溯当时实际使用的颜色。调色板无效时系统回退到 `class_spec.json` 的颜色并继续语义流程。
 
 ## 每影像 metadata
 

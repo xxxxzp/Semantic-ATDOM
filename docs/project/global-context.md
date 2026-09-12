@@ -262,11 +262,11 @@ RGB/Semantic 产品使用共同 `projection_geometry_hash`，完整 RGB 另有 `
 | CUDA V2 实现 | 已完成 |
 | online 状态与独立 final recovery | 已完成 |
 | fixed-grid paired publication | 已完成单元/集成边界测试，真实 Phantom3 CUDA 运行待 Task 9 |
-| read-only preflight/cache | 未开始 |
+| read-only preflight/cache | 已完成；真实 stage 30→100 preflight 通过，source binding 仍未验证 |
 | 正式 `semantic-atdom` 环境 | 未建立 |
 | stage 30→31 / 30→100 | 未验证 |
 
-当前 product/scheduling 已建立固定本地网格、同一冻结快照的 RGB/Semantic 原子 pair、latest-wins 请求、投影专用轻量 snapshot，以及显式 stream/headroom/time/output/checkpoint 策略。尚未完成的是只读 dataset preflight、正式环境重建和真实 Phantom3 CUDA 端到端验证；因此当前只声称实现边界通过测试，不声称实时预算或地图轴向已由实测校准。online group disagreement 在 exact rebuild 前明确为不可用而不是伪零。
+当前 product/scheduling 已建立固定本地网格、同一冻结快照的 RGB/Semantic 原子 pair、latest-wins 请求、投影专用轻量 snapshot，以及显式 stream/headroom/time/output/checkpoint 策略。训练前 preflight 会验证所选累积 stage、camera/RGB、overlap、label/metadata/hash，并将报告与派生 PLY 写入 output/cache；启用语义时不再允许隐式 semantic root。当前标签 source-image binding 未提供，因此开发运行最终只能标为 `exact_partial`。尚未完成的是正式环境重建和真实 Phantom3 CUDA 端到端验证；不声称实时预算或地图轴向已由实测校准。online group disagreement 在 exact rebuild 前明确为不可用而不是伪零。
 
 实施任务与顺序见 [G1 Evidence V2 active plan](../../plans/active/2026-09-11-g1-evidence-v2.md)。在 CPU 数学合同稳定前不修改 CUDA。
 

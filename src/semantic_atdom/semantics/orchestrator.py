@@ -934,12 +934,14 @@ class ProgressiveSemanticHook:
         projector,
         output_root: Path,
         publication_policy: Optional[MapPublicationPolicy] = None,
+        final_authoritative_complete: bool = True,
     ):
         self.dataset = dataset
         self.orchestrator = orchestrator
         self.projector = projector
         self.output_root = Path(output_root)
         self.publication_policy = publication_policy or MapPublicationPolicy()
+        self.final_authoritative_complete = bool(final_authoritative_complete)
         self._stage_boundaries = []
         self._verified_recorded_files = {}
         self._last_publication_seconds = 0.0
@@ -955,6 +957,7 @@ class ProgressiveSemanticHook:
         semantic_dataset_root: Optional[Path] = None,
         publication_policy: Optional[MapPublicationPolicy] = None,
         resume: bool = True,
+        final_authoritative_complete: bool = True,
     ) -> "ProgressiveSemanticHook":
         config = config or OnlineSemanticConfig()
         dataset = SemanticDataset(semantic_dataset_root or dataset_root)
@@ -1098,6 +1101,7 @@ class ProgressiveSemanticHook:
             projector,
             output_root,
             publication_policy=publication_policy,
+            final_authoritative_complete=final_authoritative_complete,
         )
         status_path = output_root / "sync_status.json"
         if resume and status_path.is_file():
@@ -1306,7 +1310,9 @@ class ProgressiveSemanticHook:
                         entry.image_id for entry in rebuilt.ledger.entries
                     }
                     exact_rebuilt = True
-                    exact_complete = not final_missing
+                    exact_complete = (
+                        not final_missing and self.final_authoritative_complete
+                    )
                 except Exception as error:
                     errors.append("final exact rebuild: {}".format(error))
             else:

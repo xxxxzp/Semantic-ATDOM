@@ -933,7 +933,7 @@ def SingleImage_readColmapSceneInfo_Part1(path, images, eval, llffhold=8, Image_
     Diary.write(f"After read Colmap Cameras: {time2 - time1}s\n")
     return train_cam_infos, test_cam_infos, nerf_normalization, point3D_ids_list, xys_list, tri_list
 
-def SingleImage_readColmapSceneInfo_Part2(path, train_cam_infos, test_cam_infos, nerf_normalization, point3D_ids_list, xys_list, tri_list, NewCams, OriginImageHeight, OriginImageWidth, points_per_triangle=4, device="cuda", get_ply=True, Diary=None, Silence=False, NewInputFormat=False):
+def SingleImage_readColmapSceneInfo_Part2(path, train_cam_infos, test_cam_infos, nerf_normalization, point3D_ids_list, xys_list, tri_list, NewCams, OriginImageHeight, OriginImageWidth, points_per_triangle=4, device="cuda", get_ply=True, Diary=None, Silence=False, NewInputFormat=False, Ply_Cache_Path=""):
     all_points_3d_Stack = []
     all_colors_Stack = []
     # A progressive checkpoint may update metadata without introducing a new
@@ -953,6 +953,8 @@ def SingleImage_readColmapSceneInfo_Part2(path, train_cam_infos, test_cam_infos,
         ply_path = os.path.join(path, "bin/points3D.ply")
         bin_path = os.path.join(path, "bin/points3D.bin")
         txt_path = os.path.join(path, "bin/points3D.txt")
+    if Ply_Cache_Path:
+        ply_path = os.fspath(Ply_Cache_Path)
 
     if not os.path.exists(ply_path):
         try:
@@ -1085,6 +1087,7 @@ def SingleImage_readColmapSceneInfo_Part2(path, train_cam_infos, test_cam_infos,
                 if not Silence:
                     print("Converting point3d.bin to .ply, will happen only the first time you open the scene.")
                 # storePly(ply_path, xyz, rgb)
+                os.makedirs(os.path.dirname(ply_path), exist_ok=True)
                 storePly(ply_path, all_points_3d, all_colors)
             else:
                 plydata = storePly(ply_path, all_points_3d, all_colors, False)
@@ -1223,7 +1226,7 @@ def SingleImage_readColmapSceneInfo(path, images, eval, llffhold=8, get_ply=True
                            ply_path=ply_path)
     return scene_info
 
-def readColmapSceneInfo(path, images, eval, llffhold=8, get_ply=True, Do_Get_Tri_Mask=False, No_Key_Region=False, NewInputFormat=False, Image_Folder_Path=""):
+def readColmapSceneInfo(path, images, eval, llffhold=8, get_ply=True, Do_Get_Tri_Mask=False, No_Key_Region=False, NewInputFormat=False, Image_Folder_Path="", Ply_Cache_Path=""):
     if not NewInputFormat:
         try:
             cameras_extrinsic_file = os.path.join(path, "sparse/0", "images.bin")
@@ -1267,6 +1270,8 @@ def readColmapSceneInfo(path, images, eval, llffhold=8, get_ply=True, Do_Get_Tri
         ply_path = os.path.join(path, "bin/points3D.ply")
         bin_path = os.path.join(path, "bin/points3D.bin")
         txt_path = os.path.join(path, "bin/points3D.txt")
+    if Ply_Cache_Path:
+        ply_path = os.fspath(Ply_Cache_Path)
 
     if not os.path.exists(ply_path):
         try:
@@ -1276,6 +1281,7 @@ def readColmapSceneInfo(path, images, eval, llffhold=8, get_ply=True, Do_Get_Tri
 
         if get_ply:
             print("Converting point3d.bin to .ply, will happen only the first time you open the scene.")
+            os.makedirs(os.path.dirname(ply_path), exist_ok=True)
             storePly(ply_path, xyz, rgb)
         else:
             plydata = storePly(ply_path, xyz, rgb, False)

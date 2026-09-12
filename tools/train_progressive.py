@@ -46,6 +46,7 @@ from semantic_atdom.semantics.publication import (
     MapPublicationPolicy,
 )
 from semantic_atdom.semantics.schema import SemanticClassSpec
+from semantic_atdom.semantics.preflight import run_dataset_preflight
 from semantic_atdom.semantics.tdom import (
     SemanticTdomConfig,
     load_semantic_tdom_palette,
@@ -139,6 +140,11 @@ def GetArgs():
 def TrainingPreparation(args):
     TimeCost = {}
 
+    if args.enable_semantics and not str(args.semantic_data_root).strip():
+        raise ValueError(
+            "--semantic_data_root is required when --enable_semantics is set"
+        )
+
     # 输出训练日志
     os.makedirs(args.Model_Path_Dir, exist_ok=True)
 
@@ -167,6 +173,39 @@ def TrainingPreparation(args):
 
     # IM = [int(name) for name in os.listdir(args.Source_Path_Dir) if os.path.isdir(os.path.join(args.Source_Path_Dir, name))]
     IM = sorted(IM)
+    if not IM:
+        raise ValueError("no progressive stages match the requested range")
+    dataset_id = hashlib.sha256(
+        os.path.abspath(args.Source_Path_Dir).encode("utf-8")
+    ).hexdigest()[:16]
+    args.dataset_cache_root = os.path.join(
+        args.Model_Path_Dir, "cache", dataset_id
+    )
+    if args.enable_semantics:
+        preflight = run_dataset_preflight(
+            dataset_root=args.Source_Path_Dir,
+            semantic_data_root=args.semantic_data_root,
+            output_root=args.Model_Path_Dir,
+            start_stage=args.StartFromImageNo,
+            end_stage=args.EndAtImageNo,
+            image_folder_path=(args.Image_Folder_Path or None),
+        )
+        args.dataset_preflight_path = str(preflight.report_path)
+        args.dataset_preflight_sha256 = preflight.report_sha256
+        args.dataset_cache_root = str(preflight.report_path.parent)
+        args.semantic_authoritative_exact_complete = (
+            preflight.authoritative_exact_complete
+        )
+        print(
+            "Dataset preflight: stages={}..{}, labels_complete={}, "
+            "source_binding_complete={}, sha256={}".format(
+                preflight.selected_stages[0],
+                preflight.selected_stages[-1],
+                preflight.labels_complete,
+                preflight.source_binding_complete,
+                preflight.report_sha256,
+            )
+        )
     print(IM)
     source_path_list = [os.path.join(args.Source_Path_Dir, str(im)) for im in IM]
     model_path_list = [os.path.join(args.Model_Path_Dir, str(im)) for im in IM]
@@ -190,16 +229,6 @@ def TrainingPreparation(args):
           f"UseDepthLoss: {args.UseDepthLoss}, "
           f"UseScaleLoss: {args.UseScaleLoss}, "
           f"UseNormalLoss: {args.GetNormal}")
-
-    # 如果是重新开始，则需要将数据库中输出的一些中间文件删除
-    if args.ContinueFromImageNo == -1:
-        for path in source_path_list:
-            if os.path.exists(os.path.join(path, "args_output.txt")):
-                os.remove(os.path.join(path, "args_output.txt"))
-            if os.path.exists(os.path.join(path, "class_attributes.txt")):
-                os.remove(os.path.join(path, "class_attributes.txt"))
-            if os.path.exists(os.path.join(path, "sparse", "0", "points3D.ply")):
-                os.remove(os.path.join(path, "sparse", "0", "points3D.ply"))
 
     # 如果使用原本的学习率更新方法，则重新设置position_lr_max_step
     if not args.DifferentImagesLr:
@@ -615,7 +644,13 @@ class DataPreProccesser(mp.Process):
                                                              self.args.OriginImageHeight, self.args.OriginImageWidth,
                                                              get_ply=get_ply,
                                                              points_per_triangle=self.args.points_per_triangle,
-                                                             device="cuda", Diary=self.Diary, Silence=self.Silence, NewInputFormat=NewInputFormat)
+                                                             device="cuda", Diary=self.Diary, Silence=self.Silence, NewInputFormat=NewInputFormat,
+                                                             Ply_Cache_Path=os.path.join(
+                                                                 self.args.dataset_cache_root,
+                                                                 "point_cloud",
+                                                                 os.path.basename(self.args.source_path_second),
+                                                                 "points3D.ply",
+                                                             ))
 
         time1 = time.time()
         if scene_info.ply_path is not None:
@@ -1012,9 +1047,7 @@ class GaussianTrainer(mp.Process):
         if not self.args.enable_semantics:
             return
         try:
-            semantic_dataset_root = (
-                self.args.semantic_data_root or self.args.Source_Path_Dir
-            )
+            semantic_dataset_root = self.args.semantic_data_root
             semantic_root = os.path.join(semantic_dataset_root, "semantic")
             palette_path = self.args.semantic_tdom_palette_path
             if not palette_path:
@@ -1092,6 +1125,9 @@ class GaussianTrainer(mp.Process):
                 semantic_dataset_root=semantic_dataset_root,
                 publication_policy=self.semantic_publication_policy,
                 resume=not force_fresh,
+                final_authoritative_complete=(
+                    self.args.semantic_authoritative_exact_complete
+                ),
             )
             self.gaussians.set_topology_observer(
                 self.semantic_hook.apply_topology, owner=self.semantic_hook
@@ -1201,6 +1237,12 @@ class GaussianTrainer(mp.Process):
         # 设置初始场景的文件路径
         self.args.model_path = self.model_path_list[0] if self.args.ContinueFromImageNo == -1 else self.model_path_list[self.args.ContinueFromImageNo - self.args.StartFromImageNo]
         self.args.source_path = self.source_path_list[0] if self.args.ContinueFromImageNo == -1 else self.source_path_list[self.args.ContinueFromImageNo - self.args.StartFromImageNo]
+        self.args.point_cloud_cache_path = os.path.join(
+            self.args.dataset_cache_root,
+            "point_cloud",
+            os.path.basename(self.args.source_path),
+            "points3D.ply",
+        )
         # self.Diary.write(f"First scene source_path: {self.args.source_path}\nFirst scene model_path: {self.args.model_path}\n")
 
         # 初始化背景颜色
@@ -1401,6 +1443,13 @@ class GaussianTrainer(mp.Process):
                 "height_world": window.height_world,
             },
             "crs": grid.crs,
+            "dataset_preflight": {
+                "path": self.args.dataset_preflight_path,
+                "sha256": self.args.dataset_preflight_sha256,
+                "authoritative_exact_complete": (
+                    self.args.semantic_authoritative_exact_complete
+                ),
+            },
         }
 
     def _prepare_semantic_map_safely(self, training_type):

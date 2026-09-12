@@ -194,6 +194,12 @@ python tools/train_gui.py
   --GSD_y [float]
 ```
 
+Semantic progressive runs must also pass an explicit semantic delivery root,
+for example `--enable_semantics --semantic_data_root /path/to/delivery`. The
+root must contain `semantic/class_spec.json`, `semantic/labels/`, and
+`semantic/metadata/`. Inputs are preflighted read-only; generated point-cloud
+caches and the preflight report are written below `Model_Path_Dir/cache/`.
+
 <details>
 <summary><span style="font-weight: bold;">Necessary command Line Arguments for tools/train_gui.py</span></summary>
 

@@ -725,6 +725,26 @@ class ProgressiveSemanticHookTests(unittest.TestCase):
                 (root / "missing-output" / "final_rebuild_metrics.json").exists()
             )
 
+            unbound_hook = ProgressiveSemanticHook(
+                dataset,
+                OnlineSemanticOrchestrator(
+                    SemanticGaussianState.initialize(1, 2),
+                    dataset.class_spec,
+                    OnlineSemanticConfig(max_group_size=1),
+                ),
+                Projector(),
+                root / "unbound-output",
+                final_authoritative_complete=False,
+            )
+            unbound_result = unbound_hook.synchronize(
+                3,
+                [Camera("000001"), Camera("000002"), Camera("000003")],
+                Gaussians(),
+                root / "3",
+                final=True,
+            )
+            self.assertEqual(unbound_result.status, "exact_partial")
+
             failing_projector = Projector()
             failing_runner = OnlineSemanticOrchestrator(
                 SemanticGaussianState.initialize(1, 2),

@@ -55,6 +55,10 @@ from semantic_atdom.semantics.publication import (
     MapPublicationPolicy,
     publish_tdom_pair,
 )
+from semantic_atdom.semantics.preflight import (
+    DatasetPreflightResult,
+    run_dataset_preflight,
+)
 from semantic_atdom.semantics.cuda_observation import (
     CudaObservationStats,
     rasterize_semantic_observation,
@@ -98,6 +102,8 @@ __all__ = [
     "MapGridWindow",
     "MapPublicationPolicy",
     "publish_tdom_pair",
+    "DatasetPreflightResult",
+    "run_dataset_preflight",
     "CudaSemanticProjector",
     "OnlineSemanticConfig",
     "OnlineSemanticOrchestrator",

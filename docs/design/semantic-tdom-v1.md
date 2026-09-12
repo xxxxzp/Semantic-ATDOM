@@ -2,12 +2,14 @@
 
 ## 文档状态与权威范围
 
-- 状态：设计已确认，实现与端到端运行尚未验证。
-- 确认日期：2026-09-11。
+- 状态：设计已确认并实现；Phantom3 完整399张端到端运行已验证，最终质量状态为 `exact_partial`。
+- 确认日期：2026-09-12。
 - 语义方法版本：`g1-evidence-v2`。
 - 本文是 Semantic TDOM V1 数学、状态和产品行为的唯一权威合同。
 
 [全局认知](../project/global-context.md) 只维护稳定的项目入口、数据/环境事实和本文摘要；ADR 只解释为什么作出决定。其他文档中与本文冲突的公式或产品约定均由本文取代，尤其包括：
+
+完整运行的命令、指标、产物身份和未验证边界见 [Phantom3 Semantic A-TDOM V2 实验记录](../project/phantom3-semantic-atom-v2-result.md)。
 
 - 使用 `rho * (alpha / A)` 作为类别质量；
 - leave-one-group-out 共识仍包含 Dirichlet 先验；
@@ -549,7 +551,7 @@ semantic method/config versions
 
 ## 实施与验证门槛
 
-实现顺序必须是：
+本版本按以下顺序完成实现与验证：
 
 1. CPU/reference 数学与边界条件测试；
 2. state/schema/version 与旧状态拒绝测试；
@@ -560,8 +562,8 @@ semantic method/config versions
 7. 只读 dataset preflight/cache；
 8. 干净 `semantic-atdom` 环境中的真实 CUDA import；
 9. Phantom3 stage 30 到 31 smoke；
-10. Phantom3 stage 30 到 100 运行与资源 profile。
+10. Phantom3 完整399张运行与资源 profile。
 
-在 CPU 数学合同稳定前不得继续修改 CUDA。单元测试通过不等于端到端能力可运行；每项未完成验证必须显式标为“未验证”。
+CPU 数学合同先于 CUDA 实现稳定。单元测试不替代端到端运行；每项仍未完成的验证必须显式标为“未验证”。
 
-当前实现已经覆盖 evidence-conditioned numerator、prior-free LOO、三条件 gate、新 schema、投影专用 snapshot、固定本地网格、原子 RGB/Semantic pair 和独立 final rebuild。仍未完成的合同项是只读 dataset preflight、正式环境复现和 Phantom3 真实 CUDA 渐进验证；实施状态以 [全局认知](../project/global-context.md) 的当前状态表和 active plan 为准。
+当前实现已经覆盖 evidence-conditioned numerator、prior-free LOO、三条件 gate、新 schema、投影专用 snapshot、固定本地网格、原子 RGB/Semantic pair、独立 final rebuild 和只读 dataset preflight/cache。正式环境、真实 CUDA smoke 与 Phantom3 完整399张渐进运行均已验证；剩余边界以[全局认知](../project/global-context.md)和[完整实验记录](../project/phantom3-semantic-atom-v2-result.md)为准。

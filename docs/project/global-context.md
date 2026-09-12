@@ -2,8 +2,8 @@
 
 ## 文档状态
 
-- 状态：项目边界与 G1 Evidence V2 设计已确认；实现和端到端运行尚未验证。
-- 确认日期：2026-09-11。
+- 状态：G1 Evidence V2 已实现，并完成 Phantom3 全量训练、最终语义重建和 RGB/Semantic 成对发布验证。
+- 确认日期：2026-09-12。
 - 当前开发分支：`semantic/g1-evidence-v2`。
 - 适用范围：Semantic A-TDOM 的仓库治理、数据、环境、训练期语义主链路和产品状态。
 
@@ -35,7 +35,7 @@
 
 若旧研究文档、历史源码默认或注释与 G1 Evidence V2 合同冲突，以当前合同为准，并将旧内容标为 superseded，而不是维持两套“已确认”定义。
 
-Phantom3 交付规范仍含早期 `phantom3_test100`、102张和 semantic 同置布局示例；这些历史路径/计数不是当前运行默认。当前本机路径、stage 30→100 切片和外置 semantic root 以本文为准，交付规范需在独立文档维护任务中收敛。
+Phantom3 交付规范仍含早期 `phantom3_test100`、102张和 semantic 同置布局示例；这些只作为历史合同示例，不是当前运行默认。当前本机路径、完整399张运行和外置 semantic root 以本文及[完整实验记录](phantom3-semantic-atom-v2-result.md)为准。
 
 ## 项目与代码边界
 
@@ -82,17 +82,17 @@ RGB/SfM 数据根目录：/data3/xzp/data/Onthefly/phantom3
 ### CURRENT DECISION：验证切片
 
 - 初始化 stage 30。
-- 首个完整目标是 stage 30 到 stage 100。
+- stage 30 到 31 smoke 已通过。
+- 正式运行采用 `StartFromImageNo=30`、`EndAtImageNo=400`，完成最终集合399张；stage 编号不是已消费影像数。
 - “前100张”指 stage 100 注册集合，不指任意目录排序的前100个文件。
-- 首个 smoke 是 stage 30 到 stage 31；通过后才运行至 stage 100。
-- 完整399张数据暂不宣称受支持。
+- stage 30 到 100 是早期验证目标，已被本次完整399张实验覆盖。
 
 ### CURRENT STATUS：实际数据事实
 
 - `phantom3` 有数字阶段 3 到 400。
 - stage 100 的 ID 为 `000001..000100`。
 - 最终集合有399张，编号 `000001..000402`，缺少 `000384..000386`。
-- 后期阶段存在计数和累积性异常，当前入口没有完整防护。
+- 后期阶段存在非连续 image ID，但 preflight 按实际 camera/stage 集合核验并已通过完整运行。
 - 存储 RGB/label 为 1600×897；`cam_params.json` 原始 SfM 坐标为 1870×1049，两套坐标不能混用。
 - 当前语义交付有399份 label/metadata，没有 `scores/`。
 - 前100张 background 像素为0；全部399张只有 `000112.png` 含6038个 background 像素，约占总像素0.001054%。
@@ -156,13 +156,13 @@ RGB、SfM 和 semantic roots 是只读输入。派生 PLY、索引和转换结�
 
 ## 环境合同
 
-- `ATDOM_XZP` 只是 candidate migration baseline，不是正式环境。
-- 候选组合为 Python 3.10、PyTorch 2.4.0+cu121、CUDA 12.1、RTX 4090。
+- `ATDOM_XZP` 只是环境迁移来源，不是正式运行环境。
+- 已验证组合为 Python 3.10、PyTorch 2.4.0+cu121、CUDA 12.1、RTX 4090。
 - 正式环境名为 `semantic-atdom`。
 - 不能复制历史 editable package 或 CUDA 二进制；本地扩展必须从当前 `third_party/src` 构建。
 - `environment.yml` 在验证后成为可执行真源；重大依赖升级使用独立分支。
 
-环境只有在以下检查通过后才从 candidate 晋级：
+环境通过以下检查后从 candidate 晋级：
 
 1. 从 manifest 新建环境；
 2. editable install 与所有扩展均指向当前仓库；
@@ -174,9 +174,10 @@ RGB、SfM 和 semantic roots 是只读输入。派生 PLY、索引和转换结�
 
 ### CURRENT STATUS
 
-- 当前 `environment.yml` 仍描述旧 ATDOM/Python3.7/Torch1.12/CUDA11.6，不是正式合同。
-- 当前工作树含在建语义源码，但现有本地扩展尚未证明来自当前源码并具有所需 symbols。
-- 正式 `semantic-atdom` 尚未建立；端到端能力未验证。
+- 正式 `semantic-atdom` 已从当前 `environment.yml` 建立；editable package 和全部本地扩展指向当前仓库源码。
+- 真实 import、semantic CUDA symbols、CPU/schema/CUDA 测试和 stage 30→31 smoke 均已通过。
+- 完整399张训练、冻结几何精确语义重建及原子 RGB/Semantic pair 已完成；最终代码验证为141项测试通过。
+- 训练开始环境记录在输出根 `environment_fingerprint.json`；收尾代码和环境记录在 `final_environment_fingerprint.json`。
 
 ## G1 Evidence V2 摘要
 
@@ -192,7 +193,7 @@ RGB、SfM 和 semantic roots 是只读输入。派生 PLY、索引和转换结�
 - entropy、margin、mixture/group disagreement 和 variance proxy 分开输出，不参与 V1 gate。
 - variance 是包含先验、基于独立近似的未校准 proxy，不是分类错误概率。
 - clone/split 的硬不变量是拓扑前后渲染语义场连续；后代复制父状态只是待数值测试的 V2 初始近似。
-- online group disagreement 必须真实更新；支持不足时是 NaN，不是0。
+- online group disagreement 必须真实更新；最终重建中仅多组证据提供有效支持，局部支持不足的像素是 NaN，不是0，也不应使整幅诊断图失效。
 
 ## 在线、最终与地图产品
 
@@ -242,6 +243,7 @@ RGB/Semantic 产品使用共同 `projection_geometry_hash`，完整 RGB 另有 `
 - 当前未校准运行默认值为：地图每 1 个 stage 候选发布、sidecar 每 5 个 stage checkpoint、512 像素 tile、512 MiB CUDA headroom、8 GiB pair 输出上限、30 秒在线时间预算；final 总是尝试发布和 checkpoint。时间预算是 CUDA 调用边界上的 best-effort gate，不是对单个不可中断 kernel 的硬 deadline。
 - final exact rebuild 单独统计，不计入在线 SLO。
 - `lag<=1` 和具体耗时比例在真实 profile 前只是目标，不能写成已保证事实。
+- 本次完整运行的 final exact rebuild 用时307.408秒，峰值 CUDA allocation 约2.06 GiB；该数据只描述当前约48 GiB可见显存机器，不替代24 GiB目标硬件验证。
 
 ## 版本与实施状态
 
@@ -250,7 +252,7 @@ RGB/Semantic 产品使用共同 `projection_geometry_hash`，完整 RGB 另有 `
 - 旧 sidecar 不允许静默 resume，必须从对应几何和标签重建。
 - 旧产物保留时必须标为 superseded，不在原目录无提示覆盖。
 
-截至 2026-09-11：
+截至 2026-09-12：
 
 | 项目 | 状态 |
 |---|---|
@@ -261,14 +263,15 @@ RGB/Semantic 产品使用共同 `projection_geometry_hash`，完整 RGB 另有 `
 | G1 state/recovery/product schema | 已完成 |
 | CUDA V2 实现 | 已完成 |
 | online 状态与独立 final recovery | 已完成 |
-| fixed-grid paired publication | 已完成单元/集成边界测试，真实 Phantom3 CUDA 运行待 Task 9 |
-| read-only preflight/cache | 已完成；真实 stage 30→100 preflight 通过，source binding 仍未验证 |
-| 正式 `semantic-atdom` 环境 | 未建立 |
-| stage 30→31 / 30→100 | 未验证 |
+| fixed-grid paired publication | 已通过完整 Phantom3 CUDA 运行；最终 RGB/Semantic pair 及18项产品 hash 复算通过 |
+| read-only preflight/cache | 已完成；完整399张 preflight 通过，source binding 仍不完整 |
+| 正式 `semantic-atdom` 环境 | 已建立并完成来源 fingerprint |
+| stage 30→31 smoke | 已通过 |
+| 完整399张运行 | 已完成，最终状态 `exact_partial` |
 
-当前 product/scheduling 已建立固定本地网格、同一冻结快照的 RGB/Semantic 原子 pair、latest-wins 请求、投影专用轻量 snapshot，以及显式 stream/headroom/time/output/checkpoint 策略。训练前 preflight 会验证所选累积 stage、camera/RGB、overlap、label/metadata/hash，并将报告与派生 PLY 写入 output/cache；启用语义时不再允许隐式 semantic root。当前标签 source-image binding 未提供，因此开发运行最终只能标为 `exact_partial`。尚未完成的是正式环境重建和真实 Phantom3 CUDA 端到端验证；不声称实时预算或地图轴向已由实测校准。online group disagreement 在 exact rebuild 前明确为不可用而不是伪零。
+当前 product/scheduling 已建立固定本地网格、同一冻结快照的 RGB/Semantic 原子 pair、latest-wins 请求、投影专用轻量 snapshot，以及显式 stream/headroom/time/output/checkpoint 策略。训练前 preflight 会验证所选累积 stage、camera/RGB、overlap、label/metadata/hash，并将报告与派生 PLY 写入 output/cache；启用语义时不再允许隐式 semantic root。完整 Phantom3 运行已证明训练、最终重建和配对发布可执行。当前标签 source-image binding 不完整，因此最终状态诚实标为 `exact_partial`；仍不声称语义准确率、24 GiB资源预算、GIS坐标或准实时目标已经验证。
 
-实施任务与顺序见 [G1 Evidence V2 active plan](../../plans/active/2026-09-11-g1-evidence-v2.md)。在 CPU 数学合同稳定前不修改 CUDA。
+已完成的实施任务见 [G1 Evidence V2 completed plan](../../plans/completed/2026-09-11-g1-evidence-v2.md)，本次运行的命令、指标、产物身份和未验证项见 [Phantom3 Semantic A-TDOM V2 完整实验记录](phantom3-semantic-atom-v2-result.md)。
 
 ## 开始工作前检查
 
@@ -292,3 +295,4 @@ RGB/Semantic 产品使用共同 `projection_geometry_hash`，完整 RGB 另有 `
 - [Phantom3 标签交付规范](../design/phantom3-semantic-label-contract-v1.md)
 - [推荐技术路线](../research/semantic-atdom-recommended-route.md)
 - [2026 文献综述](../research/lightweight-semantic-3dgs-literature-review-2026.md)
+- [Phantom3 Semantic A-TDOM V2 完整实验记录](phantom3-semantic-atom-v2-result.md)

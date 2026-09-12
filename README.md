@@ -274,21 +274,28 @@ for each rendering based on the current scene scale.
 
 # Linux Env Setting
 
-If you are configuring the Python environment for **A-TDOM** on **Linux**,
-please use the following command directly:
+If you are configuring **Semantic A-TDOM** on Linux, create the pinned
+environment and build every local CUDA extension from this checkout:
 
 ```shell
-# Env
-cd .../A-TDOM
+cd .../Semantic-A-TDOM
 conda env create --file environment.yml
-conda activate ATDOM
-
-pip install pytorch3d
-pip install opencv-python
-pip install lpips
-pip install scikit-image
+conda activate semantic-atdom
+CUDA_HOME="$CONDA_PREFIX" TORCH_CUDA_ARCH_LIST=8.9 \
+  python -m pip install --no-build-isolation --no-deps \
+  third_party/src/diff-gaussian-rasterization
+CUDA_HOME="$CONDA_PREFIX" TORCH_CUDA_ARCH_LIST=8.9 \
+  python -m pip install --no-build-isolation --no-deps \
+  third_party/src/simple-knn
+CUDA_HOME="$CONDA_PREFIX" TORCH_CUDA_ARCH_LIST=8.9 \
+  python -m pip install --no-build-isolation --no-deps \
+  third_party/src/fused-ssim
 python -m pip install --no-deps -e .
 ```
+
+The editable install is required before running commands under `tools/`.
+`TORCH_CUDA_ARCH_LIST=8.9` is the pinned build target for the current RTX 4090
+development machine; change it only when intentionally targeting another GPU.
 
 # Linux Run
 

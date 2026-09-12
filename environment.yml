@@ -1,19 +1,36 @@
-name: ATDOM
+name: semantic-atdom
+variables:
+  PYTHONNOUSERSITE: "1"
+  PYTHONDONTWRITEBYTECODE: "1"
 channels:
+  - https://conda.anaconda.org/nvidia/label/cuda-12.1.0
+  - pytorch3d
   - pytorch
   - conda-forge
-  - defaults
 dependencies:
-  - cudatoolkit=11.6
+  - python=3.10
+  - pip>=24
+  - setuptools<68
+  - wheel
+  - ninja
+  - cmake
+  - pytorch=2.4.0
+  - torchvision=0.19.0
+  - torchaudio=2.4.0
+  - pytorch3d=0.7.8
+  - pytorch-cuda=12.1
+  - cuda-toolkit=12.1.0
+  - cuda-cccl=12.1.55
+  - numpy=1.26
+  - scipy
+  - scikit-image
+  - pillow
   - plyfile
-  - python=3.7.13
-  - pip=22.3.1
-  - pytorch=1.12.1
-  - torchaudio=0.12.1
-  - torchvision=0.13.1
-  - tifffile
   - tqdm
+  - matplotlib
+  - pyqt
+  - tensorboard
+  - tifffile
   - pip:
-    - third_party/src/diff-gaussian-rasterization
-    - third_party/src/simple-knn
-    - third_party/src/fused-ssim
+      - lpips==0.1.4
+      - opencv-python==4.10.0.84

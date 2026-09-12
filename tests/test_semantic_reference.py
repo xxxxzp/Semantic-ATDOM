@@ -38,6 +38,22 @@ class SemanticReferenceTests(unittest.TestCase):
         )
         torch.testing.assert_close(result.evidence_ratio, torch.tensor([0.75]))
 
+    def test_evidence_conditioning_clamps_float_roundoff_below_prior(self):
+        alpha = torch.full((1, 8), 0.125, dtype=torch.float32)
+        alpha[0, 0] -= 2 * torch.finfo(alpha.dtype).eps
+
+        result = evidence_conditioned_belief(alpha, prior_total=1.0)
+
+        self.assertEqual(float(result.evidence.min()), 0.0)
+        self.assertTrue(torch.isfinite(result.distribution).all())
+
+    def test_evidence_conditioning_rejects_material_mass_below_prior(self):
+        alpha = torch.full((1, 8), 0.125, dtype=torch.float32)
+        alpha[0, 0] -= 1e-3
+
+        with self.assertRaisesRegex(ValueError, "below its prior"):
+            evidence_conditioned_belief(alpha, prior_total=1.0)
+
     def test_full_footprint_observation_ignores_unknown_pixels(self):
         contributions = torch.tensor(
             [

@@ -239,6 +239,23 @@ def TrainingPreparation(args):
 
     return TimeCost, Diary, EvaluateDiary, GaussianDiary, ImagesAlreadyBeTrainedIterations, source_path_list, model_path_list, IM
 
+
+def copy_dataset_context(source_args, worker_args):
+    """Copy preflight/cache identity to an independently parsed worker."""
+    if not hasattr(source_args, "dataset_cache_root"):
+        raise AttributeError(
+            "source arguments have not completed TrainingPreparation"
+        )
+    context_fields = (
+        "dataset_cache_root",
+        "dataset_preflight_path",
+        "dataset_preflight_sha256",
+        "semantic_authoritative_exact_complete",
+    )
+    for field in context_fields:
+        if hasattr(source_args, field):
+            setattr(worker_args, field, getattr(source_args, field))
+
 def str2dict(str):
     replacestr = "{}\':,\n"
     for rstr in replacestr:
@@ -2377,6 +2394,9 @@ class On_the_Fly_GS:
         self.GaussianTrainer.ImagesAlreadyBeTrainedIterations = self.DataPreProccesser.ImagesAlreadyBeTrainedIterations
         self.GaussianTrainer.source_path_list = self.DataPreProccesser.source_path_list
         self.GaussianTrainer.model_path_list = self.DataPreProccesser.model_path_list
+        copy_dataset_context(
+            self.DataPreProccesser.args, self.GaussianTrainer.args
+        )
 
         self.DataSaver = DataSaver()
         self.DataSaver.DataSaver_queue = self.DataSaver_queue

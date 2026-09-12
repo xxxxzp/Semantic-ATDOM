@@ -78,7 +78,10 @@ def evidence_conditioned_belief(
 
     prior_per_class = prior_total / dirichlet_alpha.shape[1]
     evidence = dirichlet_alpha - prior_per_class
-    if bool((evidence < -eps).any()):
+    numerical_tolerance = max(
+        float(eps), float(torch.finfo(dirichlet_alpha.dtype).eps) * 8.0
+    )
+    if bool((evidence < -numerical_tolerance).any()):
         raise ValueError("dirichlet_alpha must not be below its prior")
     evidence = evidence.clamp_min(0.0)
     evidence_total = evidence.sum(dim=1)

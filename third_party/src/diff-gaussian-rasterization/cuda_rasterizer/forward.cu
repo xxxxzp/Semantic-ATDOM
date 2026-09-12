@@ -877,9 +877,10 @@ void FORWARD::semanticObservation(
 	float* evidence,
 	float* all_mass,
 	float* valid_mass,
-	float* dense_contributions)
+	float* dense_contributions,
+	cudaStream_t stream)
 {
-	semanticObservationCUDA<<<grid, block>>>(
+	semanticObservationCUDA<<<grid, block, 0, stream>>>(
 		ranges,
 		point_list,
 		P, W, H,
@@ -1024,9 +1025,10 @@ void FORWARD::semanticTdom(
 	int squared_feature_channel,
 	float* rendered_features,
 	float* coverage,
-	float* squared_moment)
+	float* squared_moment,
+	cudaStream_t stream)
 {
-	semanticTdomCUDA<<<grid, block>>>(
+	semanticTdomCUDA<<<grid, block, 0, stream>>>(
 		ranges,
 		point_list,
 		W,
@@ -1071,9 +1073,10 @@ void FORWARD::preprocess(int P, int D, int M,
 	uint32_t* tiles_touched,
 	bool prefiltered,
 	const bool* Render_Mask,
-	const bool Use_Render_Mask)
+	const bool Use_Render_Mask,
+	cudaStream_t stream)
 {
-	preprocessCUDA<NUM_CHAFFELS> << <(P + 255) / 256, 256 >> > (
+	preprocessCUDA<NUM_CHAFFELS> << <(P + 255) / 256, 256, 0, stream >> > (
 		P, D, M,
 		means3D,
 		scales,
@@ -1133,9 +1136,10 @@ void FORWARD::preprocess_TDOM(int P, int D, int M,
 	uint32_t* tiles_touched,
 	bool prefiltered,
 	const bool* Render_Mask,
-	const bool Use_Render_Mask)
+	const bool Use_Render_Mask,
+	cudaStream_t stream)
 {
-	preprocessCUDA_TDOM<NUM_CHAFFELS> << <(P + 255) / 256, 256 >> > (
+	preprocessCUDA_TDOM<NUM_CHAFFELS> << <(P + 255) / 256, 256, 0, stream >> > (
 		P, D, M,
 		means3D,
 		scales,

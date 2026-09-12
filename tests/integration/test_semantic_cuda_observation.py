@@ -230,6 +230,31 @@ class SemanticCudaObservationTests(unittest.TestCase):
         self.assertEqual(result.evidence.shape, (2, self.num_classes))
         self.assertEqual(result.all_mass.shape, (2,))
 
+    def test_non_default_stream_orders_semantic_outputs(self):
+        height = 2048
+        width = 2048
+        labels = torch.zeros((height, width), dtype=torch.int64)
+        labels[:, width // 2 :] = 1
+        boundary = torch.ones((height, width), dtype=torch.float32)
+        stream = torch.cuda.Stream()
+
+        with torch.cuda.stream(stream):
+            result = self._observe(
+                labels=labels,
+                boundary_weights=boundary,
+                return_dense_contributions=False,
+                debug=False,
+            )
+            observed_evidence = result.evidence.clone()
+            observed_mass = result.all_mass.clone()
+
+        stream.synchronize()
+        torch.cuda.synchronize()
+
+        torch.testing.assert_close(observed_evidence, result.evidence)
+        torch.testing.assert_close(observed_mass, result.all_mass)
+        self.assertGreater(float(observed_evidence.sum()), 0.0)
+
     def test_dense_test_output_is_size_guarded(self):
         with self.assertRaisesRegex(ValueError, "test-only"):
             self._observe(dense_element_limit=1)

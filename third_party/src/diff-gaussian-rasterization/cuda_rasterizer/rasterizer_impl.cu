@@ -631,6 +631,7 @@ int CudaRasterizer::Rasterizer::semanticObservation(
 	float* valid_mass,
 	float* dense_contributions,
 	int* radii,
+	cudaStream_t stream,
 	bool debug)
 {
 	const float focal_y = height / (2.0f * tan_fovy);
@@ -682,28 +683,32 @@ int CudaRasterizer::Rasterizer::semanticObservation(
 		geomState.tiles_touched,
 		false,
 		nullptr,
-		false), debug)
+		false,
+		stream), debug)
 
 	CHECK_CUDA(cub::DeviceScan::InclusiveSum(
 		geomState.scanning_space,
 		geomState.scan_size,
 		geomState.tiles_touched,
 		geomState.point_offsets,
-		P), debug)
+		P,
+		stream), debug)
 
 	int num_rendered;
-	CHECK_CUDA(cudaMemcpy(
+	CHECK_CUDA(cudaMemcpyAsync(
 		&num_rendered,
 		geomState.point_offsets + P - 1,
 		sizeof(int),
-		cudaMemcpyDeviceToHost), debug)
+		cudaMemcpyDeviceToHost,
+		stream), debug)
+	CHECK_CUDA(cudaStreamSynchronize(stream), debug)
 
 	size_t binning_chunk_size = required<BinningState>(num_rendered);
 	char* binning_chunkptr = binningBuffer(binning_chunk_size);
 	BinningState binningState =
 		BinningState::fromChunk(binning_chunkptr, num_rendered);
 
-	duplicateWithKeys<<<(P + 255) / 256, 256>>>(
+	duplicateWithKeys<<<(P + 255) / 256, 256, 0, stream>>>(
 		P,
 		geomState.means2D,
 		geomState.conic_opacity,
@@ -728,14 +733,16 @@ int CudaRasterizer::Rasterizer::semanticObservation(
 		binningState.point_list,
 		num_rendered,
 		0,
-		32 + bit), debug)
+		32 + bit,
+		stream), debug)
 
-	CHECK_CUDA(cudaMemset(
+	CHECK_CUDA(cudaMemsetAsync(
 		imgState.ranges,
 		0,
-		tile_grid.x * tile_grid.y * sizeof(uint2)), debug)
+		tile_grid.x * tile_grid.y * sizeof(uint2),
+		stream), debug)
 	if (num_rendered > 0)
-		identifyTileRanges<<<(num_rendered + 255) / 256, 256>>>(
+		identifyTileRanges<<<(num_rendered + 255) / 256, 256, 0, stream>>>(
 			num_rendered,
 			binningState.point_list_keys,
 			imgState.ranges);
@@ -758,7 +765,8 @@ int CudaRasterizer::Rasterizer::semanticObservation(
 		evidence,
 		all_mass,
 		valid_mass,
-		dense_contributions), debug)
+		dense_contributions,
+		stream), debug)
 
 	return num_rendered;
 }
@@ -792,6 +800,7 @@ int CudaRasterizer::Rasterizer::semanticTdom(
 	float* squared_moment,
 	int* radii,
 	const size_t max_binning_bytes,
+	cudaStream_t stream,
 	bool debug)
 {
 	const float focal_y = height / (2.0f * tan_fovy);
@@ -846,12 +855,13 @@ int CudaRasterizer::Rasterizer::semanticTdom(
 		geomState.tiles_touched,
 		false,
 		nullptr,
-		false), debug)
+		false,
+		stream), debug)
 
 	const uint32_t tile_y_min = output_y_start / BLOCK_Y;
 	const uint32_t tile_y_max =
 		(output_y_start + output_height + BLOCK_Y - 1) / BLOCK_Y;
-	restrictTileCountsToRows<<<(P + 255) / 256, 256>>>(
+	restrictTileCountsToRows<<<(P + 255) / 256, 256, 0, stream>>>(
 		P,
 		geomState.means2D,
 		radii,
@@ -866,14 +876,17 @@ int CudaRasterizer::Rasterizer::semanticTdom(
 		geomState.scan_size,
 		geomState.tiles_touched,
 		geomState.point_offsets,
-		P), debug)
+		P,
+		stream), debug)
 
 	int num_rendered;
-	CHECK_CUDA(cudaMemcpy(
+	CHECK_CUDA(cudaMemcpyAsync(
 		&num_rendered,
 		geomState.point_offsets + P - 1,
 		sizeof(int),
-		cudaMemcpyDeviceToHost), debug)
+		cudaMemcpyDeviceToHost,
+		stream), debug)
+	CHECK_CUDA(cudaStreamSynchronize(stream), debug)
 
 	size_t binning_chunk_size = required<BinningState>(num_rendered);
 	if (binning_chunk_size > max_binning_bytes)
@@ -885,7 +898,7 @@ int CudaRasterizer::Rasterizer::semanticTdom(
 	BinningState binningState =
 		BinningState::fromChunk(binning_chunkptr, num_rendered);
 
-	duplicateWithKeys<<<(P + 255) / 256, 256>>>(
+	duplicateWithKeys<<<(P + 255) / 256, 256, 0, stream>>>(
 		P,
 		geomState.means2D,
 		geomState.conic_opacity,
@@ -910,14 +923,16 @@ int CudaRasterizer::Rasterizer::semanticTdom(
 		binningState.point_list,
 		num_rendered,
 		0,
-		32 + bit), debug)
+		32 + bit,
+		stream), debug)
 
-	CHECK_CUDA(cudaMemset(
+	CHECK_CUDA(cudaMemsetAsync(
 		imgState.ranges,
 		0,
-		tile_count * sizeof(uint2)), debug)
+		tile_count * sizeof(uint2),
+		stream), debug)
 	if (num_rendered > 0)
-		identifyTileRanges<<<(num_rendered + 255) / 256, 256>>>(
+		identifyTileRanges<<<(num_rendered + 255) / 256, 256, 0, stream>>>(
 			num_rendered,
 			binningState.point_list_keys,
 			imgState.ranges);
@@ -943,7 +958,8 @@ int CudaRasterizer::Rasterizer::semanticTdom(
 		squared_feature_channel,
 		rendered_features,
 		coverage,
-		squared_moment), debug)
+		squared_moment,
+		stream), debug)
 
 	return num_rendered;
 }

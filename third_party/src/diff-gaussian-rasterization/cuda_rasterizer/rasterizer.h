@@ -15,6 +15,7 @@
 #include <vector>
 #include <functional>
 #include <cstdint>
+#include <cuda_runtime_api.h>
 
 namespace CudaRasterizer
 {
@@ -92,6 +93,7 @@ namespace CudaRasterizer
 			float* valid_mass,
 			float* dense_contributions,
 			int* radii,
+			cudaStream_t stream,
 			bool debug = false);
 
 		static int semanticTdom(
@@ -123,6 +125,7 @@ namespace CudaRasterizer
 			float* squared_moment,
 			int* radii,
 			const size_t max_binning_bytes,
+			cudaStream_t stream,
 			bool debug = false);
 
 		static void backward(

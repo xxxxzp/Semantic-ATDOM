@@ -1324,18 +1324,21 @@ class SemanticGaussianState:
         )
         tolerance = torch.finfo(self.dtype).eps * 8
         prior = self.prior()
-        if bool((self.alpha_raw - prior - self.open_raw_evidence < -tolerance).any()):
+        raw_residual = self.alpha_raw - prior - self.open_raw_evidence
+        if bool((raw_residual < -tolerance).any()):
             raise SemanticStateError(
-                "open raw evidence exceeds total data evidence"
+                "open raw evidence exceeds total data evidence "
+                "(minimum residual={}, tolerance={})".format(
+                    float(raw_residual.min().item()), float(tolerance)
+                )
             )
-        if bool(
-            (
-                self.alpha_robust
-                - prior
-                - self.open_robust_evidence
-                < -tolerance
-            ).any()
-        ):
+        robust_residual = (
+            self.alpha_robust - prior - self.open_robust_evidence
+        )
+        if bool((robust_residual < -tolerance).any()):
             raise SemanticStateError(
-                "open robust evidence exceeds total data evidence"
+                "open robust evidence exceeds total data evidence "
+                "(minimum residual={}, tolerance={})".format(
+                    float(robust_residual.min().item()), float(tolerance)
+                )
             )

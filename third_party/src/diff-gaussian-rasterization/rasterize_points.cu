@@ -11,6 +11,7 @@
 
 #include <math.h>
 #include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
 #include <cstdio>
 #include <sstream>
 #include <iostream>
@@ -277,6 +278,7 @@ RasterizeSemanticObservationCUDA(
 
 	if (P != 0 && H != 0 && W != 0)
 	{
+		cudaStream_t stream = at::cuda::getCurrentCUDAStream(means3D.get_device());
 		torch::Tensor dummy_colors = torch::zeros({P, 3}, float_opts);
 		auto byte_opts = means3D.options().dtype(torch::kUInt8);
 		torch::Tensor geomBuffer = torch::empty({0}, byte_opts);
@@ -314,6 +316,7 @@ RasterizeSemanticObservationCUDA(
 			valid_mass.data_ptr<float>(),
 			return_dense ? dense.data_ptr<float>() : nullptr,
 			radii.data_ptr<int>(),
+			stream,
 			debug);
 	}
 
@@ -420,6 +423,7 @@ RasterizeSemanticTdomRegionCUDA(
 		{P}, means3D.options().dtype(torch::kInt32));
 	if (P != 0)
 	{
+		cudaStream_t stream = at::cuda::getCurrentCUDAStream(means3D.get_device());
 		auto byte_opts = means3D.options().dtype(torch::kUInt8);
 		torch::Tensor geomBuffer = torch::empty({0}, byte_opts);
 		torch::Tensor binningBuffer = torch::empty({0}, byte_opts);
@@ -452,6 +456,7 @@ RasterizeSemanticTdomRegionCUDA(
 				? squared_moment.data_ptr<float>() : nullptr,
 			radii.data_ptr<int>(),
 			static_cast<size_t>(max_binning_bytes),
+			stream,
 			debug);
 	}
 	return std::make_tuple(

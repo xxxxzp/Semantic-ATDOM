@@ -273,6 +273,11 @@ def _semantic_render_features(
     group_disagreement = semantic_state.group_variance.detach().to(
         device=device, dtype=torch.float32
     ).sum(dim=1).clamp(min=0.0, max=2.0)
+    group_count = semantic_state.group_count.detach().to(device=device)
+    group_eligible = group_count >= 2
+    if not semantic_state.group_disagreement_available:
+        group_eligible = torch.zeros_like(group_eligible)
+    group_support = evidence_ratio * group_eligible.to(dtype=torch.float32)
     prior_regularized_mean = alpha / (concentration.unsqueeze(1) + eps)
     prior_regularized_variance_proxy = (
         (1.0 - prior_regularized_mean.square().sum(dim=1)).clamp_min(0.0)
@@ -282,7 +287,8 @@ def _semantic_render_features(
         (
             evidence_ratio,
             evidence_ratio * probability_second_moment,
-            evidence_ratio * group_disagreement,
+            group_support * group_disagreement,
+            group_support,
             evidence_ratio.square() * prior_regularized_variance_proxy,
         ),
         dim=1,
@@ -303,10 +309,10 @@ def finalize_semantic_tdom(
 ) -> SemanticTdomResult:
     """Normalize composited evidence and apply an explainable unknown gate.
 
-    ``rendered_features`` accepts the legacy ``K + 1`` layout or the enhanced
-    ``K + 4`` layout. Enhanced scalar channels contain the weighted probability
-    second moment, flight-group disagreement and the squared-weight propagated
-    Dirichlet trace-variance numerator, respectively.
+    ``rendered_features`` accepts the legacy ``K + 1`` layout, the deprecated
+    ``K + 4`` enhanced layout, or the current ``K + 5`` enhanced layout. The
+    current layout adds an independent valid-support denominator for
+    flight-group disagreement.
     """
     config = config or SemanticTdomConfig()
     rendered_features = rendered_features.detach()
@@ -314,14 +320,18 @@ def finalize_semantic_tdom(
         device=rendered_features.device, dtype=rendered_features.dtype
     )
     class_count = class_spec.num_classes
-    valid_channel_counts = (class_count + 1, class_count + 4)
+    valid_channel_counts = (
+        class_count + 1,
+        class_count + 4,
+        class_count + 5,
+    )
     if (
         rendered_features.ndim != 3
         or rendered_features.shape[0] not in valid_channel_counts
     ):
         raise ValueError(
             "rendered_features must have shape [num_classes + 1, H, W] "
-            "or [num_classes + 4, H, W]"
+            "or an enhanced [num_classes + 4|5, H, W] layout"
         )
     if coverage.shape != rendered_features.shape[1:]:
         raise ValueError("coverage must have shape [H, W]")
@@ -336,7 +346,7 @@ def finalize_semantic_tdom(
             raise ValueError("coverage must be finite and non-negative")
 
     numerator = rendered_features[:class_count]
-    # A view would retain the complete K+4 allocation after finalization.
+    # A view would retain the complete enhanced allocation after finalization.
     absolute_support = rendered_features[class_count].clone()
     probabilities = numerator / (absolute_support.unsqueeze(0) + config.eps)
     probability_sum = probabilities.sum(dim=0, keepdim=True)
@@ -359,19 +369,31 @@ def finalize_semantic_tdom(
     entropy_scale = math.log(class_count) if class_count > 1 else 1.0
     normalized_entropy = entropy / entropy_scale
 
-    enhanced = rendered_features.shape[0] == class_count + 4
+    enhanced_channels = rendered_features.shape[0] - class_count
+    enhanced = enhanced_channels in (4, 5)
     if enhanced:
         weighted_second_moment = rendered_features[class_count + 1]
         mixture_disagreement = (
             weighted_second_moment / (absolute_support + config.eps)
             - probabilities.square().sum(dim=0)
         ).clamp(min=0.0, max=1.0)
-        group_disagreement = (
-            rendered_features[class_count + 2]
-            / (absolute_support + config.eps)
-        ).clamp(min=0.0, max=2.0)
+        if enhanced_channels == 5:
+            group_support = rendered_features[class_count + 3]
+            group_disagreement = (
+                rendered_features[class_count + 2]
+                / (group_support + config.eps)
+            ).clamp(min=0.0, max=2.0)
+            group_evidence = group_support > config.eps
+            variance_index = class_count + 4
+        else:
+            group_disagreement = (
+                rendered_features[class_count + 2]
+                / (absolute_support + config.eps)
+            ).clamp(min=0.0, max=2.0)
+            group_evidence = absolute_support > config.eps
+            variance_index = class_count + 3
         prior_regularized_variance_proxy = (
-            rendered_features[class_count + 3]
+            rendered_features[variance_index]
             / (absolute_support.square() + config.eps)
         ).clamp(min=0.0, max=1.0)
     else:
@@ -428,7 +450,7 @@ def finalize_semantic_tdom(
             semantic_evidence, mixture_disagreement, undefined
         )
         group_disagreement = torch.where(
-            semantic_evidence, group_disagreement, undefined
+            group_evidence, group_disagreement, undefined
         )
         prior_regularized_variance_proxy = torch.where(
             semantic_evidence,
@@ -598,10 +620,11 @@ def rasterize_semantic_tdom(
         raise ValueError("semantic state and geometry Gaussian counts differ")
     if semantic_state.num_classes != class_spec.num_classes:
         raise ValueError("semantic state and class spec widths differ")
-    # K class numerators plus support and three scalar uncertainty moments.
-    feature_channels = class_spec.num_classes + 4
+    # K class numerators plus support, two mixture/group numerators, a local
+    # group-validity denominator and the squared-weight variance feature.
+    feature_channels = class_spec.num_classes + 5
     if feature_channels > 20:
-        raise ValueError("Semantic TDOM currently supports at most 16 classes")
+        raise ValueError("Semantic TDOM currently supports at most 15 classes")
     image_height = int(camera.image_height)
     image_width = int(camera.image_width)
     pixel_count = image_height * image_width
@@ -720,12 +743,12 @@ def rasterize_semantic_tdom(
                     *arguments,
                     int(output_y_start),
                     int(output_height),
-                    int(class_spec.num_classes + 3),
+                    int(class_spec.num_classes + 4),
                     int(max_binning_bytes),
                     bool(debug),
                 )
             )
-            rendered[class_spec.num_classes + 3].copy_(variance_numerator)
+            rendered[class_spec.num_classes + 4].copy_(variance_numerator)
             end_event.record()
             end_event.synchronize()
             raster_cuda_seconds += (

@@ -72,6 +72,7 @@ class RepositoryLayoutTests(unittest.TestCase):
 
     def test_supported_tools_have_explicit_names(self):
         supported = {
+            "capture_environment.py",
             "train_progressive.py",
             "train_windowed.py",
             "train_gui.py",

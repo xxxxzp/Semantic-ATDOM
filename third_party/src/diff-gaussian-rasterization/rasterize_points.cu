@@ -114,6 +114,7 @@ RasterizeGaussiansCUDA(
   int num_buckets = 0;
   if(P != 0)
   {
+	  cudaStream_t stream = at::cuda::getCurrentCUDAStream(means3D.get_device());
 	  int M = 0;
 	  if(sh.size(0) != 0)
 	  {
@@ -154,7 +155,8 @@ RasterizeGaussiansCUDA(
 		get_normal,
 		debug,
 		Use_Render_Mask,
-		TDOM);
+		TDOM,
+		stream);
 		
 		rendered = std::get<0>(tup);
 		num_buckets = std::get<1>(tup);

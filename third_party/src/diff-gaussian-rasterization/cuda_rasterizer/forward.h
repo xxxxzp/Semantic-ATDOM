@@ -109,7 +109,8 @@ namespace FORWARD
 		float* out_depth,
 		float* out_depth_Hard,
 		float* rendered_normal,
-		const bool Use_Render_Mask);
+		const bool Use_Render_Mask,
+		cudaStream_t stream);
 
 	// Forward-only semantic observation. Replays the same alpha-T traversal as
 	// RGB rendering and accumulates directly into per-Gaussian statistics.

@@ -418,7 +418,8 @@ std::tuple<int,int> CudaRasterizer::Rasterizer::forward(
 	bool get_normal,
 	bool debug,
 	bool Use_Render_Mask,
-	bool TDOM)
+	bool TDOM,
+	cudaStream_t stream)
 {
 	const float focal_y = height / (2.0f * tan_fovy);
 	const float focal_x = width / (2.0f * tan_fovx);
@@ -475,7 +476,8 @@ std::tuple<int,int> CudaRasterizer::Rasterizer::forward(
 		geomState.tiles_touched,
 		prefiltered,
 		Render_Mask, // 该掩膜用于判断哪一些像素需要被渲染
-		Use_Render_Mask
+		Use_Render_Mask,
+		stream
 	), debug)
 	}
 	else{
@@ -507,17 +509,19 @@ std::tuple<int,int> CudaRasterizer::Rasterizer::forward(
 		geomState.tiles_touched,
 		prefiltered,
 		Render_Mask, // 该掩膜用于判断哪一些像素需要被渲染
-		Use_Render_Mask
+		Use_Render_Mask,
+		stream
 	), debug)
 	}
 
 	// Compute prefix sum over full list of touched tile counts by Gaussians
 	// E.g., [2, 3, 0, 2, 1] -> [2, 5, 5, 7, 8]
-	CHECK_CUDA(cub::DeviceScan::InclusiveSum(geomState.scanning_space, geomState.scan_size, geomState.tiles_touched, geomState.point_offsets, P), debug)
+	CHECK_CUDA(cub::DeviceScan::InclusiveSum(geomState.scanning_space, geomState.scan_size, geomState.tiles_touched, geomState.point_offsets, P, stream), debug)
 
 	// Retrieve total number of Gaussian instances to launch and resize aux buffers
 	int num_rendered;
-	CHECK_CUDA(cudaMemcpy(&num_rendered, geomState.point_offsets + P - 1, sizeof(int), cudaMemcpyDeviceToHost), debug);
+	CHECK_CUDA(cudaMemcpyAsync(&num_rendered, geomState.point_offsets + P - 1, sizeof(int), cudaMemcpyDeviceToHost, stream), debug);
+	CHECK_CUDA(cudaStreamSynchronize(stream), debug);
 
 	size_t binning_chunk_size = required<BinningState>(num_rendered);
 	char* binning_chunkptr = binningBuffer(binning_chunk_size);
@@ -525,7 +529,7 @@ std::tuple<int,int> CudaRasterizer::Rasterizer::forward(
 
 	// For each instance to be rendered, produce adequate [ tile | depth ] key 
 	// and corresponding dublicated Gaussian indices to be sorted
-	duplicateWithKeys << <(P + 255) / 256, 256 >> > (
+	duplicateWithKeys << <(P + 255) / 256, 256, 0, stream >> > (
 		P,
 		geomState.means2D,
 		geomState.conic_opacity,
@@ -548,13 +552,13 @@ std::tuple<int,int> CudaRasterizer::Rasterizer::forward(
 		binningState.sorting_size,
 		binningState.point_list_keys_unsorted, binningState.point_list_keys,
 		binningState.point_list_unsorted, binningState.point_list,
-		num_rendered, 0, 32 + bit), debug)
+		num_rendered, 0, 32 + bit, stream), debug)
 
-	CHECK_CUDA(cudaMemset(imgState.ranges, 0, tile_grid.x * tile_grid.y * sizeof(uint2)), debug);
+	CHECK_CUDA(cudaMemsetAsync(imgState.ranges, 0, tile_grid.x * tile_grid.y * sizeof(uint2), stream), debug);
 
 	// Identify start and end of per-tile workloads in sorted list
 	if (num_rendered > 0)
-		identifyTileRanges << <(num_rendered + 255) / 256, 256 >> > (
+		identifyTileRanges << <(num_rendered + 255) / 256, 256, 0, stream >> > (
 			num_rendered,
 			binningState.point_list_keys,
 			imgState.ranges);
@@ -562,10 +566,11 @@ std::tuple<int,int> CudaRasterizer::Rasterizer::forward(
 
  	// bucket count
 	int num_tiles = tile_grid.x * tile_grid.y;
-	perTileBucketCount<<<(num_tiles + 255) / 256, 256>>>(num_tiles, imgState.ranges, imgState.bucket_count);
-	CHECK_CUDA(cub::DeviceScan::InclusiveSum(imgState.bucket_count_scanning_space, imgState.bucket_count_scan_size, imgState.bucket_count, imgState.bucket_offsets, num_tiles), debug)
+	perTileBucketCount<<<(num_tiles + 255) / 256, 256, 0, stream>>>(num_tiles, imgState.ranges, imgState.bucket_count);
+	CHECK_CUDA(cub::DeviceScan::InclusiveSum(imgState.bucket_count_scanning_space, imgState.bucket_count_scan_size, imgState.bucket_count, imgState.bucket_offsets, num_tiles, stream), debug)
 	unsigned int bucket_sum;
-	CHECK_CUDA(cudaMemcpy(&bucket_sum, imgState.bucket_offsets + num_tiles - 1, sizeof(unsigned int), cudaMemcpyDeviceToHost), debug);
+	CHECK_CUDA(cudaMemcpyAsync(&bucket_sum, imgState.bucket_offsets + num_tiles - 1, sizeof(unsigned int), cudaMemcpyDeviceToHost, stream), debug);
+	CHECK_CUDA(cudaStreamSynchronize(stream), debug);
 	// create a state to store. size is number is the total number of buckets * block_size
 	size_t sample_chunk_size = required<SampleState>(bucket_sum);
 	char* sample_chunkptr = sampleBuffer(sample_chunk_size);
@@ -597,9 +602,10 @@ std::tuple<int,int> CudaRasterizer::Rasterizer::forward(
 		out_depth,
 		out_depth_Hard,
 		rendered_normal,
-		Use_Render_Mask), debug)
+		Use_Render_Mask,
+		stream), debug)
 
-	CHECK_CUDA(cudaMemcpy(imgState.pixel_colors, out_color, sizeof(float) * width * height * NUM_CHAFFELS, cudaMemcpyDeviceToDevice), debug);
+	CHECK_CUDA(cudaMemcpyAsync(imgState.pixel_colors, out_color, sizeof(float) * width * height * NUM_CHAFFELS, cudaMemcpyDeviceToDevice, stream), debug);
 	return std::make_tuple(num_rendered, bucket_sum);
 }
 

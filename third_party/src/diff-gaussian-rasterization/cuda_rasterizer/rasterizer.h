@@ -63,7 +63,8 @@ namespace CudaRasterizer
 			bool get_normal = false,
 			bool debug = false,
 			bool Use_Render_Mask = false,
-			bool TDOM = false);
+			bool TDOM = false,
+			cudaStream_t stream = nullptr);
 
 		static int semanticObservation(
 			std::function<char* (size_t)> geometryBuffer,

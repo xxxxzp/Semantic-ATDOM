@@ -735,9 +735,10 @@ void FORWARD::render(
 	float* out_depth,
 	float* out_depth_Hard,
 	float* rendered_normal,
-	const bool Use_Render_Mask)
+	const bool Use_Render_Mask,
+	cudaStream_t stream)
 {
-	renderCUDA<NUM_CHAFFELS, 3> << <grid, block >> > (
+	renderCUDA<NUM_CHAFFELS, 3> << <grid, block, 0, stream >> > (
 		ranges,
 		point_list,
 		per_tile_bucket_offset, bucket_to_tile,

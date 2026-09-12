@@ -180,9 +180,10 @@ class FinalSemanticRebuilder:
         state.group_variance = disagreement
         state.group_count = group_count
         state.semantic_support = semantic_support
-        state.group_disagreement_available = bool(
-            ((group_count == 0) | (group_count >= 2)).all()
-        )
+        # Availability is local to the Gaussian/pixel support. A few
+        # single-group Gaussians must not suppress the diagnostic everywhere;
+        # they are excluded by the dedicated support channel at render time.
+        state.group_disagreement_available = bool((group_count >= 2).any())
         state.mark_historical_evidence_current()
         state.mark_dirty()
         state._validate()

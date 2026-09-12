@@ -185,6 +185,30 @@ class SemanticTdomTests(unittest.TestCase):
             result.prior_regularized_variance_proxy, torch.tensor([[0.125]])
         )
 
+    def test_group_disagreement_uses_only_multi_group_support(self):
+        # Current K+5 layout: class numerators, semantic support, mixture
+        # moment, group numerator, group-valid support and variance proxy.
+        rendered = torch.tensor(
+            [
+                [[0.60, 0.60]],
+                [[0.40, 0.40]],
+                [[1.00, 1.00]],
+                [[0.52, 0.52]],
+                [[0.40, 0.00]],
+                [[0.50, 0.00]],
+                [[0.10, 0.10]],
+            ]
+        )
+        result = finalize_semantic_tdom(
+            rendered, torch.ones((1, 2)), CLASS_SPEC
+        )
+
+        torch.testing.assert_close(
+            result.group_disagreement[0, 0], torch.tensor(0.8)
+        )
+        self.assertTrue(torch.isnan(result.group_disagreement[0, 1]))
+        self.assertFalse(torch.isnan(result.entropy[0, 1]))
+
     def test_group_disagreement_keeps_full_trace_range(self):
         rendered = torch.tensor(
             [
@@ -207,6 +231,8 @@ class SemanticTdomTests(unittest.TestCase):
         state = SemanticGaussianState.initialize(1, 2)
         state.add_evidence(torch.tensor([[1.0, 1.0]]))
         state.group_variance[0] = torch.tensor([0.8, 0.8])
+        state.group_count[0] = 2
+        state.group_disagreement_available = True
 
         features = _semantic_render_features(
             state, torch.device("cpu"), use_robust=True, eps=1e-8
@@ -216,6 +242,11 @@ class SemanticTdomTests(unittest.TestCase):
         self.assertAlmostEqual(
             float(features[0, CLASS_SPEC.num_classes + 2]),
             evidence_ratio * 1.6,
+            places=6,
+        )
+        self.assertAlmostEqual(
+            float(features[0, CLASS_SPEC.num_classes + 3]),
+            evidence_ratio,
             places=6,
         )
 

@@ -94,6 +94,57 @@ class SemanticCudaTdomTests(unittest.TestCase):
         self.assertEqual(tuple(result["render"].shape), (3, 16, 16))
         self.assertTrue(bool(torch.isfinite(result["render"]).all()))
 
+    def test_rgb_tdom_honors_non_default_pytorch_stream(self):
+        class Gaussians:
+            active_sh_degree = 0
+            max_sh_degree = 0
+            _xyz = torch.tensor(
+                [[0.0, 0.0, 2.0]], dtype=torch.float32, device="cuda"
+            )
+            _features_dc = torch.ones(
+                (1, 1, 3), dtype=torch.float32, device="cuda"
+            )
+            _features_rest = torch.zeros(
+                (1, 0, 3), dtype=torch.float32, device="cuda"
+            )
+            _opacity = torch.full(
+                (1, 1), 3.0, dtype=torch.float32, device="cuda"
+            )
+            _scaling = torch.zeros(
+                (1, 3), dtype=torch.float32, device="cuda"
+            )
+            _rotation = torch.tensor(
+                [[1.0, 0.0, 0.0, 0.0]],
+                dtype=torch.float32,
+                device="cuda",
+            )
+
+        camera = DummyCamera(
+            np.eye(3, dtype=np.float32),
+            np.zeros(3, dtype=np.float32),
+            1.0,
+            1.0,
+            256,
+            256,
+        )
+        snapshot = FrozenGaussianSnapshot(Gaussians())
+        stream = torch.cuda.Stream()
+        with torch.cuda.stream(stream):
+            snapshot.wait_ready(stream)
+            rendered = render(
+                camera,
+                snapshot,
+                DummyPipeline(),
+                torch.zeros(3, dtype=torch.float32, device="cuda"),
+                Render_Mask=torch.ones(
+                    1, dtype=torch.bool, device="cuda"
+                ),
+                TDOM=True,
+            )["render"].clone()
+        stream.synchronize()
+
+        self.assertGreater(float(rendered.max().item()), 0.0)
+
     def test_high_level_renderer_enforces_memory_budget(self):
         class Gaussians:
             get_xyz = torch.zeros((1, 3), dtype=torch.float32, device="cuda")
@@ -122,6 +173,56 @@ class SemanticCudaTdomTests(unittest.TestCase):
                 spec,
                 config=SemanticTdomConfig(max_output_bytes=1),
             )
+
+    def test_high_level_group_disagreement_has_local_valid_support(self):
+        class Gaussians:
+            get_xyz = torch.tensor(
+                [[0.0, 0.0, 2.0]], dtype=torch.float32, device="cuda"
+            )
+            get_opacity = torch.tensor(
+                [[0.9]], dtype=torch.float32, device="cuda"
+            )
+            get_scaling = torch.ones(
+                (1, 3), dtype=torch.float32, device="cuda"
+            )
+            get_rotation = torch.tensor(
+                [[1.0, 0.0, 0.0, 0.0]],
+                dtype=torch.float32,
+                device="cuda",
+            )
+
+        state = SemanticGaussianState.initialize(1, 2, device="cuda")
+        state.add_evidence(torch.tensor([[4.0, 1.0]], device="cuda"))
+        state.group_variance[0] = torch.tensor([0.1, 0.1], device="cuda")
+        state.group_count[0] = 2
+        state.group_disagreement_available = True
+        camera = DummyCamera(
+            np.eye(3, dtype=np.float32),
+            np.zeros(3, dtype=np.float32),
+            1.0,
+            1.0,
+            64,
+            64,
+        )
+
+        result = rasterize_semantic_tdom(
+            Gaussians(),
+            state,
+            camera,
+            self._two_class_spec(),
+            config=SemanticTdomConfig(
+                min_free_cuda_bytes=0, save_diagnostics=True
+            ),
+        )
+        valid = torch.isfinite(result.group_disagreement)
+
+        self.assertTrue(bool(valid.any()))
+        torch.testing.assert_close(
+            result.group_disagreement[valid],
+            torch.full_like(result.group_disagreement[valid], 0.2),
+            atol=1e-5,
+            rtol=1e-5,
+        )
 
     def test_high_level_exact_stripes_match_full_frame(self):
         class Gaussians:

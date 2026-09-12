@@ -248,6 +248,19 @@ E^{robust}_g=\sum_hr_{hg}E_{hg}
 - 少于两个达到有效支持的闭合组时，分歧为 NaN，不得以0表示“完全一致”；
 - final exact rebuild 使用全部有效组重新计算权威统计。
 
+像素级组间分歧必须有独立于总语义支持的有效支持分母。令
+`m_g=1` 表示高斯 `g` 至少有两个有效闭合组，否则为0，并令
+`b^group_pg=b_pg m_g`，则：
+
+\[
+D^{group}_p=
+\frac{\sum_g b^{group}_{pg}D^{group}_g}
+{\sum_g b^{group}_{pg}+\epsilon}
+\]
+
+当分母为0时输出 NaN。单组高斯既不能用伪零稀释已有分歧，也不能
+因为局部不满足条件而使整张地图的组间分歧失效。
+
 manifest 必须将该层标记为 `online_estimate` 或 `exact_final`。
 
 ## 高斯拓扑变化

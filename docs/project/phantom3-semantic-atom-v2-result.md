@@ -76,14 +76,9 @@ hash、alignment hash、字节数以及最终 latest 指针，结果均通过。
 1.28 GB，整个正式输出根约12 GiB。消费者必须以
 `Map_Products/latest.json` 为准，不应按目录名猜测最终产品。
 
-旧的局部错误结果已保留在：
-
-```text
-/data3/xzp/data/Onthefly/outputs/semantic_atom_v2_invalid_local_20260914
-```
-
-该目录仅供故障复盘，不是有效实验结果。其根因是 `Use_Tri_Mask=False` 同时关闭了
-增量采样元数据，导致渐进阶段无法加入新高斯；旧图只有144/399个相机中心落入范围。
+旧的局部错误结果及本轮产生的 rebuild/smoke/debug 输出已于2026-09-14清理，
+不再保留对应目录。其根因记录仍保留：`Use_Tri_Mask=False` 曾同时关闭增量采样
+元数据，导致渐进阶段无法加入新高斯；旧图只有144/399个相机中心落入范围。
 
 ## 时间与资源
 

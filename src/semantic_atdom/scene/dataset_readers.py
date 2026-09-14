@@ -752,13 +752,21 @@ def SingleImage_readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder,
             image = Image.open(image_path)
             # print(image_path)
 
-            if Do_Get_Tri_Mask:
-                Tri_Mask, point3D_ids, xys, tri = Get_Tri_Mask(extr, width, height, True, Silence=Silence, No_Key_Region=No_Key_Region)
-                point3D_ids_list[image_name] = point3D_ids
-                xys_list[image_name] = xys
-                tri_list[image_name] = tri
-            else:
-                Tri_Mask = None
+            # Progressive Gaussian expansion always needs the sparse 2D/3D
+            # correspondences and triangulation.  Do_Get_Tri_Mask controls
+            # only whether the resulting mask is applied to RGB training.
+            sampling_mask, point3D_ids, xys, tri = Get_Tri_Mask(
+                extr,
+                width,
+                height,
+                True,
+                Silence=Silence,
+                No_Key_Region=No_Key_Region,
+            )
+            point3D_ids_list[image_name] = point3D_ids
+            xys_list[image_name] = xys
+            tri_list[image_name] = tri
+            Tri_Mask = sampling_mask if Do_Get_Tri_Mask else None
 
         else:
             image = None

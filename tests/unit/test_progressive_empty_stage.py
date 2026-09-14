@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 import numpy as np
+from PIL import Image
 
 from semantic_atdom.scene import dataset_readers
 from tools.train_progressive import DataPreProccesser
@@ -19,6 +20,59 @@ class _RecordingQueue:
 
 
 class ProgressiveEmptyStageTests(unittest.TestCase):
+    def test_progressive_sampling_metadata_does_not_require_training_mask(self):
+        extrinsic = SimpleNamespace(
+            camera_id=1,
+            qvec=np.array([1.0, 0.0, 0.0, 0.0]),
+            tvec=np.zeros(3),
+            name="000031.png",
+        )
+        intrinsic = SimpleNamespace(
+            id=1,
+            model="PINHOLE",
+            width=4,
+            height=3,
+            params=np.array([2.0, 2.0, 2.0, 1.5]),
+        )
+        point_ids = np.array([7, 8, 9], dtype=np.int64)
+        image_points = np.array(
+            [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]], dtype=np.float64
+        )
+        triangulation = SimpleNamespace(
+            simplices=np.array([[0, 1, 2]], dtype=np.int64)
+        )
+        sampling_mask = np.ones((3, 4), dtype=bool)
+
+        with tempfile.TemporaryDirectory() as root:
+            Image.new("RGB", (4, 3)).save(f"{root}/000031.png")
+            with mock.patch.object(
+                dataset_readers,
+                "Get_Tri_Mask",
+                return_value=(
+                    sampling_mask,
+                    point_ids,
+                    image_points,
+                    triangulation,
+                ),
+            ) as get_tri_mask:
+                cameras, ids, xys, triangles = (
+                    dataset_readers.SingleImage_readColmapCameras(
+                        {1: extrinsic},
+                        {1: intrinsic},
+                        root,
+                        Do_Get_Tri_Mask=False,
+                        CurrentImagesNames=["000030"],
+                        Silence=True,
+                    )
+                )
+                cameras[0].image.close()
+
+        get_tri_mask.assert_called_once()
+        self.assertIsNone(cameras[0].Tri_Mask)
+        np.testing.assert_array_equal(ids["000031"], point_ids)
+        np.testing.assert_array_equal(xys["000031"], image_points)
+        self.assertIs(triangles["000031"], triangulation)
+
     def test_sparse_reader_accepts_checkpoint_with_no_new_images(self):
         with tempfile.TemporaryDirectory() as root:
             with mock.patch.object(

@@ -176,7 +176,7 @@ RGB、SfM 和 semantic roots 是只读输入。派生 PLY、索引和转换结�
 
 - 正式 `semantic-atdom` 已从当前 `environment.yml` 建立；editable package 和全部本地扩展指向当前仓库源码。
 - 真实 import、semantic CUDA symbols、CPU/schema/CUDA 测试和 stage 30→31 smoke 均已通过。
-- 完整399张训练、冻结几何精确语义重建及原子 RGB/Semantic pair 已完成；最终代码验证为141项测试通过。
+- 完整399张训练、冻结几何精确语义重建及原子 RGB/Semantic pair 已完成；修复局部地图和大图 RGB OOM 后，最终代码验证为143项测试通过。
 - 训练开始环境记录在输出根 `environment_fingerprint.json`；收尾代码和环境记录在 `final_environment_fingerprint.json`。
 
 ## G1 Evidence V2 摘要
@@ -243,7 +243,7 @@ RGB/Semantic 产品使用共同 `projection_geometry_hash`，完整 RGB 另有 `
 - 当前未校准运行默认值为：地图每 1 个 stage 候选发布、sidecar 每 5 个 stage checkpoint、512 像素 tile、512 MiB CUDA headroom、8 GiB pair 输出上限、30 秒在线时间预算；final 总是尝试发布和 checkpoint。时间预算是 CUDA 调用边界上的 best-effort gate，不是对单个不可中断 kernel 的硬 deadline。
 - final exact rebuild 单独统计，不计入在线 SLO。
 - `lag<=1` 和具体耗时比例在真实 profile 前只是目标，不能写成已保证事实。
-- 本次完整运行的 final exact rebuild 用时307.408秒，峰值 CUDA allocation 约2.06 GiB；该数据只描述当前约48 GiB可见显存机器，不替代24 GiB目标硬件验证。
+- 修复后的完整运行中，final exact rebuild 用时111.338秒，峰值 CUDA allocation 约3.15 GB；该数据来自可用显存高于单卡24 GB基线的机器，不替代24 GB目标硬件验证。
 
 ## 版本与实施状态
 
@@ -252,7 +252,7 @@ RGB/Semantic 产品使用共同 `projection_geometry_hash`，完整 RGB 另有 `
 - 旧 sidecar 不允许静默 resume，必须从对应几何和标签重建。
 - 旧产物保留时必须标为 superseded，不在原目录无提示覆盖。
 
-截至 2026-09-12：
+截至 2026-09-14：
 
 | 项目 | 状态 |
 |---|---|
@@ -263,13 +263,13 @@ RGB/Semantic 产品使用共同 `projection_geometry_hash`，完整 RGB 另有 `
 | G1 state/recovery/product schema | 已完成 |
 | CUDA V2 实现 | 已完成 |
 | online 状态与独立 final recovery | 已完成 |
-| fixed-grid paired publication | 已通过完整 Phantom3 CUDA 运行；最终 RGB/Semantic pair 及18项产品 hash 复算通过 |
+| fixed-grid paired publication | 已通过完整 Phantom3 CUDA 运行；分片 RGB/Semantic 最终 pair 与15个历史阶段的完整 hash 链复算通过 |
 | read-only preflight/cache | 已完成；完整399张 preflight 通过，source binding 仍不完整 |
 | 正式 `semantic-atdom` 环境 | 已建立并完成来源 fingerprint |
-| stage 30→31 smoke | 已通过 |
-| 完整399张运行 | 已完成，最终状态 `exact_partial` |
+| stage 30→31 smoke | 已在最终修复提交上通过，最终 `lag=0` |
+| 完整399张运行 | 已完成；942,438个高斯，9216×11264全局地图，最终状态 `exact_partial` |
 
-当前 product/scheduling 已建立固定本地网格、同一冻结快照的 RGB/Semantic 原子 pair、latest-wins 请求、投影专用轻量 snapshot，以及显式 stream/headroom/time/output/checkpoint 策略。训练前 preflight 会验证所选累积 stage、camera/RGB、overlap、label/metadata/hash，并将报告与派生 PLY 写入 output/cache；启用语义时不再允许隐式 semantic root。完整 Phantom3 运行已证明训练、最终重建和配对发布可执行。当前标签 source-image binding 不完整，因此最终状态诚实标为 `exact_partial`；仍不声称语义准确率、24 GiB资源预算、GIS坐标或准实时目标已经验证。
+当前 product/scheduling 已建立固定本地网格、同一冻结快照的 RGB/Semantic 原子 pair、latest-wins 请求、投影专用轻量 snapshot，以及显式 stream/headroom/time/output/checkpoint 策略。训练前 preflight 会验证所选累积 stage、camera/RGB、overlap、label/metadata/hash，并将报告与派生 PLY 写入 output/cache；启用语义时不再允许隐式 semantic root。`Use_Tri_Mask` 只控制训练 mask，不能再关闭渐进采样元数据；大图 RGB 与 semantic 均使用分片 TDOM 渲染。修复后的完整 Phantom3 运行已证明全局渐进建图、训练、最终重建和配对发布可执行。当前标签 source-image binding 不完整，因此最终状态诚实标为 `exact_partial`；仍不声称语义准确率、24 GB资源预算、GIS坐标或准实时目标已经验证。
 
 已完成的实施任务见 [G1 Evidence V2 completed plan](../../plans/completed/2026-09-11-g1-evidence-v2.md)，本次运行的命令、指标、产物身份和未验证项见 [Phantom3 Semantic A-TDOM V2 完整实验记录](phantom3-semantic-atom-v2-result.md)。
 

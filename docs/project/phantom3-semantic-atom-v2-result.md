@@ -2,21 +2,22 @@
 
 ## 实验身份
 
-- 日期：2026-09-12
+- 日期：2026-09-14
 - 数据：`/home/xuzipeng/code/Semantic-A-TDOM/datas/phantom3`
   （指向 `/data3/xzp/data/Onthefly/phantom3`）
 - 语义标签：`/data3/xzp/data/Onthefly/semantic_labels`
-- 输出根：`/data3/xzp/data/Onthefly/outputs/semantic_atom_v2`
+- 正式输出根：`/data3/xzp/data/Onthefly/outputs/semantic_atom_v2`
 - 环境：`semantic-atdom`
-- 训练开始代码：`c6ca96b98b454710297c386f84dc4d7ecce779b9`
-- 最终发布修复代码：`847525cb96e3c7f7eaee9b32b31e40c03fd18019`
+- 采样/地图范围修复：`f6bfe42f`（`fix: decouple progressive sampling from training masks`）
+- 大图 RGB 分片修复：`b8635fcf`（`fix: tile paired RGB TDOM publication`）
 - 原始 A-TDOM 参考：`e50a5f7986664ca97b135c066b4cd462eb0bb4bf`
   （tracked 内容未修改）
 
 正式运行使用：
 
 ```shell
-CUDA_VISIBLE_DEVICES=1 python tools/train_progressive.py \
+CUDA_VISIBLE_DEVICES=0 conda run --no-capture-output -n semantic-atdom \
+  python tools/train_progressive.py \
   --Source_Path_Dir /home/xuzipeng/code/Semantic-A-TDOM/datas/phantom3 \
   --Model_Path_Dir /data3/xzp/data/Onthefly/outputs/semantic_atom_v2 \
   --StartFromImageNo 30 --EndAtImageNo 400 \
@@ -30,30 +31,36 @@ CUDA_VISIBLE_DEVICES=1 python tools/train_progressive.py \
   --render_TDOM --enable_semantics \
   --semantic_data_root /data3/xzp/data/Onthefly/semantic_labels \
   --semantic_tdom_save_diagnostics \
+  --semantic_tdom_render_tile_rows 512 \
   --semantic_checkpoint_interval 5 \
   --semantic_map_publication_interval 10 \
   --NoDebug
 ```
 
+`Use_Tri_Mask` 保持关闭。修复后的实现无论是否使用三角形训练 mask，都会生成
+增量采样需要的 `point3D_ids/xys/tri` 元数据；该参数只控制训练 mask，不再错误地
+控制新高斯初始化。
+
 ## 完成结果
 
 - 进程正常退出，日志终止标记为 `All Done!!!`。
-- 最终训练迭代：79,800；高斯数：538,792。
+- 最终训练迭代：79,800；高斯数：942,438。
 - 399/399 张相机完成完整 RGB 评测和最终渲染。
-- RGB：L1 0.0668768，PSNR 21.7285 dB，SSIM 0.7553775，
-  LPIPS 0.4240095。
+- RGB：L1 0.0174595，PSNR 31.3079 dB，SSIM 0.937277，
+  LPIPS 0.184639。
 - 最终精确语义重建使用399张标签、180个观测组，状态为
-  `exact_partial`，`lag=0`，无 error、无 deferred image。
+  `exact_partial`，`semantic_through_image=000402`，`lag=0`，无 error、
+  无 deferred image；posterior 为 `robust_exact_final`。
 - `exact_partial` 的唯一已知原因是现有标签 metadata 缺少完整 RGB
   source-image hash binding；不是标签缺失、重建失败或在线 fallback。
-- 最终地图为 4608×6144；RGB/Semantic 使用同一 `grid_id`、
-  `projection_geometry_hash` 和冻结几何快照。
-- 最终 RGB TDOM 非空：uint8 范围 0–255，均值 25.5115。
-- 最终 hard semantic map 输出类别1–7，unknown 像素为0。各类像素数：
-  bare soil 4,989,302；building 6,094,787；vegetation 6,898,206；
-  paved area 8,558,344；vehicle 103,257；water 688,406；road 979,250。
-- group disagreement 使用独立的多组有效支持，状态为 `exact_rebuild`；
-  解码范围 0–0.473617，均值 0.138917。
+- 最终地图为 9216×11264，固定网格世界范围约 221.092×270.224，
+  有效 GSD 约 0.023990×0.023990。全部399个相机中心均落入地图范围。
+- RGB/Semantic 使用同一 `grid_id`、`projection_geometry_hash` 和冻结几何快照。
+- 最终产品包含 RGB TDOM、hard/color/unknown 语义结果，以及 coverage、
+  evidence support、support ratio、entropy、Top-1、margin、mixture/group
+  disagreement 和 variance proxy 诊断。
+- 下采样人工查看确认 RGB 与 semantic 均覆盖完整航测区域，不再是早期错误运行的
+  局部 4608×6144 区域。
 
 最终权威入口是：
 
@@ -63,43 +70,50 @@ CUDA_VISIBLE_DEVICES=1 python tools/train_progressive.py \
 ```
 
 最终 `pair_manifest.json` SHA-256 为
-`feba6e634168eb1ac83a4f8f26203e3b8d20ba2731087ac676d4cdf73966b7ab`。
-清单中18项产品/子清单 hash 全部复算通过。输出根约6.0 GiB；其中包含
-准备阶段的 smoke/debug 子目录，消费者必须以 `Map_Products/latest.json`
-为准，不应按目录名猜测最终产品。
+`352c42b750b6082b7eb0f22894d4d30d7f2f4926da3edba53b85c20e92debefb`。
+正式输出包含15个历史发布阶段；逐阶段复算16项产品 hash、两份子 manifest
+hash、alignment hash、字节数以及最终 latest 指针，结果均通过。最终产品数据约
+1.28 GB，整个正式输出根约12 GiB。消费者必须以
+`Map_Products/latest.json` 为准，不应按目录名猜测最终产品。
+
+旧的局部错误结果已保留在：
+
+```text
+/data3/xzp/data/Onthefly/outputs/semantic_atom_v2_invalid_local_20260914
+```
+
+该目录仅供故障复盘，不是有效实验结果。其根因是 `Use_Tri_Mask=False` 同时关闭了
+增量采样元数据，导致渐进阶段无法加入新高斯；旧图只有144/399个相机中心落入范围。
 
 ## 时间与资源
 
-- 初始几何训练：13.750 s。
-- 增量几何训练：614.912 s，记录的均摊时间为 1.541 s/image。
-- 最终几何精修：35.130 s。
-- 冻结几何全量语义重建：307.408 s，其中投影 298.087 s、读取标签
-  8.689 s、融合 0.426 s；语义重建峰值 CUDA allocation 约2.06 GiB。
-- 最终评测约7分36秒；最终399张渲染约22秒。
-- 本次机器报告为 NVIDIA GeForce RTX 4090、CUDA 12.1、PyTorch 2.4.0，
-  可见显存约48 GiB。该实测不能替代24 GiB目标硬件上的资源验证。
+- 初始几何训练：16.192 s。
+- 增量几何训练：859.108 s，记录的均摊时间为 2.153 s/image。
+- 最终几何精修：47.353 s。
+- 冻结几何全量语义重建：111.338 s，其中投影 101.603 s、读取标签
+  8.759 s、融合 0.749 s；峰值 CUDA allocation 约3.15 GB。
+- 最终399张评测约7分33秒。
+- 该实测所在机器向任务暴露的可用显存高于单卡24 GB基线，不能替代24 GB
+  RTX 4090上的资源验证。
 
-## 运行中发现并关闭的问题
+## 修复和验证
 
-1. RGB rasterizer 原先把部分 kernel/CUB/memcpy 固定到默认 CUDA stream，
-   而 paired publisher 在非默认低优先级 stream 上运行，导致 RGB TDOM
-   间歇性全黑。修复后整个 RGB forward 使用 PyTorch current stream；新增
-   非默认 stream CUDA 回归测试，并从同一最终 checkpoint 原子重发 pair。
-2. 仅有单组观测的少量高斯曾使整张 group disagreement 被标为不可用。
-   修复后分歧有独立有效支持分母：单组高斯不贡献伪零，仅无多组支持的
-   像素为 NaN。几何、类别 posterior 和 hard semantic map 均未改变。
-3. 仓库结构测试的支持工具白名单遗漏 `capture_environment.py`，已补齐
-   显式登记，没有放宽目录约束。
-
-最终代码验证为141项测试全部通过，覆盖 CPU/schema、CUDA observation、
-Semantic TDOM、非默认 stream、拓扑同步、final rebuild、原子 pair 发布和
-仓库结构。
+1. 渐进采样元数据已与 `Use_Tri_Mask` 解耦；新增回归测试保证关闭训练 mask 时
+   仍生成 `point3D_ids/xys/tri`，而 `Tri_Mask` 保持 `None`。
+2. paired RGB TDOM 改为与 semantic TDOM 相同的纵向分片渲染路径，避免
+   9216×11264 全图一次性 rasterize 导致 CUDA OOM。CUDA 集成测试比较分片与
+   全图 RGB（含非黑背景），结果在容差内一致；调度单测覆盖分片路由。
+3. 小范围 stage 30→31 smoke 在相同提交和环境下正常结束，最终产品
+   4608×5632、`lag=0`、无 error/deferred，并成功保存 checkpoint 和点云。
+4. 完整399张训练在同一代码上正常结束；stage 280 已成功发布
+   7680×11264 中间 pair，最终发布 9216×11264，证明大图 RGB 分片修复实际生效。
+5. 代码测试共143项全部通过；`python -m compileall -q src`、
+   `git diff --check` 和正式产物完整性检查均通过。
 
 ## 仍未验证
 
 - 标签 source-image binding 尚不完整，因此不能升级为 `exact_final`。
 - 当前地图是无 GIS CRS 的局部固定网格，不能宣称地理坐标已校准。
-- 24 GiB RTX 4090 目标硬件上的峰值显存和准实时预算尚未实测。
+- 24 GB RTX 4090目标硬件上的峰值显存和准实时预算尚未实测。
 - 本次只证明训练、重建、配对渲染与产品完整性；语义准确率、阈值优劣和
-  SAM 标签质量尚未评测。unknown=0 也不是语义质量充分的证据，后续仍需
-  结合标注或人工抽检校准 support gate。
+  SAM 标签质量尚未评测，后续仍需结合标注或人工抽检校准 support gate。

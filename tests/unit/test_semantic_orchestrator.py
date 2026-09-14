@@ -527,7 +527,10 @@ class ProgressiveSemanticHookTests(unittest.TestCase):
             with patch(
                 "semantic_atdom.semantics.orchestrator.rasterize_semantic_tdom",
                 return_value=semantic_result,
-            ):
+            ), patch(
+                "semantic_atdom.semantics.orchestrator.rasterize_rgb_tdom_striped",
+                return_value=torch.tensor([[[0.0]], [[0.5]], [[1.0]]]),
+            ) as striped_rgb:
                 result = hook.synchronize(
                     1,
                     [Camera()],
@@ -557,7 +560,7 @@ class ProgressiveSemanticHookTests(unittest.TestCase):
                     rgb_renderer=rgb_renderer,
                     rgb_pipeline=Pipeline(),
                     rgb_background=torch.zeros(3),
-                    semantic_config=SemanticTdomConfig(),
+                    semantic_config=SemanticTdomConfig(render_tile_rows=16),
                 )
                 second_result = hook.synchronize(
                     2,
@@ -578,7 +581,8 @@ class ProgressiveSemanticHookTests(unittest.TestCase):
             self.assertEqual(result.publication_status, "complete")
             self.assertEqual(second_result.publication_status, "complete")
             self.assertEqual(rendered_models[0], frozen)
-            self.assertEqual(len(rendered_models), 2)
+            self.assertEqual(len(rendered_models), 1)
+            striped_rgb.assert_called_once()
             self.assertEqual(
                 pair["projection_geometry_hash"],
                 frozen.semantic_projection_sha256(),

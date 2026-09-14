@@ -252,6 +252,140 @@ def _empty_uncertainty(reference: torch.Tensor) -> torch.Tensor:
     return torch.full_like(reference, float("nan"))
 
 
+@torch.no_grad()
+def rasterize_rgb_tdom_striped(
+    gaussians,
+    camera,
+    background: torch.Tensor,
+    config: SemanticTdomConfig,
+    scale_modifier: float = 1.0,
+    debug: bool = False,
+) -> torch.Tensor:
+    """Render the paired RGB TDOM in exact horizontal stripes.
+
+    The regular RGB rasterizer allocates binning and image buffers for the
+    complete orthographic map.  Once a progressive flight expands beyond the
+    initial local block, those buffers can exceed the available CUDA memory.
+    This path uses the same front-to-back alpha compositing as the Semantic
+    TDOM tile kernel and transfers each completed stripe to CPU immediately.
+    """
+    from diff_gaussian_rasterization import _C
+    from semantic_atdom.utils.sh_utils import eval_sh
+
+    if not hasattr(_C, "semantic_tdom_tile"):
+        raise RuntimeError(
+            "diff_gaussian_rasterization must be rebuilt with exact tiled "
+            "TDOM support"
+        )
+    means3d = gaussians.get_xyz.detach().to(dtype=torch.float32).contiguous()
+    if not means3d.is_cuda:
+        raise ValueError("RGB TDOM geometry must be on CUDA")
+    if background.numel() != 3:
+        raise ValueError("RGB TDOM background must contain three channels")
+    background = background.detach().to(
+        device=means3d.device, dtype=torch.float32
+    ).reshape(3)
+
+    image_height = int(camera.image_height)
+    image_width = int(camera.image_width)
+    if image_height <= 0 or image_width <= 0:
+        raise ValueError("RGB TDOM dimensions must be positive")
+
+    features = gaussians.get_features
+    shs_view = features.transpose(1, 2).reshape(
+        -1, 3, (int(gaussians.max_sh_degree) + 1) ** 2
+    )
+    directions = means3d - camera.camera_center.reshape(1, 3)
+    directions = directions / directions.norm(dim=1, keepdim=True)
+    colors = torch.clamp_min(
+        eval_sh(int(gaussians.active_sh_degree), shs_view, directions) + 0.5,
+        0.0,
+    ).to(dtype=torch.float32).contiguous()
+
+    opacities = gaussians.get_opacity.detach().to(
+        dtype=torch.float32
+    ).contiguous()
+    scales = gaussians.get_scaling.detach().to(dtype=torch.float32).contiguous()
+    rotations = gaussians.get_rotation.detach().to(
+        dtype=torch.float32
+    ).contiguous()
+    empty = torch.empty(0, dtype=torch.float32, device=means3d.device)
+    viewmatrix = camera.world_view_transform.detach().to(
+        device=means3d.device, dtype=torch.float32
+    ).contiguous()
+    projmatrix = camera.full_proj_transform.detach().to(
+        device=means3d.device, dtype=torch.float32
+    ).contiguous()
+    campos = camera.camera_center.detach().to(
+        device=means3d.device, dtype=torch.float32
+    ).contiguous()
+
+    # Release cached full-frame publication buffers before sizing the striped
+    # renderer.  Live tensors are unaffected.
+    with torch.cuda.device(means3d.device):
+        torch.cuda.empty_cache()
+        free_cuda_bytes, _ = torch.cuda.mem_get_info()
+    capacity_bytes = min(
+        int(config.max_output_bytes),
+        int(free_cuda_bytes) - int(config.min_free_cuda_bytes),
+    )
+    gaussian_bytes = means3d.shape[0] * (3 + 32) * 4
+    binning_reserve_bytes = max(128 * 1024**2, means3d.shape[0] * 128)
+    fixed_bytes = gaussian_bytes + binning_reserve_bytes
+    bytes_per_output_row = 5 * image_width * 4
+    max_rows_by_budget = int(
+        (capacity_bytes - fixed_bytes) // bytes_per_output_row
+    )
+    max_rows_by_budget = (max_rows_by_budget // 16) * 16
+    requested_rows = config.render_tile_rows or image_height
+    tile_rows = min(requested_rows, image_height, max_rows_by_budget)
+    if tile_rows < image_height:
+        tile_rows = (tile_rows // 16) * 16
+    if tile_rows <= 0:
+        raise ValueError(
+            "RGB TDOM has insufficient memory for one 16-row render tile"
+        )
+
+    output = torch.empty(
+        (3, image_height, image_width), dtype=torch.float32, device="cpu"
+    )
+    tan_fovx = float(math.tan(camera.FoVx * 0.5))
+    tan_fovy = float(math.tan(camera.FoVy * 0.5))
+    for output_y_start in range(0, image_height, tile_rows):
+        output_height = min(tile_rows, image_height - output_y_start)
+        tile_output_bytes = 5 * output_height * image_width * 4
+        max_binning_bytes = max(
+            0, capacity_bytes - gaussian_bytes - tile_output_bytes
+        )
+        rendered, coverage, radii, squared_moment = _C.semantic_tdom_tile(
+            means3d,
+            opacities,
+            scales,
+            rotations,
+            float(scale_modifier),
+            empty,
+            colors,
+            viewmatrix,
+            projmatrix,
+            tan_fovx,
+            tan_fovy,
+            campos,
+            image_height,
+            image_width,
+            int(output_y_start),
+            int(output_height),
+            -1,
+            int(max_binning_bytes),
+            bool(debug),
+        )
+        rendered.add_((1.0 - coverage).unsqueeze(0) * background[:, None, None])
+        output[:, output_y_start : output_y_start + output_height].copy_(
+            rendered.cpu()
+        )
+        del rendered, coverage, radii, squared_moment
+    return output
+
+
 def _semantic_render_features(
     semantic_state,
     device: torch.device,

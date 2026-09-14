@@ -43,6 +43,7 @@ from semantic_atdom.semantics.publication import (
 )
 from semantic_atdom.semantics.tdom import (
     SemanticTdomConfig,
+    rasterize_rgb_tdom_striped,
     rasterize_semantic_tdom,
 )
 from semantic_atdom.utils.image_utils import tdom_to_uint8
@@ -1504,17 +1505,26 @@ class ProgressiveSemanticHook:
                 return result._replace(
                     publication_status="skipped_time_budget"
                 )
-            render_mask = torch.ones(
-                1, dtype=torch.bool, device=request.rgb_background.device
-            )
-            rgb_result = request.rgb_renderer(
-                request.camera,
-                gaussians,
-                request.rgb_pipeline,
-                request.rgb_background,
-                Render_Mask=render_mask,
-                TDOM=True,
-            )["render"]
+            if config.render_tile_rows:
+                rgb_result = rasterize_rgb_tdom_striped(
+                    gaussians,
+                    request.camera,
+                    request.rgb_background,
+                    config,
+                    debug=bool(getattr(request.rgb_pipeline, "debug", False)),
+                )
+            else:
+                render_mask = torch.ones(
+                    1, dtype=torch.bool, device=request.rgb_background.device
+                )
+                rgb_result = request.rgb_renderer(
+                    request.camera,
+                    gaussians,
+                    request.rgb_pipeline,
+                    request.rgb_background,
+                    Render_Mask=render_mask,
+                    TDOM=True,
+                )["render"]
             rgb_image = tdom_to_uint8(rgb_result)
             del rgb_result
             alignment = _tdom_alignment(request.camera, request.alignment)

@@ -11,6 +11,7 @@ from semantic_atdom.semantics.schema import SemanticClassSpec
 from semantic_atdom.semantics.state import SemanticGaussianState
 from semantic_atdom.semantics.tdom import (
     SemanticTdomConfig,
+    rasterize_rgb_tdom_striped,
     rasterize_semantic_tdom,
 )
 
@@ -93,6 +94,67 @@ class SemanticCudaTdomTests(unittest.TestCase):
 
         self.assertEqual(tuple(result["render"].shape), (3, 16, 16))
         self.assertTrue(bool(torch.isfinite(result["render"]).all()))
+
+    def test_striped_rgb_tdom_matches_full_frame(self):
+        class Gaussians:
+            active_sh_degree = 0
+            max_sh_degree = 0
+            _xyz = torch.tensor(
+                [[0.0, 0.0, 1.0], [0.15, -0.1, 2.0]],
+                dtype=torch.float32,
+                device="cuda",
+            )
+            _features_dc = torch.tensor(
+                [[[0.2, 0.4, 0.6]], [[0.7, 0.3, 0.1]]],
+                dtype=torch.float32,
+                device="cuda",
+            )
+            _features_rest = torch.zeros(
+                (2, 0, 3), dtype=torch.float32, device="cuda"
+            )
+            _opacity = torch.tensor(
+                [[1.0], [0.5]], dtype=torch.float32, device="cuda"
+            )
+            _scaling = torch.full(
+                (2, 3), -1.0, dtype=torch.float32, device="cuda"
+            )
+            _rotation = torch.tensor(
+                [[1.0, 0.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0]],
+                dtype=torch.float32,
+                device="cuda",
+            )
+
+        camera = DummyCamera(
+            np.eye(3, dtype=np.float32),
+            np.zeros(3, dtype=np.float32),
+            1.0,
+            1.0,
+            16,
+            32,
+        )
+        snapshot = FrozenGaussianSnapshot(Gaussians())
+        snapshot.wait_ready()
+        background = torch.tensor(
+            [0.1, 0.2, 0.3], dtype=torch.float32, device="cuda"
+        )
+        full = render(
+            camera,
+            snapshot,
+            DummyPipeline(),
+            background,
+            Render_Mask=torch.ones(1, dtype=torch.bool, device="cuda"),
+            TDOM=True,
+        )["render"]
+        striped = rasterize_rgb_tdom_striped(
+            snapshot,
+            camera,
+            background,
+            SemanticTdomConfig(render_tile_rows=16, min_free_cuda_bytes=0),
+        )
+
+        self.assertEqual(tuple(striped.shape), (3, 32, 16))
+        self.assertEqual(striped.device.type, "cpu")
+        torch.testing.assert_close(striped, full.cpu(), atol=1e-5, rtol=1e-5)
 
     def test_rgb_tdom_honors_non_default_pytorch_stream(self):
         class Gaussians:

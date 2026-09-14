@@ -129,6 +129,12 @@ class FinalSemanticRebuilderTests(unittest.TestCase):
             result.state.alpha_raw, torch.tensor([[2.5, 1.5]])
         )
         self.assertEqual(result.state.group_count.item(), 3)
+        torch.testing.assert_close(
+            result.state.group_variance,
+            torch.tensor([[2.0 / 9.0, 2.0 / 9.0]]),
+        )
+        self.assertTrue(result.state.group_disagreement_available)
+        self.assertFalse(result.state.historical_evidence_stale)
         self.assertLess(result.state.alpha_robust[0, 1].item(), 1.5)
         self.assertGreater(result.state.alpha_robust[0, 1].item(), 0.5)
         self.assertEqual(len(result.ledger.entries), 3)

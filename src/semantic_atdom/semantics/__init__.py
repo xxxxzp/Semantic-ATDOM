@@ -12,15 +12,18 @@ from semantic_atdom.semantics.schema import (
     sha256_file,
 )
 from semantic_atdom.semantics.reference import (
+    EvidenceBelief,
     GroupStats,
     ObservationStats,
     RobustPosterior,
     SemanticRender,
     aggregate_observation_group,
+    evidence_conditioned_belief,
     exact_robust_posterior,
     footprint_observation,
     render_semantic_tdom,
 )
+from semantic_atdom.semantics.provenance import SEMANTIC_METHOD_VERSION
 from semantic_atdom.semantics.state import (
     SemanticGaussianState,
     SemanticStateError,
@@ -76,11 +79,13 @@ __all__ = [
     "SemanticSyncResult",
     "label_boundary_weights",
     "CudaObservationStats",
+    "EvidenceBelief",
     "GroupStats",
     "ObservationStats",
     "RobustPosterior",
     "SemanticRender",
     "aggregate_observation_group",
+    "evidence_conditioned_belief",
     "exact_robust_posterior",
     "footprint_observation",
     "render_semantic_tdom",
@@ -94,4 +99,5 @@ __all__ = [
     "FinalRebuildMetrics",
     "FinalRebuildResult",
     "FinalSemanticRebuilder",
+    "SEMANTIC_METHOD_VERSION",
 ]

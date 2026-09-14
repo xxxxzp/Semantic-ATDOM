@@ -123,15 +123,20 @@ class SemanticTdomTests(unittest.TestCase):
             rendered, coverage, CLASS_SPEC, config
         )
 
-        self.assertEqual(result.class_ids.tolist(), [[0, 255]])
+        self.assertEqual(result.class_ids.tolist(), [[0, 0]])
+        self.assertEqual(result.conservative_class_ids.tolist(), [[0, 255]])
         torch.testing.assert_close(
             result.probabilities[:, 0, 0], torch.tensor([0.75, 0.25])
         )
         self.assertEqual(result.colors[:, 0, 0].tolist(), [10, 20, 30])
-        self.assertEqual(result.colors[:, 0, 1].tolist(), [0, 0, 0])
+        self.assertEqual(result.colors[:, 0, 1].tolist(), [10, 20, 30])
         self.assertFalse(torch.isnan(result.entropy[0, 1]))
         self.assertEqual(
-            int(result.unknown_reason[0, 1]), int(UnknownReason.LOW_MARGIN)
+            int(result.unknown_reason[0, 1]), 0
+        )
+        self.assertEqual(
+            int(result.conservative_unknown_reason[0, 1]),
+            int(UnknownReason.LOW_MARGIN),
         )
 
     def test_entropy_and_unknown_reasons_remain_explainable(self):
@@ -150,12 +155,15 @@ class SemanticTdomTests(unittest.TestCase):
             SemanticTdomConfig(min_margin=0.2),
         )
 
-        self.assertTrue(result.unknown_mask[0, 0])
+        self.assertFalse(result.unknown_mask[0, 0])
+        self.assertEqual(result.conservative_class_ids[0, 0], 255)
         self.assertFalse(torch.isnan(result.entropy[0, 0]))
         self.assertTrue(
-            int(result.unknown_reason[0, 0]) & int(UnknownReason.LOW_MARGIN)
+            int(result.conservative_unknown_reason[0, 0])
+            & int(UnknownReason.LOW_MARGIN)
         )
         self.assertTrue(torch.isnan(result.entropy[0, 1]))
+        self.assertTrue(torch.isnan(result.probabilities[:, 0, 1]).all())
         self.assertTrue(
             int(result.unknown_reason[0, 1])
             & int(UnknownReason.NO_SEMANTIC_EVIDENCE)
@@ -232,6 +240,8 @@ class SemanticTdomTests(unittest.TestCase):
         state = SemanticGaussianState.initialize(1, 2)
         state.add_evidence(torch.tensor([[1.0, 1.0]]))
         state.group_variance[0] = torch.tensor([0.8, 0.8])
+        state.group_count[0] = 2
+        state.group_disagreement_available = True
 
         features = _semantic_render_features(
             state, torch.device("cpu"), use_robust=True, eps=1e-8
@@ -290,9 +300,13 @@ class SemanticTdomTests(unittest.TestCase):
 
             expected = {
                 "semantic_id.png",
+                "semantic_id_conservative.png",
                 "semantic_color.png",
+                "semantic_color_conservative.png",
+                "ambiguity_mask.png",
                 "unknown_mask.png",
                 "unknown_reason.png",
+                "conservative_unknown_reason.png",
                 "geometry_valid_mask.png",
                 "semantic_support.tif",
                 "semantic_entropy.tif",
@@ -327,6 +341,18 @@ class SemanticTdomTests(unittest.TestCase):
             )
             self.assertNotIn("render_palette", payload["unknown_gate"])
             self.assertNotIn("render_palette_source", payload["unknown_gate"])
+            self.assertEqual(payload["schema_version"], 3)
+            self.assertEqual(
+                payload["semantic_method_version"], "g1-evidence-v1.1"
+            )
+            self.assertFalse(
+                payload["hard_map_contract"]
+                ["group_disagreement_available"]
+            )
+            self.assertNotIn(
+                "group_disagreement",
+                payload["hard_map_contract"]["conservative_evaluated"],
+            )
             with Image.open(root / "geometry_valid_mask.png") as image:
                 self.assertEqual(image.getpixel((0, 0)), 255)
             self.assertEqual(

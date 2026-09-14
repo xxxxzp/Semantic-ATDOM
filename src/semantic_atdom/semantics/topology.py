@@ -10,9 +10,11 @@ import torch
 class TopologyDelta:
     """Map every output Gaussian to zero or one source Gaussian.
 
-    A source index of -1 creates a new prior-only semantic row. Evidence weights
-    distribute data evidence without copying it. Stable source IDs are retained
-    only where preserve_source_ids is true.
+    A source index of -1 creates a new prior-only semantic row. The legacy
+    ``evidence_weights`` name now describes each descendant's rendered/support
+    fraction; V1.1 semantic state may copy the source belief to preserve the
+    rendered field. Stable source IDs are retained only where
+    ``preserve_source_ids`` is true.
     """
 
     old_count: int
@@ -88,7 +90,9 @@ class TopologyDelta:
                 self.evidence_weights[valid_sources],
             )
             if bool((totals > 1.0 + 1e-6).any()):
-                raise ValueError("a topology delta may not duplicate data evidence")
+                raise ValueError(
+                    "a topology delta may not duplicate source contribution"
+                )
 
         identity = torch.arange(
             self.old_count,
@@ -133,7 +137,7 @@ class TopologyDelta:
             )
         ):
             raise ValueError(
-                "clone/split topology must conserve every source's evidence"
+                "clone/split topology must conserve source contribution fractions"
             )
         if self.kind == "clone" and (
             self.new_count < self.old_count

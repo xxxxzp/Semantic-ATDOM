@@ -9,6 +9,7 @@ from semantic_atdom.semantics.state import (
     SemanticStateError,
 )
 from semantic_atdom.semantics.schema import SemanticClassSpec
+from semantic_atdom.semantics.reference import render_semantic_tdom
 from semantic_atdom.semantics.topology import TopologyDelta
 
 
@@ -37,6 +38,7 @@ RECOVERY_CONTEXT = {
         },
     },
     "open_group": None,
+    "current_geometry_stage": 0,
     "class_spec": STATE_CLASS_SPEC,
     "semantic_config": {"schema_version": 1, "prior_total": 1.0},
 }
@@ -54,24 +56,19 @@ class SemanticGaussianStateTests(unittest.TestCase):
         self.assertFalse(isinstance(state.alpha_raw, torch.nn.Parameter))
         self.assertEqual(state.gaussian_ids.tolist(), [0, 1, 2])
 
-    def test_clone_conserves_parent_data_evidence(self):
+    def test_clone_copies_parent_belief_instead_of_diluting_it(self):
         state = SemanticGaussianState.initialize(2, 2)
         state.add_evidence(
             torch.tensor([[4.0, 1.0], [0.0, 3.0]]),
             support=torch.tensor([2.0, 1.0]),
         )
         state.mark_clean()
-        evidence_before = state.alpha_raw - 0.5
+        parent_evidence = state.alpha_raw[0] - 0.5
 
         state.apply_topology(TopologyDelta.clone(2, torch.tensor([0])))
 
         self.assertEqual(state.num_gaussians, 3)
-        torch.testing.assert_close(
-            (state.alpha_raw - 0.5).sum(dim=0), evidence_before.sum(dim=0)
-        )
-        torch.testing.assert_close(
-            state.alpha_raw[0] - 0.5, torch.tensor([2.0, 0.5])
-        )
+        torch.testing.assert_close(state.alpha_raw[0] - 0.5, parent_evidence)
         torch.testing.assert_close(state.alpha_raw[2], state.alpha_raw[0])
         self.assertEqual(state.gaussian_ids.tolist()[:2], [0, 1])
         self.assertNotIn(state.gaussian_ids[2].item(), [0, 1])
@@ -93,9 +90,51 @@ class SemanticGaussianStateTests(unittest.TestCase):
 
         self.assertEqual(state.num_gaussians, 4)
         self.assertEqual(state.gaussian_ids[:2].tolist(), [0, 2])
-        torch.testing.assert_close(state.alpha_raw[2] - 0.5, parent_evidence / 2)
-        torch.testing.assert_close(state.alpha_raw[3] - 0.5, parent_evidence / 2)
+        torch.testing.assert_close(state.alpha_raw[2] - 0.5, parent_evidence)
+        torch.testing.assert_close(state.alpha_raw[3] - 0.5, parent_evidence)
         self.assertTrue(bool(state.dirty[2:].all()))
+
+    def test_split_copy_preserves_rendered_semantic_field(self):
+        state = SemanticGaussianState.initialize(1, 2)
+        state.add_evidence(torch.tensor([[4.0, 1.0]]))
+        before = render_semantic_tdom(
+            torch.tensor([[0.6]]), state.alpha_robust
+        )
+
+        state.apply_topology(
+            TopologyDelta.split(
+                old_count=1,
+                parent_indices=torch.tensor([0]),
+                children_per_parent=2,
+            )
+        )
+        after = render_semantic_tdom(
+            torch.tensor([[0.3, 0.3]]), state.alpha_robust
+        )
+
+        for name in (
+            "probabilities",
+            "absolute_support",
+            "support_ratio",
+            "entropy",
+            "class_ids",
+        ):
+            torch.testing.assert_close(
+                getattr(after, name), getattr(before, name), equal_nan=True
+            )
+
+    def test_topology_marks_closed_evidence_stale(self):
+        state = SemanticGaussianState.initialize(1, 2)
+        state.add_evidence(
+            torch.tensor([[1.0, 0.0]]),
+            group_count_increment=torch.tensor([1]),
+        )
+
+        state.apply_topology(
+            TopologyDelta.split(1, torch.tensor([0]), children_per_parent=2)
+        )
+
+        self.assertTrue(state.historical_evidence_stale)
 
     def test_prune_and_append_prior_follow_explicit_deltas(self):
         state = SemanticGaussianState.initialize(3, 2)
@@ -111,6 +150,22 @@ class SemanticGaussianStateTests(unittest.TestCase):
             state.alpha_raw[2:], torch.full((2, 2), 0.5)
         )
         self.assertTrue(bool(state.dirty[2:].all()))
+
+    def test_append_marks_new_rows_for_active_window_reprojection(self):
+        state = SemanticGaussianState.initialize(1, 2)
+        state.replace_open_group(
+            torch.tensor([[0.5, 0.0]]),
+            torch.tensor([[0.5, 0.0]]),
+            torch.tensor([1]),
+            torch.tensor([[[1.0, 0.0]]]),
+            torch.tensor([[0.5]]),
+            torch.tensor([[1.0]]),
+        )
+
+        state.apply_topology(TopologyDelta.append_prior(1, 1))
+
+        self.assertFalse(state.active_projection_dirty[0])
+        self.assertTrue(state.active_projection_dirty[1])
 
     def test_sidecar_validates_geometry_and_class_spec(self):
         state = SemanticGaussianState.initialize(2, 3)
@@ -171,6 +226,37 @@ class SemanticGaussianStateTests(unittest.TestCase):
                     expected_recovery_context_sha256="d" * 64,
                 )
 
+    def test_v1_sidecar_cannot_resume_under_v1_1_method(self):
+        state = SemanticGaussianState.initialize(1, 3)
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "semantic_state.pt"
+            payload = state.state_dict(
+                GEOMETRY_HASH,
+                STATE_CLASS_SPEC_HASH,
+                RECOVERY_CONTEXT,
+            )
+            payload["schema_version"] = 2
+            payload.pop("semantic_method_version")
+            torch.save(payload, path)
+
+            with self.assertRaisesRegex(
+                SemanticStateError, "unsupported semantic state schema"
+            ):
+                SemanticGaussianState.load(
+                    path,
+                    expected_geometry_hash=GEOMETRY_HASH,
+                    expected_class_spec_hash=STATE_CLASS_SPEC_HASH,
+                    expected_gaussian_count=1,
+                    expected_recovery_context_sha256=(
+                        state.validated_recovery_context_sha256(
+                            RECOVERY_CONTEXT,
+                            class_spec_hash=STATE_CLASS_SPEC_HASH,
+                            prior_total=1.0,
+                            num_classes=3,
+                        )
+                    ),
+                )
+
     def test_recovery_context_rejects_placeholders(self):
         state = SemanticGaussianState.initialize(1, 3)
         with self.assertRaisesRegex(SemanticStateError, "ledger"):
@@ -214,7 +300,7 @@ class SemanticGaussianStateTests(unittest.TestCase):
         self.assertIs(state.alpha_raw, alpha_before)
         self.assertEqual(state.topology_version, 0)
 
-    def test_zero_weight_lineage_does_not_copy_group_statistics(self):
+    def test_zero_weight_lineage_still_copies_local_belief_statistics(self):
         state = SemanticGaussianState.initialize(1, 2)
         state.group_count[0] = 3
         state.group_variance[0] = torch.tensor([0.2, 0.1])
@@ -225,8 +311,11 @@ class SemanticGaussianStateTests(unittest.TestCase):
                 child_fractions=torch.tensor([1.0]),
             )
         )
-        self.assertEqual(state.group_count[0].item(), 0)
-        torch.testing.assert_close(state.group_variance[0], torch.zeros(2))
+        self.assertEqual(state.group_count.tolist(), [3, 3])
+        torch.testing.assert_close(
+            state.group_variance,
+            torch.tensor([[0.2, 0.1], [0.2, 0.1]]),
+        )
 
 
 class TopologyDeltaTests(unittest.TestCase):

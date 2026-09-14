@@ -17,6 +17,7 @@ from semantic_atdom.semantics.orchestrator import (
     OnlineSemanticOrchestrator,
     ProgressiveSemanticHook,
     ProjectedObservation,
+    _unbound_source_image_ids,
     label_boundary_weights,
 )
 from semantic_atdom.semantics.schema import (
@@ -283,7 +284,7 @@ class OnlineSemanticOrchestratorTests(unittest.TestCase):
             state.open_supports, torch.tensor([[0.4, 0.4]])
         )
         torch.testing.assert_close(
-            state.open_raw_evidence.sum(dim=0), torch.tensor([0.6, 0.2])
+            state.open_raw_evidence.sum(dim=0), torch.tensor([1.2, 0.4])
         )
 
         runner.refresh_open_group(
@@ -302,7 +303,8 @@ class OnlineSemanticOrchestratorTests(unittest.TestCase):
         torch.testing.assert_close(
             state.semantic_support, torch.tensor([3.0, 2.0])
         )
-        self.assertFalse(bool(state.dirty.any()))
+        self.assertFalse(bool(state.active_projection_dirty.any()))
+        self.assertTrue(bool(state.dirty.any()))
         self.assertEqual(len(runner.ledger.entries), 1)
 
     def test_invalid_projection_does_not_partially_mutate_open_group(self):
@@ -340,6 +342,105 @@ class OnlineSemanticOrchestratorTests(unittest.TestCase):
 
 
 class ProgressiveSemanticHookTests(unittest.TestCase):
+    def test_geometry_stage_change_reprojects_the_open_group(self):
+        class Camera:
+            image_name = "000001"
+
+        class Projector:
+            def project(self, gaussians, camera, item):
+                return projection([0.0, 1.0], 1.0)
+
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            semantic = root / "semantic"
+            (semantic / "labels").mkdir(parents=True)
+            (semantic / "metadata").mkdir()
+            (semantic / "class_spec.json").write_text(
+                json.dumps(CLASS_SPEC_VALUE), encoding="utf-8"
+            )
+            label_path = semantic / "labels" / "000001.png"
+            Image.fromarray(np.zeros((1, 1), dtype=np.uint8)).save(label_path)
+            metadata = observation("000001").metadata.copy()
+            metadata["class_spec_sha256"] = CLASS_SPEC.fingerprint
+            metadata["label_sha256"] = sha256_file(label_path)
+            (semantic / "metadata" / "000001.json").write_text(
+                json.dumps(metadata), encoding="utf-8"
+            )
+            sparse = root / "1" / "sparse" / "0"
+            sparse.mkdir(parents=True)
+            (sparse / "imagesNames.txt").write_text(
+                "000001\n", encoding="utf-8"
+            )
+            (sparse / "imageMatchMatrix.txt").write_text(
+                "100\n", encoding="utf-8"
+            )
+            dataset = SemanticDataset(root)
+            runner = OnlineSemanticOrchestrator(
+                SemanticGaussianState.initialize(1, 2),
+                dataset.class_spec,
+                OnlineSemanticConfig(),
+            )
+            runner.ingest(
+                dataset.load_observation("000001"),
+                projection([1.0, 0.0], 1.0),
+                overlap(["000001"]),
+            )
+            hook = ProgressiveSemanticHook(
+                dataset, runner, Projector(), root / "output"
+            )
+            hook._persist = lambda gaussians, result: None
+
+            hook.synchronize(1, [Camera()], object(), root / "1")
+
+        torch.testing.assert_close(
+            runner.state.open_raw_evidence,
+            torch.tensor([[0.0, 1.0]]),
+        )
+        self.assertFalse(bool(runner.state.active_projection_dirty.any()))
+
+    def test_source_binding_requires_matching_source_bytes(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            rgb_root = root / "rgb-dataset"
+            semantic_root = root / "semantic-dataset"
+            semantic = semantic_root / "semantic"
+            (semantic / "metadata").mkdir(parents=True)
+            (semantic / "class_spec.json").write_text(
+                json.dumps(CLASS_SPEC_VALUE), encoding="utf-8"
+            )
+            (rgb_root / "images").mkdir(parents=True)
+            source = rgb_root / "images" / "000001.jpg"
+            source.write_bytes(b"source-image-bytes")
+            metadata = {
+                "source_image": "images/000001.jpg",
+                "source_image_sha256": sha256_file(source),
+            }
+            (semantic / "metadata" / "000001.json").write_text(
+                json.dumps(metadata), encoding="utf-8"
+            )
+            dataset = SemanticDataset(semantic_root)
+
+            self.assertEqual(
+                _unbound_source_image_ids(
+                    dataset, ("000001",), rgb_dataset_root=rgb_root
+                ),
+                (),
+            )
+            decoy = root / "decoy" / "000001.jpg"
+            decoy.parent.mkdir()
+            decoy.write_bytes(b"decoy-image-bytes")
+            metadata["source_image"] = str(decoy)
+            metadata["source_image_sha256"] = sha256_file(decoy)
+            (semantic / "metadata" / "000001.json").write_text(
+                json.dumps(metadata), encoding="utf-8"
+            )
+            self.assertEqual(
+                _unbound_source_image_ids(
+                    dataset, ("000001",), rgb_dataset_root=rgb_root
+                ),
+                ("000001",),
+            )
+
     def test_final_hook_rebuilds_every_ready_label_exactly_twice(self):
         class Camera:
             def __init__(self, image_name):
@@ -417,6 +518,20 @@ class ProgressiveSemanticHookTests(unittest.TestCase):
             self.assertEqual(projector.calls, 9)
             self.assertTrue(
                 (root / "output" / "final_rebuild_metrics.json").is_file()
+            )
+            rebuild_metrics = json.loads(
+                (root / "output" / "final_rebuild_metrics.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(
+                rebuild_metrics["semantic_method_version"],
+                "g1-evidence-v1.1",
+            )
+            self.assertEqual(
+                rebuild_metrics["semantic_fusion_config"]
+                ["min_consensus_support"],
+                1.0,
             )
             self.assertEqual(hook.orchestrator.state.group_count.item(), 3)
             self.assertEqual(hook.orchestrator.open_member_ids, ())
@@ -545,6 +660,12 @@ class ProgressiveSemanticHookTests(unittest.TestCase):
                 (root / "output" / latest["geometry_checkpoint"]).is_file()
             )
             first_slot = latest["slot"]
+            hook.orchestrator.state.add_evidence(
+                torch.tensor([[1.0, 0.0]]),
+                group_count_increment=torch.tensor([1]),
+            )
+            hook.orchestrator.state.mark_historical_evidence_current()
+            hook._persist(Gaussians(), result)
             restored = ProgressiveSemanticHook.create(
                 root,
                 root / "output",
@@ -552,7 +673,15 @@ class ProgressiveSemanticHookTests(unittest.TestCase):
                 projector=NeverProject(),
             )
             self.assertEqual(restored._stage_boundaries, ["000001"])
+            self.assertEqual(restored.orchestrator.current_geometry_stage, 1)
+            restored.synchronize(1, [Camera()], Gaussians(), root / "1")
+            self.assertFalse(
+                restored.orchestrator.state.historical_evidence_stale
+            )
             restored.synchronize(2, [Camera()], Gaussians(), root / "1")
+            self.assertTrue(
+                restored.orchestrator.state.historical_evidence_stale
+            )
             latest = json.loads(
                 (root / "output" / "latest.json").read_text(encoding="utf-8")
             )

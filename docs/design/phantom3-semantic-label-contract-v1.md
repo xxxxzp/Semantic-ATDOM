@@ -158,11 +158,19 @@ V1 类别映射固定为：
   "width": 1600,
   "height": 897,
   "class_spec_sha256": "<规范化class_spec内容的SHA256>",
-  "label_sha256": "<标签PNG文件的SHA256>"
+  "label_sha256": "<标签PNG文件的SHA256>",
+  "source_image": "images/000001.jpg",
+  "source_image_sha256": "<原始RGB影像的SHA256>"
 }
 ```
 
 尖括号字段是说明占位符，不能直接作为交付值。标签生成器必须写入真实模型标识、checkpoint 哈希、有效 prompt 配置、阈值和文件哈希。使用同一模型配置生成的一批标签可以共享 `label_version`；任何配置或标签内容变化都必须发布新版本，不能用同一 `image_id + label_version` 静默覆盖不同内容。
+
+V1.1 仍允许读取缺少 `source_image` 或 `source_image_sha256` 的历史标签，
+但最终产品只能标记为 `exact_partial`。声明的哈希还必须匹配本次训练快照
+实际读取的 RGB 字节；指向另一个同名文件并提供自洽哈希仍会被拒绝。相对
+路径以 RGB 数据根目录解析，而不是以可能独立存在的语义数据根目录解析。
+只有全部标签均能通过这些检查时，最终重建才可标记为 `exact_final`。
 
 ## 可选完整 scores
 

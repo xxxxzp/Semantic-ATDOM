@@ -15,6 +15,8 @@ from PIL import Image
 import torch
 
 from semantic_atdom.semantics.schema import SemanticClassSpec, sha256_file
+from semantic_atdom.semantics.provenance import SEMANTIC_METHOD_VERSION
+from semantic_atdom.semantics.reference import evidence_conditioned_belief
 
 
 def _is_rgb_color(value: object) -> bool:
@@ -45,7 +47,7 @@ class UnknownReason(IntFlag):
 
 @dataclass(frozen=True)
 class SemanticTdomConfig:
-    """Configurable unknown gate; defaults preserve the V1 hard-map behavior."""
+    """Structural primary gate plus uncalibrated conservative ambiguity gate."""
 
     min_coverage: float = 0.05
     min_absolute_support: float = 0.01
@@ -133,14 +135,17 @@ class SemanticTdomConfig:
         # Palette is a visualization concern, not an unknown-gate parameter.
         payload.pop("render_palette")
         payload.pop("render_palette_source")
+        payload["semantic_method_version"] = SEMANTIC_METHOD_VERSION
         return payload
 
 
 class SemanticTdomResult(NamedTuple):
     class_ids: torch.Tensor
+    conservative_class_ids: torch.Tensor
     colors: Optional[torch.Tensor]
     unknown_mask: torch.Tensor
     unknown_reason: torch.Tensor
+    conservative_unknown_reason: torch.Tensor
     probabilities: Optional[torch.Tensor]
     coverage: Optional[torch.Tensor]
     absolute_support: torch.Tensor
@@ -284,18 +289,18 @@ def _semantic_render_features(
     eps: float,
     gaussian_mask: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Build the K+4 per-Gaussian values consumed by the CUDA renderer."""
+    """Build K+5 evidence-conditioned values for the CUDA renderer."""
     alpha = semantic_state.alpha_robust if use_robust else semantic_state.alpha_raw
     alpha = alpha.detach().to(device=device, dtype=torch.float32)
     if gaussian_mask is not None:
         alpha = alpha[gaussian_mask]
-    concentration = alpha.sum(dim=1)
-    means = alpha / (concentration.unsqueeze(1) + eps)
-    evidence_ratio = (
-        (concentration - semantic_state.prior_total)
-        / (concentration + eps)
-    ).clamp(min=0.0, max=1.0)
-    probability_second_moment = means.square().sum(dim=1)
+    belief = evidence_conditioned_belief(
+        alpha, prior_total=semantic_state.prior_total, eps=eps
+    )
+    concentration = belief.concentration
+    evidence_ratio = belief.evidence_ratio
+    distribution = belief.distribution
+    probability_second_moment = distribution.square().sum(dim=1)
     # Squared distance between two categorical distributions can reach 2
     # (opposite one-hot vectors), so the flight-group trace must retain [0, 2].
     group_disagreement = semantic_state.group_variance.detach().to(
@@ -304,21 +309,30 @@ def _semantic_render_features(
     if gaussian_mask is not None:
         group_disagreement = group_disagreement[gaussian_mask]
     group_disagreement = group_disagreement.sum(dim=1).clamp(min=0.0, max=2.0)
+    group_count = semantic_state.group_count.detach().to(device=device)
+    if gaussian_mask is not None:
+        group_count = group_count[gaussian_mask]
+    group_eligible = group_count >= 2
+    if not semantic_state.group_disagreement_available:
+        group_eligible = torch.zeros_like(group_eligible)
+    group_support = evidence_ratio * group_eligible.to(dtype=torch.float32)
+    prior_regularized_mean = alpha / (concentration.unsqueeze(1) + eps)
     posterior_variance = (
-        (1.0 - probability_second_moment).clamp_min(0.0)
+        (1.0 - prior_regularized_mean.square().sum(dim=1)).clamp_min(0.0)
         / (concentration + 1.0)
     )
     auxiliary = torch.stack(
         (
             evidence_ratio,
             evidence_ratio * probability_second_moment,
-            evidence_ratio * group_disagreement,
+            group_support * group_disagreement,
+            group_support,
             evidence_ratio.square() * posterior_variance,
         ),
         dim=1,
     )
     return torch.cat(
-        (means * evidence_ratio.unsqueeze(1), auxiliary), dim=1
+        (belief.evidence / concentration.unsqueeze(1), auxiliary), dim=1
     ).contiguous()
 
 
@@ -333,10 +347,9 @@ def finalize_semantic_tdom(
 ) -> SemanticTdomResult:
     """Normalize composited evidence and apply an explainable unknown gate.
 
-    ``rendered_features`` accepts the legacy ``K + 1`` layout or the enhanced
-    ``K + 4`` layout. Enhanced scalar channels contain the weighted probability
-    second moment, flight-group disagreement and the squared-weight propagated
-    Dirichlet trace-variance numerator, respectively.
+    ``rendered_features`` accepts the legacy ``K + 1`` layout, the deprecated
+    ``K + 4`` layout, or the V1.1 ``K + 5`` layout. The current layout adds a
+    local validity denominator for flight-group disagreement.
     """
     config = config or SemanticTdomConfig()
     rendered_features = rendered_features.detach()
@@ -344,14 +357,18 @@ def finalize_semantic_tdom(
         device=rendered_features.device, dtype=rendered_features.dtype
     )
     class_count = class_spec.num_classes
-    valid_channel_counts = (class_count + 1, class_count + 4)
+    valid_channel_counts = (
+        class_count + 1,
+        class_count + 4,
+        class_count + 5,
+    )
     if (
         rendered_features.ndim != 3
         or rendered_features.shape[0] not in valid_channel_counts
     ):
         raise ValueError(
             "rendered_features must have shape [num_classes + 1, H, W] "
-            "or [num_classes + 4, H, W]"
+            "or an enhanced [num_classes + 4|5, H, W] layout"
         )
     if coverage.shape != rendered_features.shape[1:]:
         raise ValueError("coverage must have shape [H, W]")
@@ -366,7 +383,7 @@ def finalize_semantic_tdom(
             raise ValueError("coverage must be finite and non-negative")
 
     numerator = rendered_features[:class_count]
-    # A view would retain the complete K+4 allocation after finalization.
+    # A view would retain the complete enhanced allocation after finalization.
     absolute_support = rendered_features[class_count].clone()
     probabilities = numerator / (absolute_support.unsqueeze(0) + config.eps)
     probability_sum = probabilities.sum(dim=0, keepdim=True)
@@ -389,19 +406,31 @@ def finalize_semantic_tdom(
     entropy_scale = math.log(class_count) if class_count > 1 else 1.0
     normalized_entropy = entropy / entropy_scale
 
-    enhanced = rendered_features.shape[0] == class_count + 4
+    enhanced_channels = rendered_features.shape[0] - class_count
+    enhanced = enhanced_channels in (4, 5)
     if enhanced:
         weighted_second_moment = rendered_features[class_count + 1]
         mixture_disagreement = (
             weighted_second_moment / (absolute_support + config.eps)
             - probabilities.square().sum(dim=0)
         ).clamp(min=0.0, max=1.0)
-        group_disagreement = (
-            rendered_features[class_count + 2]
-            / (absolute_support + config.eps)
-        ).clamp(min=0.0, max=2.0)
+        if enhanced_channels == 5:
+            group_support = rendered_features[class_count + 3]
+            group_disagreement = (
+                rendered_features[class_count + 2]
+                / (group_support + config.eps)
+            ).clamp(min=0.0, max=2.0)
+            group_evidence = group_support > config.eps
+            variance_index = class_count + 4
+        else:
+            group_disagreement = (
+                rendered_features[class_count + 2]
+                / (absolute_support + config.eps)
+            ).clamp(min=0.0, max=2.0)
+            group_evidence = absolute_support > config.eps
+            variance_index = class_count + 3
         posterior_variance = (
-            rendered_features[class_count + 3]
+            rendered_features[variance_index]
             / (absolute_support.square() + config.eps)
         ).clamp(min=0.0, max=1.0)
     else:
@@ -430,26 +459,40 @@ def finalize_semantic_tdom(
         support_ratio < config.min_support_ratio,
         UnknownReason.LOW_SUPPORT_RATIO,
     )
-    add_reason(margin < config.min_margin, UnknownReason.LOW_MARGIN)
-    add_reason(
-        top1_probability < config.min_top1_probability,
-        UnknownReason.LOW_TOP1_PROBABILITY,
-    )
-    add_reason(
-        normalized_entropy > config.max_normalized_entropy,
-        UnknownReason.HIGH_NORMALIZED_ENTROPY,
-    )
-    if enhanced:
-        add_reason(
-            group_disagreement > config.max_group_disagreement,
-            UnknownReason.HIGH_GROUP_DISAGREEMENT,
-        )
-
     valid = reason == 0
     class_ids = probabilities.argmax(dim=0).to(dtype=torch.uint8)
     class_ids = torch.where(
         valid,
         class_ids,
+        torch.full_like(class_ids, class_spec.ignore_id),
+    )
+    conservative_reason = reason.clone()
+
+    def add_conservative_reason(
+        mask: torch.Tensor, flag: UnknownReason
+    ) -> None:
+        conservative_reason.bitwise_or_(
+            mask.to(dtype=torch.uint8) * int(flag)
+        )
+
+    add_conservative_reason(margin < config.min_margin, UnknownReason.LOW_MARGIN)
+    add_conservative_reason(
+        top1_probability < config.min_top1_probability,
+        UnknownReason.LOW_TOP1_PROBABILITY,
+    )
+    add_conservative_reason(
+        normalized_entropy > config.max_normalized_entropy,
+        UnknownReason.HIGH_NORMALIZED_ENTROPY,
+    )
+    if enhanced:
+        add_conservative_reason(
+            group_disagreement > config.max_group_disagreement,
+            UnknownReason.HIGH_GROUP_DISAGREEMENT,
+        )
+    conservative_valid = conservative_reason == 0
+    conservative_class_ids = torch.where(
+        conservative_valid,
+        probabilities.argmax(dim=0).to(dtype=torch.uint8),
         torch.full_like(class_ids, class_spec.ignore_id),
     )
     # Entropy describes ambiguity, including supported pixels rejected by the
@@ -462,13 +505,23 @@ def finalize_semantic_tdom(
         normalized_entropy,
         torch.full_like(normalized_entropy, float("nan")),
     )
+    top1_probability = torch.where(
+        semantic_evidence,
+        top1_probability,
+        torch.full_like(top1_probability, float("nan")),
+    )
+    margin = torch.where(
+        semantic_evidence,
+        margin,
+        torch.full_like(margin, float("nan")),
+    )
     if enhanced:
         undefined = torch.full_like(absolute_support, float("nan"))
         mixture_disagreement = torch.where(
             semantic_evidence, mixture_disagreement, undefined
         )
         group_disagreement = torch.where(
-            semantic_evidence, group_disagreement, undefined
+            group_evidence, group_disagreement, undefined
         )
         posterior_variance = torch.where(
             semantic_evidence, posterior_variance, undefined
@@ -485,12 +538,20 @@ def finalize_semantic_tdom(
         colors = torch.where(
             valid.unsqueeze(2), colors, torch.zeros_like(colors)
         ).permute(2, 0, 1)
-    returned_probabilities = probabilities if retain_probabilities else None
+    returned_probabilities = None
+    if retain_probabilities:
+        returned_probabilities = torch.where(
+            semantic_evidence.unsqueeze(0),
+            probabilities,
+            torch.full_like(probabilities, float("nan")),
+        )
     return SemanticTdomResult(
         class_ids=class_ids,
+        conservative_class_ids=conservative_class_ids,
         colors=colors,
         unknown_mask=~valid,
         unknown_reason=reason,
+        conservative_unknown_reason=conservative_reason,
         probabilities=returned_probabilities,
         coverage=coverage,
         absolute_support=absolute_support,
@@ -541,8 +602,14 @@ def _finalize_semantic_tdom_in_tiles(
         output_height = height if total_height is None else total_height
         outputs = {
             "class_ids": torch.empty((output_height, width), dtype=torch.uint8),
+            "conservative_class_ids": torch.empty(
+                (output_height, width), dtype=torch.uint8
+            ),
             "unknown_mask": torch.empty((output_height, width), dtype=torch.bool),
             "unknown_reason": torch.empty((output_height, width), dtype=torch.uint8),
+            "conservative_unknown_reason": torch.empty(
+                (output_height, width), dtype=torch.uint8
+            ),
         }
         for name in float_names:
             outputs[name] = torch.empty(
@@ -570,12 +637,18 @@ def _finalize_semantic_tdom_in_tiles(
         outputs["class_ids"][destination_start:destination_end].copy_(
             tile.class_ids.cpu()
         )
+        outputs["conservative_class_ids"][
+            destination_start:destination_end
+        ].copy_(tile.conservative_class_ids.cpu())
         outputs["unknown_mask"][destination_start:destination_end].copy_(
             tile.unknown_mask.cpu()
         )
         outputs["unknown_reason"][destination_start:destination_end].copy_(
             tile.unknown_reason.cpu()
         )
+        outputs["conservative_unknown_reason"][
+            destination_start:destination_end
+        ].copy_(tile.conservative_unknown_reason.cpu())
         for name in float_names:
             outputs[name][destination_start:destination_end].copy_(
                 getattr(tile, name).cpu()
@@ -587,9 +660,11 @@ def _finalize_semantic_tdom_in_tiles(
 
     return SemanticTdomResult(
         class_ids=outputs["class_ids"],
+        conservative_class_ids=outputs["conservative_class_ids"],
         colors=None,
         unknown_mask=outputs["unknown_mask"],
         unknown_reason=outputs["unknown_reason"],
+        conservative_unknown_reason=outputs["conservative_unknown_reason"],
         probabilities=probabilities,
         coverage=outputs.get("coverage"),
         absolute_support=outputs["absolute_support"],
@@ -647,10 +722,11 @@ def rasterize_semantic_tdom(
         opacities = opacities[trusted_mask].contiguous()
         scales = scales[trusted_mask].contiguous()
         rotations = rotations[trusted_mask].contiguous()
-    # K class numerators plus support and three scalar uncertainty moments.
-    feature_channels = class_spec.num_classes + 4
+    # K class numerators plus support, two disagreement values, a local
+    # group-validity denominator and the squared-weight variance feature.
+    feature_channels = class_spec.num_classes + 5
     if feature_channels > 20:
-        raise ValueError("Semantic TDOM currently supports at most 16 classes")
+        raise ValueError("Semantic TDOM currently supports at most 15 classes")
     image_height = int(camera.image_height)
     image_width = int(camera.image_width)
     pixel_count = image_height * image_width
@@ -767,12 +843,12 @@ def rasterize_semantic_tdom(
                     *arguments,
                     int(output_y_start),
                     int(output_height),
-                    int(class_spec.num_classes + 3),
+                    int(class_spec.num_classes + 4),
                     int(max_binning_bytes),
                     bool(debug),
                 )
             )
-            rendered[class_spec.num_classes + 3].copy_(variance_numerator)
+            rendered[class_spec.num_classes + 4].copy_(variance_numerator)
             end_event.record()
             end_event.synchronize()
             raster_cuda_seconds += (
@@ -800,8 +876,10 @@ def rasterize_semantic_tdom(
                 name: getattr(result, name)
                 for name in (
                     "class_ids",
+                    "conservative_class_ids",
                     "unknown_mask",
                     "unknown_reason",
+                    "conservative_unknown_reason",
                     "coverage",
                     "absolute_support",
                     "support_ratio",
@@ -972,6 +1050,30 @@ def write_semantic_tdom(
     record(color_path)
     del color, safe_ids
 
+    conservative_ids = (
+        result.conservative_class_ids.detach().cpu().contiguous().numpy()
+    )
+    conservative_id_path = staging / "semantic_id_conservative.png"
+    _save_image_atomic(conservative_id_path, conservative_ids, "PNG")
+    record(conservative_id_path)
+    conservative_safe_ids = np.minimum(
+        conservative_ids, class_spec.num_classes - 1
+    )
+    conservative_color = palette[conservative_safe_ids]
+    conservative_color[conservative_ids == class_spec.ignore_id] = 0
+    conservative_color_path = staging / "semantic_color_conservative.png"
+    _save_image_atomic(conservative_color_path, conservative_color, "PNG")
+    record(conservative_color_path)
+    ambiguity = (class_ids != class_spec.ignore_id) & (
+        conservative_ids == class_spec.ignore_id
+    )
+    ambiguity_path = staging / "ambiguity_mask.png"
+    _save_image_atomic(
+        ambiguity_path, ambiguity.astype(np.uint8) * 255, "PNG"
+    )
+    record(ambiguity_path)
+    del conservative_color, conservative_safe_ids
+
     unknown = result.unknown_mask.detach().cpu().contiguous().numpy()
     unknown_path = staging / "unknown_mask.png"
     _save_image_atomic(unknown_path, unknown.astype(np.uint8) * 255, "PNG")
@@ -983,6 +1085,15 @@ def write_semantic_tdom(
     reason_path = staging / "unknown_reason.png"
     _save_image_atomic(reason_path, reason_array, "PNG")
     record(reason_path)
+
+    conservative_reason = (
+        result.conservative_unknown_reason.detach().cpu().contiguous()
+    )
+    conservative_reason_path = staging / "conservative_unknown_reason.png"
+    _save_image_atomic(
+        conservative_reason_path, conservative_reason.numpy(), "PNG"
+    )
+    record(conservative_reason_path)
 
     geometry_valid = (
         reason_array & int(UnknownReason.LOW_COVERAGE)
@@ -1081,6 +1192,21 @@ def write_semantic_tdom(
     class_counts = torch.bincount(
         result.class_ids.detach().cpu().long().reshape(-1), minlength=256
     )
+    conservative_class_counts = torch.bincount(
+        result.conservative_class_ids.detach().cpu().long().reshape(-1),
+        minlength=256,
+    )
+    group_disagreement_available = bool(
+        result.group_disagreement is not None
+        and torch.isfinite(result.group_disagreement).any()
+    )
+    conservative_evaluated_gates = [
+        "margin",
+        "top1_probability",
+        "normalized_entropy",
+    ]
+    if group_disagreement_available:
+        conservative_evaluated_gates.append("group_disagreement")
     payload = dict(manifest)
     render_metrics = dict(result.metrics)
     render_metrics["product_files_write_and_hash_seconds"] = float(
@@ -1088,7 +1214,8 @@ def write_semantic_tdom(
     )
     payload.update(
         {
-            "schema_version": 2,
+            "schema_version": 3,
+            "semantic_method_version": SEMANTIC_METHOD_VERSION,
             "width": int(result.class_ids.shape[1]),
             "height": int(result.class_ids.shape[0]),
             "class_spec_sha256": class_spec.fingerprint,
@@ -1096,13 +1223,24 @@ def write_semantic_tdom(
             "render_palette_sha256": files["render_palette.json"],
             "render_palette": render_palette,
             "unknown_gate": config.to_dict(),
+            "hard_map_contract": {
+                "primary": [
+                    "coverage",
+                    "absolute_evidence_support",
+                    "evidence_support_ratio",
+                ],
+                "conservative_evaluated": conservative_evaluated_gates,
+                "group_disagreement_available": (
+                    group_disagreement_available
+                ),
+            },
             "unknown_reason_bits": {
                 item.name.lower(): int(item) for item in UnknownReason
             },
             "uncertainty_definitions": {
                 "semantic_entropy": "categorical entropy in nats; range [0, ln(K)]",
                 "normalized_entropy": "semantic_entropy / ln(K); range [0, 1]",
-                "mixture_disagreement": "weighted E[||mu_g||^2] - ||E[mu_g]||^2",
+                "mixture_disagreement": "weighted E[||q_g||^2] - ||E[q_g]||^2 for evidence-conditioned q",
                 "group_disagreement": "weighted mean trace of per-Gaussian flight-group variance",
                 "posterior_variance": "squared semantic-weight propagation of independent Dirichlet trace variance",
             },
@@ -1114,11 +1252,18 @@ def write_semantic_tdom(
                 "unknown_pixel_count": int(
                     class_counts[class_spec.ignore_id].item()
                 ),
+                "conservative_unknown_pixel_count": int(
+                    conservative_class_counts[class_spec.ignore_id].item()
+                ),
+                "ambiguity_pixel_count": int(ambiguity.sum()),
                 "geometry_valid_pixel_count": geometry_valid_pixel_count,
                 "geometry_invalid_pixel_count": int(
                     geometry_valid.size - geometry_valid_pixel_count
                 ),
                 "unknown_reason_pixel_counts": _unknown_reason_counts(reason),
+                "conservative_unknown_reason_pixel_counts": (
+                    _unknown_reason_counts(conservative_reason)
+                ),
             },
             "render_metrics": render_metrics,
             "tiff_writer": tiff_writer,

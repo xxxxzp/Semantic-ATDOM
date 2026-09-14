@@ -18,6 +18,7 @@ from semantic_atdom.semantics.cuda_observation import (
     rasterize_semantic_observation,
 )
 from semantic_atdom.semantics.reference import aggregate_observation_group
+from semantic_atdom.semantics.provenance import SEMANTIC_METHOD_VERSION
 from semantic_atdom.semantics.rebuild import FinalSemanticRebuilder
 from semantic_atdom.semantics.schema import (
     LedgerEntry,
@@ -48,6 +49,91 @@ def _acquisition_key(image_id: str):
     if match is None:
         return (1, image_id)
     return (0, int(match.group(1)), image_id)
+
+
+def _unbound_source_image_ids(
+    dataset: SemanticDataset,
+    image_ids: Sequence[str],
+    rgb_dataset_root: Optional[Path] = None,
+    snapshot_root: Optional[Path] = None,
+) -> Tuple[str, ...]:
+    """Return labels that cannot be tied to the exact source image bytes.
+
+    This intentionally performs file hashing and is therefore reserved for
+    final exact publication, not the quasi-real-time online path.
+    """
+    rgb_dataset_root = Path(rgb_dataset_root or dataset.dataset_root)
+    candidate_image_directories = []
+    for root in (snapshot_root, rgb_dataset_root):
+        if root is None:
+            continue
+        directory = Path(root) / "images"
+        if directory not in candidate_image_directories:
+            candidate_image_directories.append(directory)
+
+    def actual_rgb_path(image_id: str) -> Optional[Path]:
+        for directory in candidate_image_directories:
+            try:
+                matches = tuple(
+                    path
+                    for path in directory.glob(image_id + ".*")
+                    if path.is_file() and path.stem == image_id
+                )
+            except OSError:
+                continue
+            if len(matches) == 1:
+                return matches[0]
+            if len(matches) > 1:
+                return None
+        return None
+
+    failures = []
+    for image_id in image_ids:
+        metadata_path = (
+            dataset.semantic_root / "metadata" / (image_id + ".json")
+        )
+        try:
+            with metadata_path.open("r", encoding="utf-8") as stream:
+                metadata = json.load(stream)
+        except (OSError, ValueError):
+            failures.append(image_id)
+            continue
+        source_image = metadata.get("source_image")
+        source_hash = metadata.get("source_image_sha256")
+        if (
+            not isinstance(source_image, str)
+            or not source_image
+            or not isinstance(source_hash, str)
+            or re.fullmatch(r"[0-9a-fA-F]{64}", source_hash) is None
+        ):
+            failures.append(image_id)
+            continue
+        source_path = Path(source_image)
+        if not source_path.is_absolute():
+            source_path = rgb_dataset_root / source_path
+        training_path = actual_rgb_path(image_id)
+        try:
+            source_path = source_path.resolve(strict=True)
+            training_path = training_path.resolve(strict=True)
+            source_digest = sha256_file(source_path)
+            training_digest = (
+                source_digest
+                if training_path == source_path
+                else sha256_file(training_path)
+            )
+            source_matches = (
+                source_path.stem == image_id
+                and source_path.is_file()
+                and training_path.stem == image_id
+                and training_path.is_file()
+                and source_digest == source_hash.lower()
+                and training_digest == source_hash.lower()
+            )
+        except (AttributeError, OSError):
+            source_matches = False
+        if not source_matches:
+            failures.append(image_id)
+    return tuple(failures)
 
 
 _GEOMETRY_ATTRIBUTE_NAMES = (
@@ -182,6 +268,7 @@ class OnlineSemanticConfig:
     max_group_size: int = 4
     reliability_floor: float = 0.1
     temperature: float = 0.1
+    min_consensus_support: float = 1.0
     prior_total: float = 1.0
     boundary_bandwidth: float = 2.0
     boundary_floor: float = 0.25
@@ -196,6 +283,8 @@ class OnlineSemanticConfig:
             raise ValueError("reliability_floor must be in [0, 1]")
         if self.temperature <= 0 or self.prior_total <= 0 or self.eps <= 0:
             raise ValueError("temperature, prior_total, and eps must be positive")
+        if self.min_consensus_support < 0:
+            raise ValueError("min_consensus_support must be non-negative")
         if self.boundary_bandwidth < 0:
             raise ValueError("boundary_bandwidth must be non-negative")
         if not 0 <= self.boundary_floor <= 1:
@@ -208,10 +297,12 @@ class OnlineSemanticConfig:
             "max_group_size": self.max_group_size,
             "reliability_floor": self.reliability_floor,
             "temperature": self.temperature,
+            "min_consensus_support": self.min_consensus_support,
             "prior_total": self.prior_total,
             "boundary_bandwidth": self.boundary_bandwidth,
             "boundary_floor": self.boundary_floor,
             "eps": self.eps,
+            "semantic_method_version": SEMANTIC_METHOD_VERSION,
         }
 
 
@@ -415,7 +506,7 @@ class OnlineSemanticOrchestrator:
             LedgerEntry.from_dict(item)
             for item in context["ledger"]["observations"]
         )
-        return cls(
+        orchestrator = cls(
             state,
             class_spec,
             config,
@@ -423,6 +514,10 @@ class OnlineSemanticOrchestrator:
             label_provenance=context["label_provenance"],
             open_group=context["open_group"],
         )
+        orchestrator.current_geometry_stage = int(
+            context["current_geometry_stage"]
+        )
+        return orchestrator
 
     def _validate_runtime_state(self) -> None:
         representatives = ()
@@ -582,14 +677,20 @@ class OnlineSemanticOrchestrator:
         else:
             closed_raw = self.state.alpha_raw - self.state.open_raw_evidence
             closed_count = self.state.group_count - self.state.open_group_count
-        consensus = closed_raw / (
-            closed_raw.sum(dim=1, keepdim=True) + self.config.eps
+        closed_evidence = (closed_raw - self.state.prior()).clamp_min(0.0)
+        closed_support = closed_evidence.sum(dim=1)
+        consensus = closed_evidence / (
+            closed_support.unsqueeze(1) + self.config.eps
         )
         js = self._js_divergence(group.distribution, consensus)
         reliability = self.config.reliability_floor + (
             1.0 - self.config.reliability_floor
         ) * torch.exp(-js / self.config.temperature)
-        eligible = (closed_count >= 2) & (group.support > self.config.eps)
+        eligible = (
+            (closed_count >= 2)
+            & (closed_support >= self.config.min_consensus_support)
+            & (group.support > self.config.eps)
+        )
         reliability = torch.where(
             eligible, reliability, torch.ones_like(reliability)
         )
@@ -660,7 +761,7 @@ class OnlineSemanticOrchestrator:
         distributions = self.state.open_distributions.clone()
         supports = self.state.open_supports.clone()
         semantic_supports = self.state.open_semantic_supports.clone()
-        dirty = self.state.dirty
+        dirty = self.state.active_projection_dirty
         for index, image_id in enumerate(representatives):
             projection = projections[image_id]
             distribution = projection.distribution.detach().to(
@@ -687,8 +788,10 @@ class OnlineSemanticOrchestrator:
         raw_evidence = group.support.unsqueeze(1) * group.distribution
         closed_raw = self.state.alpha_raw - self.state.open_raw_evidence
         closed_count = self.state.group_count - self.state.open_group_count
-        consensus = closed_raw / (
-            closed_raw.sum(dim=1, keepdim=True) + self.config.eps
+        closed_evidence = (closed_raw - self.state.prior()).clamp_min(0.0)
+        closed_support = closed_evidence.sum(dim=1)
+        consensus = closed_evidence / (
+            closed_support.unsqueeze(1) + self.config.eps
         )
         reliability = self.config.reliability_floor + (
             1.0 - self.config.reliability_floor
@@ -696,7 +799,11 @@ class OnlineSemanticOrchestrator:
             -self._js_divergence(group.distribution, consensus)
             / self.config.temperature
         )
-        eligible = (closed_count >= 2) & (group.support > self.config.eps)
+        eligible = (
+            (closed_count >= 2)
+            & (closed_support >= self.config.min_consensus_support)
+            & (group.support > self.config.eps)
+        )
         reliability = torch.where(
             eligible, reliability, torch.ones_like(reliability)
         )
@@ -710,7 +817,7 @@ class OnlineSemanticOrchestrator:
         )
         self.open_group["projection_topology_version"] = self.state.topology_version
         self.open_group["projection_geometry_stage"] = self.current_geometry_stage
-        self.state.mark_clean(dirty)
+        self.state.mark_active_projection_current(dirty)
         return True
 
     def recovery_context(self) -> Dict[str, object]:
@@ -723,6 +830,7 @@ class OnlineSemanticOrchestrator:
             },
             "label_provenance": self.label_provenance,
             "open_group": self.open_group,
+            "current_geometry_stage": self.current_geometry_stage,
             "class_spec": self.class_spec.to_dict(),
             "semantic_config": self.config.to_dict(),
         }
@@ -737,11 +845,15 @@ class ProgressiveSemanticHook:
         orchestrator: OnlineSemanticOrchestrator,
         projector,
         output_root: Path,
+        rgb_dataset_root: Optional[Path] = None,
     ):
         self.dataset = dataset
         self.orchestrator = orchestrator
         self.projector = projector
         self.output_root = Path(output_root)
+        self.rgb_dataset_root = Path(
+            rgb_dataset_root or dataset.dataset_root
+        )
         self._stage_boundaries = []
         self._verified_recorded_files = {}
 
@@ -863,7 +975,13 @@ class ProgressiveSemanticHook:
             )
         if projector is None:
             projector = CudaSemanticProjector(dataset.class_spec, config)
-        hook = cls(dataset, orchestrator, projector, output_root)
+        hook = cls(
+            dataset,
+            orchestrator,
+            projector,
+            output_root,
+            rgb_dataset_root=dataset_root,
+        )
         status_path = output_root / "sync_status.json"
         if status_path.is_file():
             try:
@@ -898,6 +1016,16 @@ class ProgressiveSemanticHook:
         geometry_stage = int(geometry_stage)
         if geometry_stage != self.orchestrator.current_geometry_stage:
             self.orchestrator.state.mark_dirty()
+            if self.orchestrator.open_group is not None:
+                self.orchestrator.state.mark_active_projection_dirty()
+            if bool(
+                (
+                    self.orchestrator.state.group_count
+                    - self.orchestrator.state.open_group_count
+                    > 0
+                ).any()
+            ):
+                self.orchestrator.state.mark_historical_evidence_stale()
         self.orchestrator.current_geometry_stage = geometry_stage
         overlap = AcquisitionOverlap.load(snapshot_root)
         camera_by_id = {
@@ -996,6 +1124,10 @@ class ProgressiveSemanticHook:
                         self.output_root / "final_rebuild_metrics.json",
                         {
                             "schema_version": 1,
+                            "semantic_method_version": SEMANTIC_METHOD_VERSION,
+                            "semantic_fusion_config": (
+                                self.orchestrator.config.to_dict()
+                            ),
                             "geometry_stage": geometry_stage,
                             "geometry_hash": gaussians.geometry_sha256(),
                             "groups": [list(group) for group in rebuilt.image_groups],
@@ -1035,6 +1167,33 @@ class ProgressiveSemanticHook:
             lag <= 1,
             tuple(errors),
         )
+        unbound_source_image_ids = ()
+        source_binding_complete = None
+        if exact_rebuilt:
+            unbound_source_image_ids = _unbound_source_image_ids(
+                self.dataset,
+                ordered,
+                rgb_dataset_root=self.rgb_dataset_root,
+                snapshot_root=snapshot_root,
+            )
+            source_binding_complete = not bool(unbound_source_image_ids)
+        if exact_rebuilt:
+            semantic_quality_status = (
+                "exact_partial"
+                if unbound_source_image_ids
+                else "exact_final"
+            )
+        elif final:
+            semantic_quality_status = "online_fallback"
+        elif (
+            self.orchestrator.state.historical_evidence_stale
+            or deferred
+            or errors
+            or not result.within_lag_budget
+        ):
+            semantic_quality_status = "stale_online"
+        else:
+            semantic_quality_status = "approx_online"
         if tdom_camera is not None and tdom_output_root is not None:
             try:
                 tdom_result = rasterize_semantic_tdom(
@@ -1053,6 +1212,10 @@ class ProgressiveSemanticHook:
                         "semantic_through_image": result.semantic_through_image,
                         "label_version": self.orchestrator.label_version,
                         "geometry_hash": gaussians.geometry_sha256(),
+                        "semantic_method_version": SEMANTIC_METHOD_VERSION,
+                        "semantic_fusion_config": (
+                            self.orchestrator.config.to_dict()
+                        ),
                         "posterior": (
                             "robust_exact_final"
                             if exact_rebuilt
@@ -1061,14 +1224,17 @@ class ProgressiveSemanticHook:
                         "semantic_quality": {
                             "final_requested": bool(final),
                             "exact_rebuild_succeeded": bool(exact_rebuilt),
-                            "status": (
-                                "exact_final"
-                                if exact_rebuilt
-                                else (
-                                    "online_fallback"
-                                    if final
-                                    else "online"
-                                )
+                            "status": semantic_quality_status,
+                            "historical_evidence_stale": bool(
+                                self.orchestrator.state.historical_evidence_stale
+                            ),
+                            "group_disagreement_available": bool(
+                                self.orchestrator.state.group_disagreement_available
+                            ),
+                            "source_binding_complete": source_binding_complete,
+                            "source_binding_evaluated": bool(exact_rebuilt),
+                            "unbound_source_image_ids": (
+                                list(unbound_source_image_ids)
                             ),
                             "deferred_image_ids": list(deferred),
                             "errors_before_tdom": list(errors),

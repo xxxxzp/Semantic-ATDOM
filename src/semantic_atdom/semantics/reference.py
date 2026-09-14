@@ -22,6 +22,15 @@ class GroupStats(NamedTuple):
     support: torch.Tensor
 
 
+class EvidenceBelief(NamedTuple):
+    """Observed semantic evidence separated from its numerical prior."""
+
+    evidence: torch.Tensor
+    distribution: torch.Tensor
+    evidence_ratio: torch.Tensor
+    concentration: torch.Tensor
+
+
 class RobustPosterior(NamedTuple):
     raw_alpha: torch.Tensor
     robust_alpha: torch.Tensor
@@ -44,6 +53,46 @@ def _check_finite_nonnegative(name: str, value: torch.Tensor) -> None:
         raise ValueError("{} must contain only finite values".format(name))
     if bool((value < 0).any()):
         raise ValueError("{} must be non-negative".format(name))
+
+
+def evidence_conditioned_belief(
+    dirichlet_alpha: torch.Tensor,
+    prior_total: float = 1.0,
+    eps: float = 1e-8,
+) -> EvidenceBelief:
+    """Return class belief derived only from observed evidence.
+
+    The symmetric prior keeps an empty state numerically well-defined; it is
+    not a class observation and therefore cannot contribute to the official
+    class distribution.
+    """
+    dirichlet_alpha = dirichlet_alpha.detach()
+    if dirichlet_alpha.ndim != 2 or dirichlet_alpha.shape[1] < 1:
+        raise ValueError("dirichlet_alpha must have shape [gaussians, classes]")
+    if not torch.is_floating_point(dirichlet_alpha):
+        raise ValueError("dirichlet_alpha must use a floating dtype")
+    if prior_total <= 0 or eps <= 0:
+        raise ValueError("prior_total and eps must be positive")
+    _check_finite_nonnegative("dirichlet_alpha", dirichlet_alpha)
+
+    prior_per_class = prior_total / dirichlet_alpha.shape[1]
+    evidence = dirichlet_alpha - prior_per_class
+    tolerance = max(
+        float(eps), float(torch.finfo(dirichlet_alpha.dtype).eps) * 8.0
+    )
+    if bool((evidence < -tolerance).any()):
+        raise ValueError("dirichlet_alpha must not be below its prior")
+    evidence = evidence.clamp_min(0.0)
+    evidence_total = evidence.sum(dim=1)
+    concentration = dirichlet_alpha.sum(dim=1)
+    distribution = evidence / (evidence_total.unsqueeze(1) + eps)
+    evidence_ratio = evidence_total / (concentration + eps)
+    return EvidenceBelief(
+        evidence=evidence,
+        distribution=distribution,
+        evidence_ratio=evidence_ratio,
+        concentration=concentration,
+    )
 
 
 def footprint_observation(
@@ -179,6 +228,7 @@ def exact_robust_posterior(
     prior_total: float = 1.0,
     reliability_floor: float = 0.1,
     temperature: float = 0.1,
+    min_consensus_support: float = 1.0,
     eps: float = 1e-8,
 ) -> RobustPosterior:
     """Build raw and exact leave-one-group-out robust Dirichlet posteriors."""
@@ -198,6 +248,8 @@ def exact_robust_posterior(
         raise ValueError("reliability_floor must be in [0, 1]")
     if temperature <= 0:
         raise ValueError("temperature must be positive")
+    if min_consensus_support < 0:
+        raise ValueError("min_consensus_support must be non-negative")
     _check_finite_nonnegative("group_distributions", group_distributions)
     _check_finite_nonnegative("group_supports", group_supports)
     if bool((group_supports > 1).any()):
@@ -214,11 +266,14 @@ def exact_robust_posterior(
     raw = prior + evidence.sum(dim=0)
     js = torch.zeros_like(group_supports)
     reliability = torch.ones_like(group_supports)
+    leave_out_support = torch.zeros_like(group_supports)
 
     effective_group_count = (group_supports > eps).sum(dim=0)
     if bool((effective_group_count >= 3).any()):
+        total_evidence = evidence.sum(dim=0)
         for group_index in range(group_count):
-            leave_one_out = raw - evidence[group_index]
+            leave_one_out = total_evidence - evidence[group_index]
+            leave_out_support[group_index] = leave_one_out.sum(dim=1)
             consensus = leave_one_out / (
                 leave_one_out.sum(dim=1, keepdim=True) + eps
             )
@@ -228,8 +283,13 @@ def exact_robust_posterior(
         candidate = reliability_floor + (1.0 - reliability_floor) * torch.exp(
             -js / temperature
         )
-        eligible = (effective_group_count >= 3).unsqueeze(0) & (
+        other_group_count = effective_group_count.unsqueeze(0) - (
             group_supports > eps
+        ).to(dtype=effective_group_count.dtype)
+        eligible = (
+            (other_group_count >= 2)
+            & (leave_out_support >= min_consensus_support)
+            & (group_supports > eps)
         )
         reliability = torch.where(eligible, candidate, reliability)
 
@@ -265,39 +325,40 @@ def render_semantic_tdom(
     _check_finite_nonnegative("contributions", contributions)
     _check_finite_nonnegative("dirichlet_alpha", dirichlet_alpha)
 
-    concentration = dirichlet_alpha.sum(dim=1)
-    means = dirichlet_alpha / (concentration.unsqueeze(1) + eps)
-    evidence_ratio = ((concentration - prior_total) / (concentration + eps)).clamp(
-        min=0.0, max=1.0
+    belief = evidence_conditioned_belief(
+        dirichlet_alpha, prior_total=prior_total, eps=eps
     )
-    semantic_weights = contributions * evidence_ratio.unsqueeze(0)
+    semantic_weights = contributions * belief.evidence_ratio.unsqueeze(0)
     coverage = contributions.sum(dim=1)
     absolute_support = semantic_weights.sum(dim=1)
     support_ratio = absolute_support / (coverage + eps)
-    probabilities = semantic_weights.matmul(means) / (
+    safe_probabilities = semantic_weights.matmul(belief.distribution) / (
         absolute_support.unsqueeze(1) + eps
     )
 
     entropy = -(
-        probabilities * torch.log(probabilities.clamp_min(eps))
+        safe_probabilities * torch.log(safe_probabilities.clamp_min(eps))
     ).sum(dim=1)
-    entropy = torch.where(
-        absolute_support > eps,
-        entropy,
-        torch.full_like(entropy, float("nan")),
-    )
-    if probabilities.shape[1] > 1:
-        top_two = torch.topk(probabilities, k=2, dim=1).values
+    if safe_probabilities.shape[1] > 1:
+        top_two = torch.topk(safe_probabilities, k=2, dim=1).values
         margin = top_two[:, 0] - top_two[:, 1]
     else:
-        margin = probabilities[:, 0]
-    class_ids = torch.argmax(probabilities, dim=1)
+        margin = safe_probabilities[:, 0]
+    has_evidence = absolute_support > eps
+    undefined = torch.full_like(absolute_support, float("nan"))
+    entropy = torch.where(has_evidence, entropy, undefined)
+    margin = torch.where(has_evidence, margin, undefined)
+    probabilities = torch.where(
+        has_evidence.unsqueeze(1),
+        safe_probabilities,
+        torch.full_like(safe_probabilities, float("nan")),
+    )
+    class_ids = torch.argmax(safe_probabilities, dim=1)
     valid = (
         (coverage >= min_coverage)
         & (absolute_support >= min_absolute_support)
         & (support_ratio >= min_support_ratio)
-        & (margin >= min_margin)
-        & (absolute_support > eps)
+        & has_evidence
     )
     class_ids = torch.where(
         valid, class_ids, torch.full_like(class_ids, ignore_id)

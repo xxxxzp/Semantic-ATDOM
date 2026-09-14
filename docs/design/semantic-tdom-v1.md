@@ -1,5 +1,12 @@
 # Semantic TDOM V1：已确认设计
 
+> **V1.1 分支说明（2026-09-14）**：本文保留为 V1 工程基线。
+> `semantic/g1-evidence-v1.1` 中有关正式类别概率、G1 共识资格、
+> clone/split 继承、hard-map gate、状态/产品版本与质量状态的定义，已由
+> [ADR 0005：V1.1 Evidence-lite](../decisions/0005-v1-1-evidence-lite.md)
+> 覆盖。未被 ADR 覆盖的训练主链、几何防火墙、标签契约、全分辨率渲染和
+> 异常尺度安全阀继续沿用本文。
+
 ## 文档状态
 
 本文记录截至 2026-09-09 已确认的 Semantic TDOM V1 实施基线。研究比较和取舍依据见 [Semantic A-TDOM 推荐技术路线](../research/semantic-atdom-recommended-route.md)。仍未校准的数值参数集中列在文末，必须保持配置化，不应在实现中伪装成经验最优值。

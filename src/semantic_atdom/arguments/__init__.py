@@ -169,6 +169,7 @@ class OptimizationParams(ParamGroup):
         self.semantic_max_group_size = 4
         self.semantic_reliability_floor = 0.1
         self.semantic_temperature = 0.1
+        self.semantic_min_consensus_support = 1.0
         self.semantic_boundary_bandwidth = 2.0
         self.semantic_boundary_floor = 0.25
         self.semantic_data_root = ""

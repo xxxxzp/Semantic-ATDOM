@@ -991,6 +991,9 @@ class GaussianTrainer(mp.Process):
                 max_group_size=self.args.semantic_max_group_size,
                 reliability_floor=self.args.semantic_reliability_floor,
                 temperature=self.args.semantic_temperature,
+                min_consensus_support=(
+                    self.args.semantic_min_consensus_support
+                ),
                 boundary_bandwidth=self.args.semantic_boundary_bandwidth,
                 boundary_floor=self.args.semantic_boundary_floor,
             )

@@ -61,6 +61,13 @@ original scripts as follows:
 The scripts under `tools/legacy/` are retained for traceability and are not
 supported command interfaces.
 
+## Semantic A-TDOM documentation
+
+- [G1 V1, V1.1, and V2 design comparison](docs/design/g1-v1-v2-comparison.md)
+- [Authoritative Semantic TDOM V1 / G1 Evidence V2 contract](docs/design/semantic-tdom-v1.md)
+- [Current project context](docs/project/global-context.md)
+- [Validated Phantom3 V2 experiment](docs/project/phantom3-semantic-atom-v2-result.md)
+
 # Windows Env Setting
 
 If you are configuring the Python environment for **A-TDOM** on **Windows**,

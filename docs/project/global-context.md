@@ -3,8 +3,8 @@
 ## 文档状态
 
 - 状态：G1 Evidence V2 已实现，并完成 Phantom3 全量训练、最终语义重建和 RGB/Semantic 成对发布验证。
-- 确认日期：2026-09-12。
-- 当前开发分支：`semantic/g1-evidence-v2`。
+- 确认日期：2026-09-14。
+- 当前开发分支：`fix/global-progressive-map`（基于 `semantic/g1-evidence-v2`）。
 - 适用范围：Semantic A-TDOM 的仓库治理、数据、环境、训练期语义主链路和产品状态。
 
 本文是开发者和代码代理开始工作前的项目入口。它保存跨实验仍应成立的共同认知，不复制完整数学合同，也不把源码中的在建行为描述成已完成能力。
@@ -25,6 +25,7 @@
 | 内容 | 权威来源 |
 |---|---|
 | Semantic TDOM 数学、状态和产品合同 | [Semantic TDOM V1：G1 Evidence V2](../design/semantic-tdom-v1.md) |
+| G1 V1、V1.1 与 V2 的设计演进 | [G1 V1→V2 差异总结](../design/g1-v1-v2-comparison.md) |
 | 决策原因与取舍 | `docs/decisions/` 中的 ADR |
 | Phantom3 label/metadata 的文件 schema 与类别 ID | [Phantom3 语义标签交付规范](../design/phantom3-semantic-label-contract-v1.md) |
 | 类别本体 | 当前数据版本的 `semantic/class_spec.json` |
@@ -286,6 +287,7 @@ RGB/Semantic 产品使用共同 `projection_geometry_hash`，完整 RGB 另有 `
 
 ## 关联文档
 
+- [G1 V1→V2 差异总结](../design/g1-v1-v2-comparison.md)
 - [Semantic TDOM V1：G1 Evidence V2](../design/semantic-tdom-v1.md)
 - [Evidence-conditioned 渲染 ADR](../decisions/0005-evidence-conditioned-semantic-rendering.md)
 - [有界在线产品 ADR](../decisions/0006-bounded-online-semantic-products.md)

@@ -4,7 +4,7 @@
 
 - 状态：G1 Evidence V2 已实现，并完成 Phantom3 全量训练、最终语义重建和 RGB/Semantic 成对发布验证。
 - 确认日期：2026-09-15。
-- 当前开发分支：`fix/semantic-tdom-valid-footprint`（基于 `semantic/g1-evidence-v2`）。
+- 当前开发分支：`semantic/g1-evidence-v2`。
 - 适用范围：Semantic A-TDOM 的仓库治理、数据、环境、训练期语义主链路和产品状态。
 
 本文是开发者和代码代理开始工作前的项目入口。它保存跨实验仍应成立的共同认知，不复制完整数学合同，也不把源码中的在建行为描述成已完成能力。
@@ -47,7 +47,7 @@ Phantom3 交付规范仍含早期 `phantom3_test100`、102张和 semantic 同置
 - A-TDOM_Online 只说明此前研究课题，**FORBIDDEN** 将其作为算法、架构、实现思路或复制代码的来源。
 - G（逐高斯语义场）是研究主线。
 - D（直接分割 RGB TDOM）和 M（二维标签直接融合到地图网格）只作为未来对比/消融。
-- G3 学习式残差是低优先级扩展，不能成为 V1 权威产品的必要依赖。
+- G3 学习式残差是低优先级扩展，不能成为当前权威产品的必要依赖。
 - 当前产品是闭集地物类别的俯视 RGB/Semantic TDOM；任意透视视角语义只作内部诊断。
 
 ### MUST：几何防火墙
@@ -62,8 +62,11 @@ Phantom3 交付规范仍含早期 `phantom3_test100`、102张和 semantic 同置
 ### CURRENT DECISION：仓库治理
 
 - `main` 保存历史/重构基线，**FORBIDDEN** 直接进行当前语义开发。
-- `semantic/xzp` 是上一阶段语义开发基线。
-- `semantic/g1-evidence-v2` 用于本次重大合同修订和实施。
+- G1 Prior V1 已退役，不再保留开发分支或 worktree；历史代码由
+  `g1-prior-v1-baseline` 和 `g1-prior-v1-stable-eb57e4d` 标签冻结，仅用于复现退化对照。
+- `semantic/g1-evidence-v1.1` 由 `g1-evidence-v1.1-baseline` 标签冻结，作为当前最小算法
+  baseline；它只用于复现和对照，不承接新功能。
+- `semantic/g1-evidence-v2` 是唯一活跃的 G 路线开发与端到端产品主线。
 - 重大算法、数据合同、环境大版本或产品 schema 变更使用独立分支与 ADR。
 - `upstream` 保持只读，`origin` 用于个人仓库推送。
 - MUST 识别并保留工作区中不属于当前任务的修改。

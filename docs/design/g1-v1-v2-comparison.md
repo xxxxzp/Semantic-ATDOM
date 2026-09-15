@@ -4,8 +4,8 @@
 
 - 状态：当前实现总结，依据截至2026-09-14已经合入并通过 Phantom3 全量运行的代码。
 - 当前语义方法：`g1-evidence-v2`。
-- 历史对照：`g1-prior-v1`。
-- 过渡版本：`g1-evidence-v1.1`。
+- 已退役历史对照：`g1-prior-v1`，仅由冻结标签保留。
+- 当前最小算法 baseline：`g1-evidence-v1.1`，冻结用于复现和 A/B 对照。
 - 本文解释设计演进和工程差异，不替代
   [Semantic TDOM V1 权威数学与产品合同](semantic-tdom-v1.md)。
 
@@ -214,7 +214,7 @@ U_p\ge\theta_U,\qquad
 margin、entropy、Top-1、mixture disagreement、group disagreement 和
 prior-regularized variance proxy 都是独立诊断，不得暗中改变主类别图。
 
-## 为什么 V1.1 不是当前主线
+## 为什么 V1.1 是 baseline 而不是当前主线
 
 `g1-evidence-v1.1` 已经采用 evidence-conditioned belief、prior-free LOO、三条件主
 产品 gate 和拓扑局部连续性，解决了最关键的数学问题。但它有意保留 V1 的工程管线：
@@ -225,7 +225,8 @@ prior-regularized variance proxy 都是独立诊断，不得暗中改变主类�
 - 仍保留 semantic-only Gaussian scale outlier filter；
 - 主类别图之外另有 conservative/ambiguity 产品。
 
-因此 V1.1 适合作为隔离数学变化的 A/B 过渡版本，而不是当前端到端发布基线。
+因此 V1.1 被正式冻结为隔离数学变化的最小算法 baseline，而不是当前端到端发布主线。
+Prior-weighted V1 已从活跃开发中退役，只保留标签和历史结果用于退化对照。
 
 ## V2 在线与最终结果的关系
 
@@ -321,7 +322,8 @@ V1 已验证的异常尺度语义支持域过滤，导致纯黑 RGB 边缘仍被
 
 ## 后续开发基线
 
-后续 G 路线工作应从 `g1-evidence-v2` 继续，而不是重新启用 prior-weighted V1：
+后续 G 路线工作只从 `g1-evidence-v2` 继续。`g1-evidence-v1.1` 是冻结的最小算法
+baseline；prior-weighted V1 已退役，不再承接开发：
 
 1. 先补齐 source-image binding，使完整数据具备 `exact_final` 资格；
 2. 再建立语义质量评测和人工抽检，校准 support/JS 参数；
@@ -332,8 +334,9 @@ V1 已验证的异常尺度语义支持域过滤，导致纯黑 RGB 边缘仍被
 ## 代码与历史锚点
 
 - 原始 A-TDOM 只读基线：`e50a5f7`。
-- G1 Prior V1 baseline：`91e0ec3`；稳定修复：`eb57e4d`。
-- G1 Evidence V1.1：`023617f`。
+- G1 Prior V1 历史标签：`g1-prior-v1-baseline` @ `91e0ec3`；
+  `g1-prior-v1-stable-eb57e4d` @ `eb57e4d`。
+- 当前最小算法 baseline：`g1-evidence-v1.1-baseline` @ `023617f`。
 - G1 Evidence V2 完成基线：`d1daa4b`。
 - 渐进全局范围修复：`f6bfe42`。
 - paired RGB TDOM 分片修复：`b8635fc`。

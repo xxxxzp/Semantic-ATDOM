@@ -445,7 +445,7 @@ def _semantic_render_features(
     eps: float,
     gaussian_mask: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Build the K+4 per-Gaussian values consumed by the CUDA renderer."""
+    """Build the K+5 per-Gaussian values consumed by the CUDA renderer."""
     alpha = semantic_state.alpha_robust if use_robust else semantic_state.alpha_raw
     alpha = alpha.detach().to(device=device, dtype=torch.float32)
     if gaussian_mask is not None:

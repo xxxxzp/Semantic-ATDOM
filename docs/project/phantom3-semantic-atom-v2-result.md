@@ -72,8 +72,27 @@ geometry coverage 中位数约0.9998、support ratio 中位数约0.9464；因此
 尺度约3131 m。
 
 最新代码已按 ADR 0007 恢复只读 Semantic TDOM 支持域过滤。本文其余训练、几何、
-配对和 hash 结论仍描述原始完整运行；修复后的最终 semantic map 在 CUDA 可用时必须
-重新渲染并生成新的产物身份，不能把本目录静默描述为已修复。
+配对和 hash 结论仍描述原始完整运行；原目录不能被静默描述为已修复。
+
+2026-09-15 使用同一冻结最终几何和语义状态完成独立整图重渲染：
+
+```text
+/data3/xzp/data/Onthefly/outputs/semantic_atom_v2_valid_footprint_r14/
+  Map_Products/stage_000399_final_refinement/
+```
+
+- 尺寸仍为9216×11264，`grid_id`、projection geometry、RGB model 和 semantic state
+  均与原最终 pair 相同；RGB/Semantic alignment 完全相同。
+- `r_s=14` 排除6211/942438个尺度异常高斯，可信最大世界尺度为约3.6844 m；
+  15仍残留379个纯黑像素被分类，因此14是本次测试中最宽的有效阈值。
+- 3618个纯黑 RGB 像素中，被分类数量由3618降为0；强度不超过1的18128个像素
+  也全部为 `ignore=255`。不以 RGB 颜色作为第四个 gate，避免拒绝合法暗色地物。
+- `unknown_pixels=17644952`；所有 pair、RGB 和 semantic 产品文件 hash 与文件大小
+  已独立复算一致。
+- 新 pair manifest SHA-256：
+  `fbe9e32b92b26d4d4e3944c2cd70ed326add28b9713bd62ae198dfe2d9593090`。
+- 新 semantic manifest SHA-256：
+  `41c06012d9edb99fd0d2917ad63f6fbcae74481c2180b316e88cc99206a81c03`。
 
 最终权威入口是：
 

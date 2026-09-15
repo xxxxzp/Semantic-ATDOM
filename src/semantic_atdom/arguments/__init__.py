@@ -152,6 +152,7 @@ class OptimizationParams(ParamGroup):
         self.MergeScene_Densification_Interval = 100
         self.MergeScene_Densify_Grad_Threshold = 0.0002
         self.GaussiansNumMax = 1000000
+        self.GaussianBudgetSlack = 0.05
         self.ResetOpacityUntilIter = 300000
         self.RenderAllImagesInterval = 5000
         self.InitialTrainingEvaluateInterval = 500

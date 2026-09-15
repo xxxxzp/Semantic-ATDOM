@@ -1766,7 +1766,8 @@ class GaussianTrainer(mp.Process):
                         self.gaussians.densify_and_prune(self.args.densify_grad_threshold, self.args.opacity_threshold,
                                                          self.scene.cameras_extent, size_threshold, radii)
                         budget_pruned = self.gaussians.prune_to_max_count(
-                            self.args.GaussiansNumMax
+                            self.args.GaussiansNumMax,
+                            self.args.GaussianBudgetSlack,
                         )
                         if budget_pruned:
                             print(
@@ -1834,7 +1835,8 @@ class GaussianTrainer(mp.Process):
                 self.gaussians.prune_points(prune_mask)
                 print(f"Prune Gaussians Num: {prune_mask.sum()}")
                 budget_pruned = self.gaussians.prune_to_max_count(
-                    self.args.GaussiansNumMax
+                    self.args.GaussiansNumMax,
+                    self.args.GaussianBudgetSlack,
                 )
                 if budget_pruned:
                     print(

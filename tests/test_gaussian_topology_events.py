@@ -196,6 +196,13 @@ class GaussianTopologyIntegrationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "positive"):
             model.prune_to_max_count(0)
 
+    def test_hard_budget_slack_batches_compaction(self):
+        model = self._make_model()
+        self.assertEqual(model.prune_to_max_count(2, slack_fraction=0.5), 0)
+        self.assertEqual(model.get_xyz.shape[0], 3)
+        with self.assertRaisesRegex(ValueError, "non-negative"):
+            model.prune_to_max_count(2, slack_fraction=-0.1)
+
     def test_observer_failure_never_interrupts_geometry_and_requires_rebuild(self):
         model = self._make_model()
 

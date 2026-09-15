@@ -25,6 +25,7 @@ from pytorch3d.transforms import quaternion_to_matrix
 from semantic_atdom.utils.graphics_utils import BasicPointCloud, getWorld2View2
 from semantic_atdom.semantics.topology import TopologyDelta
 import copy
+import math
 import warnings
 
 try:
@@ -851,7 +852,7 @@ class GaussianModel:
         if emit_topology:
             self._emit_topology_delta(topology_delta)
 
-    def prune_to_max_count(self, max_count):
+    def prune_to_max_count(self, max_count, slack_fraction=0.0):
         """Enforce a hard Gaussian budget using learned opacity as importance.
 
         Progressive sparse-point expansion is independent from densification,
@@ -863,10 +864,15 @@ class GaussianModel:
         max_count = int(max_count)
         if max_count <= 0:
             raise ValueError("max_count must be positive")
+        slack_fraction = float(slack_fraction)
+        if slack_fraction < 0:
+            raise ValueError("slack_fraction must be non-negative")
         point_count = int(self.get_xyz.shape[0])
-        excess = point_count - max_count
-        if excess <= 0:
+        slack_count = int(math.ceil(max_count * slack_fraction))
+        trigger_count = max_count + slack_count
+        if point_count <= trigger_count:
             return 0
+        excess = point_count - max_count
 
         # The last rasterization can leave several GiB in CUDA's cache.  The
         # optimizer/state slices below need temporary space while both the old

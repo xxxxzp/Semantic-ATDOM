@@ -851,6 +851,38 @@ class GaussianModel:
         if emit_topology:
             self._emit_topology_delta(topology_delta)
 
+    def prune_to_max_count(self, max_count):
+        """Enforce a hard Gaussian budget using learned opacity as importance.
+
+        Progressive sparse-point expansion is independent from densification,
+        so merely disabling densification at ``GaussiansNumMax`` does not bound
+        model memory.  Keep the most opaque Gaussians after a training phase;
+        ``prune_points`` also publishes the exact topology change to a bound
+        semantic state.
+        """
+        max_count = int(max_count)
+        if max_count <= 0:
+            raise ValueError("max_count must be positive")
+        point_count = int(self.get_xyz.shape[0])
+        excess = point_count - max_count
+        if excess <= 0:
+            return 0
+
+        importance = self._opacity.detach().reshape(-1)
+        keep_indices = torch.topk(
+            importance,
+            k=max_count,
+            largest=True,
+            sorted=False,
+        ).indices
+        prune_mask = torch.ones(
+            point_count, dtype=torch.bool, device=importance.device
+        )
+        prune_mask[keep_indices] = False
+        self.prune_points(prune_mask)
+        torch.cuda.empty_cache()
+        return excess
+
     def cat_tensors_to_optimizer(self, tensors_dict):
         optimizable_tensors = {}
         for group in self.optimizer.param_groups:

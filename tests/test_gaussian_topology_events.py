@@ -159,6 +159,43 @@ class GaussianTopologyIntegrationTests(unittest.TestCase):
         )
         self.assertEqual(state.gaussian_ids.tolist(), [0, 1, 2, 3])
 
+    def test_hard_budget_keeps_highest_opacity_and_aligns_semantics(self):
+        model = self._make_model()
+        model._opacity.data[:] = torch.tensor(
+            [[-2.0], [3.0], [1.0]], device="cuda"
+        )
+        state = SemanticGaussianState.initialize(3, 2, device="cuda")
+        state.semantic_support[:] = torch.tensor(
+            [10.0, 20.0, 30.0], device="cuda"
+        )
+        events = []
+
+        def apply_delta(delta):
+            events.append(delta.kind)
+            state.apply_topology(delta)
+
+        model.set_topology_observer(apply_delta, owner=state)
+        pruned = model.prune_to_max_count(2)
+
+        self.assertEqual(pruned, 1)
+        self.assertEqual(model.get_xyz.shape[0], 2)
+        self.assertEqual(state.num_gaussians, 2)
+        self.assertEqual(events, ["prune"])
+        torch.testing.assert_close(
+            model.get_xyz[:, 0], torch.tensor([20.0, 30.0], device="cuda")
+        )
+        torch.testing.assert_close(
+            state.semantic_support, torch.tensor([20.0, 30.0], device="cuda")
+        )
+
+    def test_hard_budget_is_a_noop_at_or_below_limit(self):
+        model = self._make_model()
+        self.assertEqual(model.prune_to_max_count(3), 0)
+        self.assertEqual(model.prune_to_max_count(4), 0)
+        self.assertEqual(model.get_xyz.shape[0], 3)
+        with self.assertRaisesRegex(ValueError, "positive"):
+            model.prune_to_max_count(0)
+
     def test_observer_failure_never_interrupts_geometry_and_requires_rebuild(self):
         model = self._make_model()
 

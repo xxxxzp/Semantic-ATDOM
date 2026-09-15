@@ -1746,6 +1746,16 @@ class GaussianTrainer(mp.Process):
                         size_threshold = 20 if self.AlreadyTrainingIterations > self.args.opacity_reset_interval else None
                         self.gaussians.densify_and_prune(self.args.densify_grad_threshold, self.args.opacity_threshold,
                                                          self.scene.cameras_extent, size_threshold, radii)
+                        budget_pruned = self.gaussians.prune_to_max_count(
+                            self.args.GaussiansNumMax
+                        )
+                        if budget_pruned:
+                            print(
+                                "Hard Gaussian budget pruned {} points; "
+                                "retained {}".format(
+                                    budget_pruned, self.args.GaussiansNumMax
+                                )
+                            )
                         GaussianPruned = True
                 '''
                 elif Training_Type == "Final_Refinement" and self.AlreadyTrainingIterations <= Start_From_Its + iteration / 2:
@@ -1795,6 +1805,15 @@ class GaussianTrainer(mp.Process):
                 prune_mask = (self.gaussians.get_opacity < self.args.opacity_threshold).squeeze()
                 self.gaussians.prune_points(prune_mask)
                 print(f"Prune Gaussians Num: {prune_mask.sum()}")
+                budget_pruned = self.gaussians.prune_to_max_count(
+                    self.args.GaussiansNumMax
+                )
+                if budget_pruned:
+                    print(
+                        "Hard Gaussian budget pruned {} points; retained {}".format(
+                            budget_pruned, self.args.GaussiansNumMax
+                        )
+                    )
 
         # 如果需要，进行一次影像渲染或者TDOM的生成
         if Training_Type == "On_The_Fly" and self.args.render_RGB:

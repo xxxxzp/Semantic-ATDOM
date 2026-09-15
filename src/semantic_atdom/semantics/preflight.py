@@ -16,7 +16,8 @@ from semantic_atdom.semantics.orchestrator import AcquisitionOverlap
 from semantic_atdom.semantics.schema import SemanticDataset, SemanticSchemaError, sha256_file
 
 
-_IMAGE_ID = re.compile(r"^[0-9]{6}$")
+_IMAGE_ID = re.compile(r"^[^/\\\x00]+$")
+_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".tif", ".tiff"}
 
 
 def _save_json_atomic(path: Path, payload: Mapping[str, object]) -> None:
@@ -66,7 +67,7 @@ def _read_colmap_image_names(path: Path) -> Tuple[str, ...]:
                 stream.seek(24 * point_count, os.SEEK_CUR)
                 image_id = Path(name).stem
                 if _IMAGE_ID.fullmatch(image_id) is None:
-                    raise ValueError("image name must use a six-digit stem: {}".format(name))
+                    raise ValueError("image name has an invalid stem: {}".format(name))
                 names.append((image_id, name))
     except (OSError, UnicodeError, struct.error, ValueError) as error:
         raise SemanticSchemaError(
@@ -86,6 +87,28 @@ def _stage_sparse_root(stage_root: Path) -> Path:
     if binary.is_dir():
         return binary
     raise SemanticSchemaError("stage has neither sparse/0 nor bin: {}".format(stage_root))
+
+
+def _index_rgb_images(root: Path) -> Dict[str, Path]:
+    try:
+        paths = tuple(
+            path
+            for path in root.iterdir()
+            if path.is_file() and path.suffix.lower() in _IMAGE_EXTENSIONS
+        )
+    except OSError as error:
+        raise SemanticSchemaError(
+            "unable to read RGB image directory {}: {}".format(root, error)
+        )
+    index = {}
+    for path in paths:
+        image_id = path.stem
+        if image_id in index:
+            raise SemanticSchemaError(
+                "RGB image id {} is ambiguous in {}".format(image_id, root)
+            )
+        index[image_id] = path
+    return index
 
 
 @dataclass(frozen=True)
@@ -145,37 +168,51 @@ def run_dataset_preflight(
     stage_records = []
     previous_ids = set()
     final_names = ()
+    shared_image_root = (
+        Path(image_folder_path).expanduser().resolve()
+        if image_folder_path is not None and str(image_folder_path).strip()
+        else None
+    )
+    shared_rgb_index = (
+        _index_rgb_images(shared_image_root) if shared_image_root is not None else None
+    )
     for stage in selected:
         stage_root = dataset_root / str(stage)
         sparse_root = _stage_sparse_root(stage_root)
+        names_path, matrix_path = AcquisitionOverlap.input_paths(stage_root)
         required = (
             sparse_root / "images.bin",
             sparse_root / "cameras.bin",
             sparse_root / "points3D.bin",
-            sparse_root / "imagesNames.txt",
-            sparse_root / "imageMatchMatrix.txt",
+            names_path,
+            matrix_path,
         )
         missing_files = [str(path) for path in required if not path.is_file()]
         if missing_files:
             raise SemanticSchemaError(
                 "stage {} is missing required files: {}".format(stage, missing_files)
             )
-        image_names = _read_colmap_image_names(sparse_root / "images.bin")
-        image_ids = tuple(item[0] for item in image_names)
-        current_ids = set(image_ids)
-        if not previous_ids.issubset(current_ids):
-            raise SemanticSchemaError("stage {} is not cumulative".format(stage))
+        snapshot_image_names = _read_colmap_image_names(sparse_root / "images.bin")
+        snapshot_ids = {item[0] for item in snapshot_image_names}
         overlap = AcquisitionOverlap.load(stage_root)
-        if set(overlap.image_ids) != current_ids:
+        image_ids = overlap.image_ids
+        current_ids = set(image_ids)
+        identity_set_is_cumulative = previous_ids.issubset(current_ids)
+        if not snapshot_ids.issubset(current_ids):
             raise SemanticSchemaError(
-                "stage {} overlap identities do not match COLMAP cameras".format(stage)
+                "stage {} local COLMAP identities are absent from cumulative overlap identities".format(
+                    stage
+                )
             )
         stage_image_root = (
-            Path(image_folder_path).expanduser().resolve()
-            if image_folder_path is not None and str(image_folder_path).strip()
-            else stage_root / "images"
+            shared_image_root if shared_image_root is not None else stage_root / "images"
         )
-        absent_rgb = [name for _, name in image_names if not (stage_image_root / name).is_file()]
+        rgb_index = (
+            shared_rgb_index
+            if shared_rgb_index is not None
+            else _index_rgb_images(stage_image_root)
+        )
+        absent_rgb = sorted(current_ids - set(rgb_index))
         if absent_rgb:
             raise SemanticSchemaError(
                 "stage {} is missing RGB images: {}".format(stage, absent_rgb[:10])
@@ -184,18 +221,19 @@ def run_dataset_preflight(
             {
                 "stage": stage,
                 "camera_count": len(image_ids),
+                "snapshot_camera_count": len(snapshot_ids),
                 "stage_number_matches_camera_count": len(image_ids) == stage,
+                "identity_set_is_cumulative": identity_set_is_cumulative,
                 "new_image_ids": sorted(current_ids - previous_ids),
+                "dropped_image_ids": sorted(previous_ids - current_ids),
                 "images_bin_sha256": sha256_file(sparse_root / "images.bin"),
                 "cameras_bin_sha256": sha256_file(sparse_root / "cameras.bin"),
-                "images_names_sha256": sha256_file(sparse_root / "imagesNames.txt"),
-                "overlap_matrix_sha256": sha256_file(
-                    sparse_root / "imageMatchMatrix.txt"
-                ),
+                "images_names_sha256": sha256_file(names_path),
+                "overlap_matrix_sha256": sha256_file(matrix_path),
             }
         )
         previous_ids = current_ids
-        final_names = image_names
+        final_names = tuple((image_id, rgb_index[image_id].name) for image_id in image_ids)
 
     semantic_dataset = SemanticDataset(semantic_data_root)
     class_counts = np.zeros(semantic_dataset.class_spec.num_classes, dtype=np.int64)
@@ -204,11 +242,7 @@ def run_dataset_preflight(
     source_unverified = []
     labels = []
     final_stage_root = dataset_root / str(selected[-1])
-    final_image_root = (
-        Path(image_folder_path).expanduser().resolve()
-        if image_folder_path is not None and str(image_folder_path).strip()
-        else final_stage_root / "images"
-    )
+    final_image_root = shared_image_root or final_stage_root / "images"
     for image_id, image_name in sorted(final_names):
         observation = semantic_dataset.load_observation(image_id)
         rgb_path = final_image_root / image_name

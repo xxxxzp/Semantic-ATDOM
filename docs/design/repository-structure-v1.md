@@ -61,6 +61,7 @@ Semantic-A-TDOM/
 │
 ├── tools/
 │   ├── train_progressive.py
+│   ├── prepare_id_labels.py
 │   ├── train_windowed.py
 │   ├── train_gui.py
 │   ├── render.py
@@ -143,6 +144,7 @@ from semantic_atdom.utils.loss_utils import l1_loss
 | `render.py` | `tools/render.py` | 渲染入口 |
 | `convert.py` | `tools/convert_colmap.py` | COLMAP 转换入口 |
 | `metrics.py` | `tools/evaluate_metrics.py` | 现有 RGB 指标入口 |
+| — | `tools/prepare_id_labels.py` | 显式 ID 映射语义标签适配入口 |
 | `DatasetPrepare.py` | `tools/legacy/prepare_dataset.py` | 硬编码数据准备脚本 |
 | `DownSample.py` | `tools/legacy/downsample_images.py` | 硬编码图像处理脚本 |
 | `GetDemo.py` | `tools/legacy/create_demo_video.py` | 硬编码视频生成脚本 |

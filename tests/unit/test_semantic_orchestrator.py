@@ -115,6 +115,29 @@ class AcquisitionOverlapTests(unittest.TestCase):
         self.assertEqual(result.normalized("000001", "000002"), 0.5)
         self.assertEqual(result.normalized("000002", "000003"), 0.8)
 
+    def test_fixed_layout_parses_inline_markers_and_decimal_timestamps(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            marker = "00007FFE9CAB9DE0"
+            (root / "match_matrix_image_name.txt").write_text(
+                "1658137108.010.jpg,1658137107.900.jpg" + marker,
+                encoding="utf-8",
+            )
+            (root / "match_matrix_value.txt").write_text(
+                "100,25" + marker + "25,50" + marker,
+                encoding="utf-8",
+            )
+
+            result = AcquisitionOverlap.load(root)
+
+        self.assertEqual(
+            result.acquisition_order,
+            ("1658137107.900", "1658137108.010"),
+        )
+        self.assertEqual(
+            result.normalized("1658137108.010", "1658137107.900"), 0.5
+        )
+
     def test_anchor_overlap_prevents_transitive_group_growth(self):
         matrix = overlap(
             ["000001", "000002", "000003"],

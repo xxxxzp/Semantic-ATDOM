@@ -28,6 +28,18 @@ import time
 from scipy.spatial import Delaunay
 import cv2
 
+
+_IMAGE_SUFFIXES = frozenset({".jpg", ".jpeg", ".png", ".tif", ".tiff"})
+
+
+def _image_identity(value):
+    path = Path(str(value))
+    return path.stem if path.suffix.lower() in _IMAGE_SUFFIXES else path.name
+
+
+def _with_image_suffix(value, suffix):
+    return str(Path(value).with_suffix(suffix))
+
 class CameraInfo(NamedTuple):
     uid: int
     R: np.array
@@ -563,7 +575,7 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder, Do_Get_Tri_
     for idx, key in enumerate(cam_extrinsics):
         extr = cam_extrinsics[key]
         image_path = os.path.join(images_folder, os.path.basename(extr.name))
-        image_name = os.path.basename(image_path).split(".")[0]
+        image_name = _image_identity(image_path)
 
         sys.stdout.write('\r')
         # the exact output you're looking for:
@@ -605,11 +617,11 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder, Do_Get_Tri_
 
         if os.path.exists(image_path):
             image = Image.open(image_path)
-        elif os.path.exists(image_path.split(".")[0] + ".jpg"):
-            image_path = image_path.split(".")[0] + ".jpg"
+        elif os.path.exists(_with_image_suffix(image_path, ".jpg")):
+            image_path = _with_image_suffix(image_path, ".jpg")
             image = Image.open(image_path)
         else:
-            image_path = image_path.split(".")[0] + ".png"
+            image_path = _with_image_suffix(image_path, ".png")
             image = Image.open(image_path)
 
         Tri_Mask = None
@@ -665,16 +677,16 @@ def On_the_Fly_readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder, 
             assert False, "Colmap camera model not handled: only undistorted datasets (PINHOLE or SIMPLE_PINHOLE cameras) supported!"
 
         image_path = os.path.join(images_folder, os.path.basename(extr.name))
-        image_name = os.path.basename(image_path).split(".")[0]
+        image_name = _image_identity(image_path)
 
         if image_name not in CurrentImagesNames:
             if os.path.exists(image_path):
                 image = Image.open(image_path)
-            elif os.path.exists(image_path.split(".")[0] + ".jpg"):
-                image_path = image_path.split(".")[0] + ".jpg"
+            elif os.path.exists(_with_image_suffix(image_path, ".jpg")):
+                image_path = _with_image_suffix(image_path, ".jpg")
                 image = Image.open(image_path)
             else:
-                image_path = image_path.split(".")[0] + ".png"
+                image_path = _with_image_suffix(image_path, ".png")
                 image = Image.open(image_path)
 
             if Do_Get_Tri_Mask:
@@ -738,15 +750,15 @@ def SingleImage_readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder,
             assert False, "Colmap camera model not handled: only undistorted datasets (PINHOLE or SIMPLE_PINHOLE cameras) supported!"
 
         image_path = os.path.join(images_folder, os.path.basename(extr.name))
-        image_name = os.path.basename(image_path).split(".")[0]
+        image_name = _image_identity(image_path)
 
-        if (image_name != "" and image_name == Image_Name.split(".")[0]) or (CurrentImagesNames != [] and image_name not in CurrentImagesNames):
+        if (image_name != "" and image_name == _image_identity(Image_Name)) or (CurrentImagesNames != [] and image_name not in CurrentImagesNames):
             if os.path.exists(image_path):
                 image_path = image_path
-            elif os.path.exists(image_path.split(".")[0] + ".jpg"):
-                image_path = image_path.split(".")[0] + ".jpg"
+            elif os.path.exists(_with_image_suffix(image_path, ".jpg")):
+                image_path = _with_image_suffix(image_path, ".jpg")
             else:
-                image_path = image_path.split(".")[0] + ".png"
+                image_path = _with_image_suffix(image_path, ".png")
             # print(image_path)
 
             image = Image.open(image_path)
@@ -931,7 +943,7 @@ def SingleImage_readColmapSceneInfo_Part1(path, images, eval, llffhold=8, Image_
     # 仅保留选中的影像（这一步在渐进式训练中不进行，因为需要更新其他训练影像的位姿）
     if CurrentImagesNames == []:
         for i in range(len(train_cam_infos)):
-            if Image_Name != "" and train_cam_infos[i].image_name == Image_Name.split('.')[0]:
+            if Image_Name != "" and train_cam_infos[i].image_name == _image_identity(Image_Name):
                 train_cam_infos = [train_cam_infos[i]]
                 break
 
@@ -1170,7 +1182,7 @@ def SingleImage_readColmapSceneInfo(path, images, eval, llffhold=8, get_ply=True
     # 仅保留选中的影像（这一步在渐进式训练中不进行，因为需要更新其他训练影像的位姿）
     if CurrentImagesNames == []:
         for i in range(len(train_cam_infos)):
-            if Image_Name != "" and train_cam_infos[i].image_name == Image_Name.split('.')[0]:
+            if Image_Name != "" and train_cam_infos[i].image_name == _image_identity(Image_Name):
                 train_cam_infos = [train_cam_infos[i]]
                 break
 

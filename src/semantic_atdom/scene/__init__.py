@@ -12,6 +12,7 @@
 import os
 import random
 import json
+from pathlib import Path
 from semantic_atdom.utils.system_utils import searchForMaxIteration
 from semantic_atdom.scene.dataset_readers import sceneLoadTypeCallbacks
 from semantic_atdom.scene.gaussian_model import GaussianModel
@@ -335,9 +336,9 @@ class Scene:
                 # 如果需要还原成原始的形状 [C, H, W] 或 [H, W]，可以移除额外的维度
                 downsampled_image = downsampled_image.squeeze(0)  # 移除 batch 维度
 
-                self.DepthMap[image_file.split(".")[0]] = downsampled_image[0]
+                self.DepthMap[Path(image_file).stem] = downsampled_image[0]
             else:
-                self.DepthMap[image_file.split(".")[0]] = image
+                self.DepthMap[Path(image_file).stem] = image
 
     # 读入所有的法线图GT
     def ReadInNormalAll(self, path, device):
@@ -374,7 +375,7 @@ class Scene:
 
             normal = -((image * 2) - 1)
 
-            self.NormalMap[image_file.split(".")[0]] = normal
+            self.NormalMap[Path(image_file).stem] = normal
 
 class Scene_Second:
 

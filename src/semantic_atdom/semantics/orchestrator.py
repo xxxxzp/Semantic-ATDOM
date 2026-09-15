@@ -2,6 +2,8 @@
 
 from dataclasses import dataclass, replace
 from concurrent.futures import ThreadPoolExecutor
+from decimal import Decimal, InvalidOperation
+import io
 import json
 import math
 import os
@@ -26,6 +28,7 @@ from semantic_atdom.semantics.schema import (
     SemanticLedger,
     SemanticObservation,
     SemanticSchemaError,
+    normalize_image_id,
     sha256_file,
 )
 from semantic_atdom.semantics.state import SemanticGaussianState
@@ -50,17 +53,26 @@ from semantic_atdom.utils.image_utils import tdom_to_uint8
 
 
 def _image_id(value: object) -> str:
-    result = Path(str(value)).stem
-    if not result:
-        raise ValueError("image id must not be empty")
-    return result
+    return normalize_image_id(value)
 
 
 def _acquisition_key(image_id: str):
-    match = re.search(r"(\d+)$", image_id)
-    if match is None:
-        return (1, image_id)
-    return (0, int(match.group(1)), image_id)
+    try:
+        return (0, Decimal(image_id), image_id)
+    except InvalidOperation:
+        match = re.search(r"(\d+)$", image_id)
+        if match is None:
+            return (2, image_id)
+        return (1, image_id[: match.start()], int(match.group(1)), image_id)
+
+
+_INLINE_RECORD_SEPARATOR = re.compile(r"0000[1-9A-Fa-f][0-9A-Fa-f]{11}")
+
+
+def _read_exported_text(path: Path) -> str:
+    """Read vendor text exports that may contain an inline record marker."""
+    content = path.read_text(encoding="utf-8")
+    return _INLINE_RECORD_SEPARATOR.sub("\n", content)
 
 
 _GEOMETRY_ATTRIBUTE_NAMES = RGB_MODEL_ATTRIBUTE_NAMES
@@ -146,28 +158,53 @@ class AcquisitionOverlap:
     image_ids: Tuple[str, ...]
     matrix: np.ndarray
 
+    @staticmethod
+    def input_paths(snapshot_root: Path) -> Tuple[Path, Path]:
+        snapshot_root = Path(snapshot_root)
+        legacy_root = snapshot_root / "sparse" / "0"
+        candidates = (
+            (
+                legacy_root / "imagesNames.txt",
+                legacy_root / "imageMatchMatrix.txt",
+            ),
+            (
+                snapshot_root / "match_matrix_image_name.txt",
+                snapshot_root / "match_matrix_value.txt",
+            ),
+        )
+        for names_path, matrix_path in candidates:
+            if names_path.is_file() and matrix_path.is_file():
+                return names_path, matrix_path
+        raise SemanticSchemaError(
+            "stage is missing overlap inputs; expected either {} and {}, or {} and {}".format(
+                *[str(path) for pair in candidates for path in pair]
+            )
+        )
+
     @classmethod
     def load(cls, snapshot_root: Path) -> "AcquisitionOverlap":
-        sparse_root = Path(snapshot_root) / "sparse" / "0"
-        names_path = sparse_root / "imagesNames.txt"
-        matrix_path = sparse_root / "imageMatchMatrix.txt"
         try:
-            raw_names = names_path.read_text(encoding="utf-8")
+            names_path, matrix_path = cls.input_paths(snapshot_root)
+            raw_names = _read_exported_text(names_path)
             names = tuple(
                 _image_id(item)
                 for item in re.split(r"[,\s]+", raw_names.strip())
                 if item
             )
-            matrix = np.loadtxt(str(matrix_path), delimiter=",", dtype=np.float64)
+            matrix = np.loadtxt(
+                io.StringIO(_read_exported_text(matrix_path)),
+                delimiter=",",
+                dtype=np.float64,
+            )
         except (OSError, ValueError) as error:
             raise SemanticSchemaError(
                 "unable to load COLMAP overlap inputs from {}: {}".format(
-                    sparse_root, error
+                    snapshot_root, error
                 )
             )
         if len(names) == 0 or len(names) != len(set(names)):
             raise SemanticSchemaError(
-                "imagesNames.txt must contain unique image ids"
+                "overlap names must contain unique image ids"
             )
         if matrix.ndim == 0 and len(names) == 1:
             matrix = matrix.reshape(1, 1)
@@ -175,13 +212,13 @@ class AcquisitionOverlap:
             matrix = matrix.reshape(1, 1)
         if matrix.shape != (len(names), len(names)):
             raise SemanticSchemaError(
-                "imageMatchMatrix shape {} does not match {} names".format(
+                "overlap matrix shape {} does not match {} names".format(
                     matrix.shape, len(names)
                 )
             )
         if not bool(np.isfinite(matrix).all()) or bool((matrix < 0).any()):
             raise SemanticSchemaError(
-                "imageMatchMatrix must contain finite non-negative counts"
+                "overlap matrix must contain finite non-negative counts"
             )
         return cls(names, matrix)
 
@@ -198,7 +235,7 @@ class AcquisitionOverlap:
             j = positions[second]
         except KeyError as error:
             raise SemanticSchemaError(
-                "image {} is absent from imagesNames.txt".format(error.args[0])
+                "image {} is absent from overlap names".format(error.args[0])
             )
         denominator = min(float(self.matrix[i, i]), float(self.matrix[j, j]))
         if denominator <= 0:

@@ -135,6 +135,73 @@ class DatasetPreflightTests(unittest.TestCase):
                     end_stage=2,
                 )
 
+    def test_fixed_layout_uses_cumulative_overlap_and_shared_rgb_images(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            dataset, semantic_data = self._fixture(root)
+            fixed = root / "scene" / "GaussianSplatting"
+            shared_images = root / "scene" / "interval5_CAM"
+            shared_images.mkdir(parents=True)
+            ids = ("1658137107.900", "1658137108.010")
+            semantic = semantic_data / "semantic"
+            spec = SemanticClassSpec.load(semantic / "class_spec.json")
+            for index, image_id in enumerate(ids, start=1):
+                rgb_path = shared_images / (image_id + ".jpg")
+                Image.fromarray(np.zeros((2, 2, 3), dtype=np.uint8)).save(rgb_path)
+                label_path = semantic / "labels" / (image_id + ".png")
+                Image.fromarray(np.ones((2, 2), dtype=np.uint8)).save(label_path)
+                metadata = {
+                    "schema_version": 1,
+                    "image_id": image_id,
+                    "label_version": "fixture-v1",
+                    "model": "fixture",
+                    "checkpoint_sha256": hashlib.sha256(b"model").hexdigest(),
+                    "prompt_config": {},
+                    "thresholds": {},
+                    "width": 2,
+                    "height": 2,
+                    "class_spec_sha256": spec.fingerprint,
+                    "label_sha256": sha256_file(label_path),
+                    "source_image_sha256": sha256_file(rgb_path),
+                }
+                (semantic / "metadata" / (image_id + ".json")).write_text(
+                    json.dumps(metadata), encoding="utf-8"
+                )
+            marker = "00007FFE9CAB9DE0"
+            for stage in (1, 2):
+                stage_root = fixed / str(stage)
+                binary = stage_root / "bin"
+                binary.mkdir(parents=True)
+                local_name = ids[stage - 1] + ".jpg"
+                _write_images_binary(binary / "images.bin", (local_name,))
+                (binary / "cameras.bin").write_bytes(b"camera")
+                (binary / "points3D.bin").write_bytes(b"points")
+                names = ids[:stage]
+                (stage_root / "match_matrix_image_name.txt").write_text(
+                    ",".join(item + ".jpg" for item in names) + marker,
+                    encoding="utf-8",
+                )
+                rows = []
+                for row in np.eye(stage, dtype=np.int64):
+                    rows.append(",".join(str(value) for value in row))
+                (stage_root / "match_matrix_value.txt").write_text(
+                    marker.join(rows) + marker, encoding="utf-8"
+                )
+
+            result = run_dataset_preflight(
+                dataset_root=fixed,
+                semantic_data_root=semantic_data,
+                output_root=root / "fixed-output",
+                start_stage=1,
+                end_stage=2,
+                image_folder_path=shared_images,
+            )
+            report = json.loads(result.report_path.read_text(encoding="utf-8"))
+
+            self.assertEqual(result.final_image_ids, ids)
+            self.assertEqual(report["stage_records"][1]["camera_count"], 2)
+            self.assertEqual(report["stage_records"][1]["snapshot_camera_count"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()

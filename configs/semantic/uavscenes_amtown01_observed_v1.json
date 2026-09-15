@@ -1,0 +1,45 @@
+{
+  "schema_version": 1,
+  "label_version": "uavscenes-amtown01-observed-v1",
+  "producer": "UAVScenes human annotation via explicit ID adapter",
+  "source": "https://github.com/sijieaaa/UAVScenes/blob/main/cmap.py",
+  "scope": "Source IDs observed in interval5_AMtown01; fail closed on any new ID",
+  "source_id_to_class_id": {
+    "0": 0,
+    "1": 1,
+    "2": 2,
+    "3": 3,
+    "5": 4,
+    "6": 5,
+    "13": 6,
+    "14": 7,
+    "15": 8,
+    "16": 9,
+    "17": 10,
+    "19": 11,
+    "20": 12,
+    "24": 13,
+    "25": 14
+  },
+  "class_spec": {
+    "schema_version": 1,
+    "ignore_id": 255,
+    "classes": [
+      {"id": 0, "name": "background", "color": [0, 0, 0], "is_background": true},
+      {"id": 1, "name": "roof", "color": [119, 11, 32]},
+      {"id": 2, "name": "dirt_motor_road", "color": [180, 165, 180]},
+      {"id": 3, "name": "paved_motor_road", "color": [128, 64, 128]},
+      {"id": 4, "name": "pool", "color": [0, 80, 100]},
+      {"id": 5, "name": "bridge", "color": [150, 100, 100]},
+      {"id": 6, "name": "green_field", "color": [107, 142, 35]},
+      {"id": 7, "name": "wild_field", "color": [210, 180, 140]},
+      {"id": 8, "name": "solar_board", "color": [220, 220, 0]},
+      {"id": 9, "name": "umbrella", "color": [153, 153, 153]},
+      {"id": 10, "name": "transparent_roof", "color": [0, 0, 90]},
+      {"id": 11, "name": "paved_walk", "color": [244, 35, 232]},
+      {"id": 12, "name": "sedan", "color": [0, 0, 142]},
+      {"id": 13, "name": "truck", "color": [0, 0, 70]},
+      {"id": 14, "name": "unnamed_25", "color": [0, 60, 100]}
+    ]
+  }
+}

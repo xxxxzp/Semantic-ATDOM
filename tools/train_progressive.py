@@ -22,6 +22,10 @@ from semantic_atdom.scene.cameras import Camera, DummyCamera, DummyPipeline
 from semantic_atdom.utils.camera_utils import camera_to_JSON
 import json
 from semantic_atdom.scene.dataset_readers import sceneLoadTypeCallbacks
+from semantic_atdom.scene.progressive_layout import (
+    resolve_progressive_dataset_layout,
+    select_progressive_stages,
+)
 from semantic_atdom.utils.general_utils import PILtoTorch
 import numpy as np
 import shutil
@@ -132,8 +136,13 @@ def GetArgs():
 
     # 输出存储训练后模型的存储位置
     print("Optimizing " + args.Source_Path_Dir)
-    if os.path.exists(os.path.join(args.Source_Path_Dir, "GaussianSplatting")):
-        args.Source_Path_Dir = os.path.join(args.Source_Path_Dir, "GaussianSplatting")
+    layout = resolve_progressive_dataset_layout(
+        args.Source_Path_Dir, args.Image_Folder_Path or None
+    )
+    args.Source_Path_Dir = str(layout.progressive_root)
+    if not args.Image_Folder_Path and layout.image_root is not None:
+        args.Image_Folder_Path = str(layout.image_root)
+        print("Discovered shared RGB folder: " + args.Image_Folder_Path)
 
     return args, lp, op, pp
 
@@ -165,14 +174,13 @@ def TrainingPreparation(args):
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
 
     # 读取所有的source_path
-    IM = []
-    for name in os.listdir(args.Source_Path_Dir):
-        if name != "images":
-            if os.path.isdir(os.path.join(args.Source_Path_Dir, name)) and int(name) >= args.StartFromImageNo and (int(name) <= args.EndAtImageNo or args.EndAtImageNo <= args.StartFromImageNo):
-                IM.append(int(name))
-
-    # IM = [int(name) for name in os.listdir(args.Source_Path_Dir) if os.path.isdir(os.path.join(args.Source_Path_Dir, name))]
-    IM = sorted(IM)
+    IM = list(
+        select_progressive_stages(
+            args.Source_Path_Dir,
+            args.StartFromImageNo,
+            args.EndAtImageNo,
+        )
+    )
     if not IM:
         raise ValueError("no progressive stages match the requested range")
     dataset_id = hashlib.sha256(
@@ -859,7 +867,25 @@ class DataPreProccesser(mp.Process):
 
         StartFrom = 0 if self.args.ContinueFromImageNo == -1 else self.args.ContinueFromImageNo - self.args.StartFromImageNo
         if StartFrom > len(self.source_path_list) - 2:
-            return 0
+            while True:
+                if self.DataPreProccesser_queue.empty():
+                    continue
+                command = self.DataPreProccesser_queue.get()
+                if command[0] in ("Progressive_First_Step", "Progressive"):
+                    self.args.source_path = self.source_path_list[-1]
+                    self.args.model_path = self.model_path_list[-1]
+                    self.args.source_path_second = self.source_path_list[-1]
+                    self.args.model_path_second = self.model_path_list[-1]
+                    print("DataPreProccesser: Start Final Refinement...")
+                    self.GaussianTrainer_queue.put(
+                        ["Final_Refinement", self.args.model_path]
+                    )
+                    while True:
+                        if not self.DataPreProccesser_queue.empty():
+                            if self.DataPreProccesser_queue.get()[0] == "stop":
+                                return 0
+                if command[0] == "stop":
+                    return 0
 
         ProgressiveTrainingTime = StartFrom
         while True:

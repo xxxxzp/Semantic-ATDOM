@@ -189,6 +189,19 @@ class ObservationKey:
     label_version: str
 
 
+_IMAGE_SUFFIXES = frozenset({".jpg", ".jpeg", ".png", ".tif", ".tiff"})
+
+
+def normalize_image_id(value: object) -> str:
+    """Return an image identity while preserving decimal timestamp suffixes."""
+    text = str(value)
+    path = Path(text)
+    result = path.stem if path.suffix.lower() in _IMAGE_SUFFIXES else path.name
+    if not result:
+        raise SemanticSchemaError("image_id must not be empty")
+    return result
+
+
 @dataclass(frozen=True)
 class SemanticObservation:
     key: ObservationKey
@@ -212,9 +225,7 @@ class SemanticDataset:
     def load_observation(
         self, image_id: str, require_scores: bool = False
     ) -> SemanticObservation:
-        image_id = Path(str(image_id)).stem
-        if not image_id:
-            raise SemanticSchemaError("image_id must not be empty")
+        image_id = normalize_image_id(image_id)
         label_path = self.semantic_root / "labels" / (image_id + ".png")
         metadata_path = self.semantic_root / "metadata" / (image_id + ".json")
         score_path = self.semantic_root / "scores" / (image_id + ".npy")

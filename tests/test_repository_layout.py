@@ -79,6 +79,7 @@ class RepositoryLayoutTests(unittest.TestCase):
             "render.py",
             "convert_colmap.py",
             "evaluate_metrics.py",
+            "prepare_id_labels.py",
         }
         self.assertEqual(supported, {path.name for path in (ROOT / "tools").glob("*.py")})
 

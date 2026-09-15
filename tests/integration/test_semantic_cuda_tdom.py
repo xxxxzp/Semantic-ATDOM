@@ -156,6 +156,93 @@ class SemanticCudaTdomTests(unittest.TestCase):
         self.assertEqual(striped.device.type, "cpu")
         torch.testing.assert_close(striped, full.cpu(), atol=1e-5, rtol=1e-5)
 
+    def test_scale_outlier_filter_prevents_giant_border_classification(self):
+        class Gaussians:
+            get_xyz = torch.tensor(
+                [
+                    [-0.10, -0.10, 2.0],
+                    [0.10, -0.10, 2.0],
+                    [-0.10, 0.10, 2.0],
+                    [0.10, 0.10, 2.0],
+                    [0.0, 0.0, 2.0],
+                ],
+                dtype=torch.float32,
+                device="cuda",
+            )
+            get_opacity = torch.full(
+                (5, 1), 0.95, dtype=torch.float32, device="cuda"
+            )
+            get_scaling = torch.tensor(
+                [
+                    [0.20, 0.20, 0.20],
+                    [0.20, 0.20, 0.20],
+                    [0.20, 0.20, 0.20],
+                    [0.20, 0.20, 0.20],
+                    [5.0, 5.0, 5.0],
+                ],
+                dtype=torch.float32,
+                device="cuda",
+            )
+            get_rotation = torch.tensor(
+                [[1.0, 0.0, 0.0, 0.0]] * 5,
+                dtype=torch.float32,
+                device="cuda",
+            )
+
+        camera = DummyCamera(
+            np.eye(3, dtype=np.float32),
+            np.zeros(3, dtype=np.float32),
+            1.0,
+            1.0,
+            32,
+            32,
+        )
+        state = SemanticGaussianState.initialize(5, 2, device="cuda")
+        state.add_evidence(
+            torch.tensor(
+                [
+                    [8.0, 1.0],
+                    [8.0, 1.0],
+                    [8.0, 1.0],
+                    [8.0, 1.0],
+                    [1.0, 8.0],
+                ],
+                device="cuda",
+            )
+        )
+        unfiltered = rasterize_semantic_tdom(
+            Gaussians(),
+            state,
+            camera,
+            self._two_class_spec(),
+            config=SemanticTdomConfig(
+                max_gaussian_scale_ratio=0.0,
+                min_free_cuda_bytes=0,
+            ),
+        )
+        filtered = rasterize_semantic_tdom(
+            Gaussians(),
+            state,
+            camera,
+            self._two_class_spec(),
+            config=SemanticTdomConfig(
+                max_gaussian_scale_ratio=14.0,
+                min_free_cuda_bytes=0,
+            ),
+        )
+
+        self.assertEqual(int(unfiltered.class_ids[0, 0]), 1)
+        self.assertEqual(int(filtered.class_ids[0, 0]), 255)
+        self.assertNotEqual(int(filtered.class_ids[16, 16]), 255)
+        self.assertEqual(
+            filtered.metrics["geometry_validity_filter"][
+                "excluded_gaussian_count"
+            ],
+            1,
+        )
+        self.assertEqual(filtered.radii.shape[0], 5)
+        self.assertEqual(float(filtered.radii[-1]), 0.0)
+
     def test_rgb_tdom_honors_non_default_pytorch_stream(self):
         class Gaussians:
             active_sh_degree = 0

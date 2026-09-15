@@ -117,6 +117,7 @@ class RepositoryLayoutTests(unittest.TestCase):
                 "0004-clean-atdom-lineage.md",
                 "0005-evidence-conditioned-semantic-rendering.md",
                 "0006-bounded-online-semantic-products.md",
+                "0007-bound-semantic-render-support.md",
             },
             {path.name for path in decisions.glob("*.md")},
         )

@@ -312,7 +312,22 @@ B_g(k)=\rho_g\tilde q_g(k)=\frac{E_{gk}}{A_g}
 
 没有真实证据时 `rho_g=0`，该高斯不向任何类别 numerator 提供质量；`tilde q_g` 视为未定义。均匀先验不能生成 background 或其他类别。
 
-令 `kappa_pg` 为与 RGB TDOM 相同排序和 alpha compositing 得到的几何权重：
+渐进几何可能含有少量异常膨胀高斯：其 SH 外观在 RGB 中接近黑色，但高 opacity
+仍会把语义类别扩散到地图边缘。Semantic TDOM 因此先构造只读可信支持域
+
+\[
+\mathcal G_{trusted}=\left\{g:\max(\mathbf s_g)\le
+r_s\operatorname{median}_h\max(\mathbf s_h)\right\},
+\]
+
+V1 工程默认值为20；V2 在完整 Phantom3 冻结快照上取 `r_s=14`，设为0可关闭。
+14是已测试的最宽有效阈值：15仍留下379个纯黑 RGB 像素被分类。该筛选同步作用于语义几何、类别 evidence 和诊断
+feature，只影响 Semantic TDOM 产品渲染，不删除或修改高斯，也不影响 RGB、训练或
+几何优化。输入、保留、排除数量及实际尺度阈值必须进入 manifest render metrics。
+它是光栅化前的支持域清理，不是第四个像素 hard-map gate。
+
+令 `kappa_pg` 为在 `g in G_trusted` 上按与 RGB TDOM 相同排序和 alpha
+compositing 得到的几何权重；被排除高斯的 `kappa_pg=0`：
 
 \[
 C_p=\sum_g\kappa_{pg}
@@ -546,6 +561,7 @@ semantic method/config versions
 | min geometry coverage | 0.05 | hard-map gate |
 | min pixel evidence support | 0.01 | hard-map gate |
 | min pixel support ratio | 0.05 | hard-map gate |
+| max Gaussian scale ratio | 14.0 | semantic raster support-domain filter；0关闭 |
 
 这些值全部必须配置化并写入 manifest；当前没有人工真值或正式评测支持其最优性。
 
@@ -566,4 +582,4 @@ semantic method/config versions
 
 CPU 数学合同先于 CUDA 实现稳定。单元测试不替代端到端运行；每项仍未完成的验证必须显式标为“未验证”。
 
-当前实现已经覆盖 evidence-conditioned numerator、prior-free LOO、三条件 gate、新 schema、投影专用 snapshot、固定本地网格、原子 RGB/Semantic pair、独立 final rebuild 和只读 dataset preflight/cache。正式环境、真实 CUDA smoke 与 Phantom3 完整399张渐进运行均已验证；剩余边界以[全局认知](../project/global-context.md)和[完整实验记录](../project/phantom3-semantic-atom-v2-result.md)为准。
+当前实现已经覆盖 evidence-conditioned numerator、prior-free LOO、三条件 gate、异常尺度语义支持域筛选、新 schema、投影专用 snapshot、固定本地网格、原子 RGB/Semantic pair、独立 final rebuild 和只读 dataset preflight/cache。正式环境、真实 CUDA smoke 与 Phantom3 完整399张渐进运行均已验证；完整399张历史产物生成后发现 V2 分支遗漏了 V1 的异常尺度筛选，该回归已由 ADR 0007 修复并完成冻结最终快照整图重渲染验证。剩余边界以[全局认知](../project/global-context.md)和[完整实验记录](../project/phantom3-semantic-atom-v2-result.md)为准。

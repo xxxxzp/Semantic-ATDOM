@@ -1129,6 +1129,9 @@ class GaussianTrainer(mp.Process):
                 min_free_cuda_bytes=(
                     self.args.semantic_tdom_min_free_cuda_bytes
                 ),
+                max_gaussian_scale_ratio=(
+                    self.args.semantic_tdom_max_gaussian_scale_ratio
+                ),
                 render_palette=render_palette,
                 render_palette_source=render_palette_source,
             )

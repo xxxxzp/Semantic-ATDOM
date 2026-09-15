@@ -3,8 +3,8 @@
 ## 文档状态
 
 - 状态：G1 Evidence V2 已实现，并完成 Phantom3 全量训练、最终语义重建和 RGB/Semantic 成对发布验证。
-- 确认日期：2026-09-14。
-- 当前开发分支：`fix/global-progressive-map`（基于 `semantic/g1-evidence-v2`）。
+- 确认日期：2026-09-15。
+- 当前开发分支：`fix/semantic-tdom-valid-footprint`（基于 `semantic/g1-evidence-v2`）。
 - 适用范围：Semantic A-TDOM 的仓库治理、数据、环境、训练期语义主链路和产品状态。
 
 本文是开发者和代码代理开始工作前的项目入口。它保存跨实验仍应成立的共同认知，不复制完整数学合同，也不把源码中的在建行为描述成已完成能力。
@@ -193,6 +193,8 @@ RGB、SfM 和 semantic roots 是只读输入。派生 PLY、索引和转换结�
 - hard map 只由 geometry coverage、pixel evidence support 和 support ratio 三个 gate 决定。
 - entropy、margin、mixture/group disagreement 和 variance proxy 分开输出，不参与 V1 gate。
 - variance 是包含先验、基于独立近似的未校准 proxy，不是分类错误概率。
+- Semantic TDOM 光栅化前默认排除最大尺度超过场景中位最大尺度14倍的异常高斯；
+  这只是只读产品支持域清理，不是第四个 hard-map gate，也不影响 RGB 或几何训练。
 - clone/split 的硬不变量是拓扑前后渲染语义场连续；后代复制父状态只是待数值测试的 V2 初始近似。
 - online group disagreement 必须真实更新；最终重建中仅多组证据提供有效支持，局部支持不足的像素是 NaN，不是0，也不应使整幅诊断图失效。
 
@@ -264,13 +266,13 @@ RGB/Semantic 产品使用共同 `projection_geometry_hash`，完整 RGB 另有 `
 | G1 state/recovery/product schema | 已完成 |
 | CUDA V2 实现 | 已完成 |
 | online 状态与独立 final recovery | 已完成 |
-| fixed-grid paired publication | 已通过完整 Phantom3 CUDA 运行；分片 RGB/Semantic 最终 pair 与15个历史阶段的完整 hash 链复算通过 |
+| fixed-grid paired publication | 已通过完整 Phantom3 CUDA 运行；历史 pair 的完整 hash 链复算通过；异常尺度过滤修复后又以同一冻结最终快照完成9216×11264整图重渲染回归 |
 | read-only preflight/cache | 已完成；完整399张 preflight 通过，source binding 仍不完整 |
 | 正式 `semantic-atdom` 环境 | 已建立并完成来源 fingerprint |
 | stage 30→31 smoke | 已在最终修复提交上通过，最终 `lag=0` |
 | 完整399张运行 | 已完成；942,438个高斯，9216×11264全局地图，最终状态 `exact_partial` |
 
-当前 product/scheduling 已建立固定本地网格、同一冻结快照的 RGB/Semantic 原子 pair、latest-wins 请求、投影专用轻量 snapshot，以及显式 stream/headroom/time/output/checkpoint 策略。训练前 preflight 会验证所选累积 stage、camera/RGB、overlap、label/metadata/hash，并将报告与派生 PLY 写入 output/cache；启用语义时不再允许隐式 semantic root。`Use_Tri_Mask` 只控制训练 mask，不能再关闭渐进采样元数据；大图 RGB 与 semantic 均使用分片 TDOM 渲染。修复后的完整 Phantom3 运行已证明全局渐进建图、训练、最终重建和配对发布可执行。当前标签 source-image binding 不完整，因此最终状态诚实标为 `exact_partial`；仍不声称语义准确率、24 GB资源预算、GIS坐标或准实时目标已经验证。
+当前 product/scheduling 已建立固定本地网格、同一冻结快照的 RGB/Semantic 原子 pair、latest-wins 请求、投影专用轻量 snapshot，以及显式 stream/headroom/time/output/checkpoint 策略。训练前 preflight 会验证所选累积 stage、camera/RGB、overlap、label/metadata/hash，并将报告与派生 PLY 写入 output/cache；启用语义时不再允许隐式 semantic root。`Use_Tri_Mask` 只控制训练 mask，不能再关闭渐进采样元数据；大图 RGB 与 semantic 均使用分片 TDOM 渲染。完整 Phantom3 运行已证明全局渐进建图、训练、最终重建和配对发布可执行，但其历史 Semantic TDOM 在分支开发时遗漏了 V1 异常尺度过滤，导致3618个纯黑 RGB 像素全部被赋予类别。ADR 0007 已恢复并校准只读语义支持域过滤；修复后的完整大图以同一冻结最终快照完成 CUDA 重渲染回归。当前标签 source-image binding 不完整，因此最终状态诚实标为 `exact_partial`；仍不声称语义准确率、24 GB资源预算、GIS坐标或准实时目标已经验证。
 
 已完成的实施任务见 [G1 Evidence V2 completed plan](../../plans/completed/2026-09-11-g1-evidence-v2.md)，本次运行的命令、指标、产物身份和未验证项见 [Phantom3 Semantic A-TDOM V2 完整实验记录](phantom3-semantic-atom-v2-result.md)。
 
@@ -290,6 +292,7 @@ RGB/Semantic 产品使用共同 `projection_geometry_hash`，完整 RGB 另有 `
 - [G1 V1→V2 差异总结](../design/g1-v1-v2-comparison.md)
 - [Semantic TDOM V1：G1 Evidence V2](../design/semantic-tdom-v1.md)
 - [Evidence-conditioned 渲染 ADR](../decisions/0005-evidence-conditioned-semantic-rendering.md)
+- [异常尺度语义支持域 ADR](../decisions/0007-bound-semantic-render-support.md)
 - [有界在线产品 ADR](../decisions/0006-bounded-online-semantic-products.md)
 - [几何防火墙 ADR](../decisions/0001-one-way-semantic-dependency.md)
 - [阶段同步 ADR](../decisions/0003-stage-synchronous-semantics.md)

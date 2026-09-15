@@ -62,6 +62,19 @@ CUDA_VISIBLE_DEVICES=0 conda run --no-capture-output -n semantic-atdom \
 - 下采样人工查看确认 RGB 与 semantic 均覆盖完整航测区域，不再是早期错误运行的
   局部 4608×6144 区域。
 
+### 已发现的 Semantic TDOM 边缘回归
+
+该目录是在恢复 V1 异常尺度过滤之前生成的历史产物。最终 RGB TDOM 中共有3618个
+纯黑像素，这些像素在 `semantic_id.png` 中全部不是 `ignore=255`。对应像素的
+geometry coverage 中位数约0.9998、support ratio 中位数约0.9464；因此问题不是地图
+尺寸或三项 gate 阈值，而是少数异常膨胀高斯凭高 opacity 将类别扩散到了近黑地图
+边缘。最终模型942438个高斯中，按 V1 默认20倍中位最大尺度规则会排除2746个；最大
+尺度约3131 m。
+
+最新代码已按 ADR 0007 恢复只读 Semantic TDOM 支持域过滤。本文其余训练、几何、
+配对和 hash 结论仍描述原始完整运行；修复后的最终 semantic map 在 CUDA 可用时必须
+重新渲染并生成新的产物身份，不能把本目录静默描述为已修复。
+
 最终权威入口是：
 
 ```text

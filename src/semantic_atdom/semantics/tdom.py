@@ -52,6 +52,7 @@ class SemanticTdomConfig:
     validate_rendered_inputs: bool = False
     max_output_bytes: int = 8 * 1024**3
     min_free_cuda_bytes: int = 512 * 1024**2
+    max_gaussian_scale_ratio: float = 14.0
     render_palette: Optional[Tuple[Tuple[int, int, int], ...]] = None
     render_palette_source: Optional[str] = None
 
@@ -94,6 +95,15 @@ class SemanticTdomConfig:
             or self.min_free_cuda_bytes < 0
         ):
             raise ValueError("min_free_cuda_bytes must be a non-negative integer")
+        if (
+            not math.isfinite(self.max_gaussian_scale_ratio)
+            or self.max_gaussian_scale_ratio < 0
+            or 0 < self.max_gaussian_scale_ratio <= 1
+        ):
+            raise ValueError(
+                "max_gaussian_scale_ratio must be zero (disabled) or greater "
+                "than one"
+            )
         if self.render_palette is not None:
             if not self.render_palette:
                 raise ValueError("render_palette must not be empty")
@@ -252,6 +262,48 @@ def _empty_uncertainty(reference: torch.Tensor) -> torch.Tensor:
     return torch.full_like(reference, float("nan"))
 
 
+def _trusted_geometry_mask(
+    scales: torch.Tensor, max_scale_ratio: float
+) -> Tuple[torch.Tensor, Dict[str, object]]:
+    """Exclude detached scale outliers from Semantic TDOM support.
+
+    Progressive geometry can contain a small number of extremely large
+    Gaussians whose dark SH appearance is nearly invisible in RGB while their
+    opacity spreads one semantic class across the map border.  This mask only
+    bounds the read-only semantic render; it never mutates geometry or feeds
+    back into training.
+    """
+    if scales.ndim != 2 or scales.shape[1] != 3:
+        raise ValueError("Gaussian scales must have shape [N, 3]")
+    maximum_scales = scales.detach().max(dim=1).values
+    if not bool(torch.isfinite(maximum_scales).all()):
+        raise ValueError("Gaussian scales must be finite")
+    median_scale = (
+        float(maximum_scales.median().item())
+        if maximum_scales.numel()
+        else 0.0
+    )
+    enabled = max_scale_ratio > 0 and maximum_scales.numel() > 0
+    scale_limit = median_scale * max_scale_ratio if enabled else None
+    trusted = torch.ones_like(maximum_scales, dtype=torch.bool)
+    if enabled:
+        trusted &= maximum_scales <= scale_limit
+    input_count = int(maximum_scales.numel())
+    trusted_count = int(trusted.sum().item())
+    return trusted, {
+        "method": "max_world_scale_over_scene_median",
+        "enabled": bool(enabled),
+        "max_gaussian_scale_ratio": float(max_scale_ratio),
+        "median_max_world_scale": median_scale,
+        "max_trusted_world_scale": (
+            None if scale_limit is None else float(scale_limit)
+        ),
+        "input_gaussian_count": input_count,
+        "trusted_gaussian_count": trusted_count,
+        "excluded_gaussian_count": input_count - trusted_count,
+    }
+
+
 @torch.no_grad()
 def rasterize_rgb_tdom_striped(
     gaussians,
@@ -391,10 +443,13 @@ def _semantic_render_features(
     device: torch.device,
     use_robust: bool,
     eps: float,
+    gaussian_mask: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Build the K+4 per-Gaussian values consumed by the CUDA renderer."""
     alpha = semantic_state.alpha_robust if use_robust else semantic_state.alpha_raw
     alpha = alpha.detach().to(device=device, dtype=torch.float32)
+    if gaussian_mask is not None:
+        alpha = alpha[gaussian_mask]
     belief = evidence_conditioned_belief(
         alpha, prior_total=semantic_state.prior_total, eps=eps
     )
@@ -406,8 +461,12 @@ def _semantic_render_features(
     # (opposite one-hot vectors), so the flight-group trace must retain [0, 2].
     group_disagreement = semantic_state.group_variance.detach().to(
         device=device, dtype=torch.float32
-    ).sum(dim=1).clamp(min=0.0, max=2.0)
+    )
     group_count = semantic_state.group_count.detach().to(device=device)
+    if gaussian_mask is not None:
+        group_disagreement = group_disagreement[gaussian_mask]
+        group_count = group_count[gaussian_mask]
+    group_disagreement = group_disagreement.sum(dim=1).clamp(min=0.0, max=2.0)
     group_eligible = group_count >= 2
     if not semantic_state.group_disagreement_available:
         group_eligible = torch.zeros_like(group_eligible)
@@ -754,6 +813,19 @@ def rasterize_semantic_tdom(
         raise ValueError("semantic state and geometry Gaussian counts differ")
     if semantic_state.num_classes != class_spec.num_classes:
         raise ValueError("semantic state and class spec widths differ")
+    opacities = gaussians.get_opacity.detach().to(dtype=torch.float32).contiguous()
+    scales = gaussians.get_scaling.detach().to(dtype=torch.float32).contiguous()
+    rotations = gaussians.get_rotation.detach().to(dtype=torch.float32).contiguous()
+    trusted_mask, geometry_validity = _trusted_geometry_mask(
+        scales, config.max_gaussian_scale_ratio
+    )
+    input_gaussian_count = int(means3d.shape[0])
+    filter_applied = geometry_validity["excluded_gaussian_count"] > 0
+    if filter_applied:
+        means3d = means3d[trusted_mask].contiguous()
+        opacities = opacities[trusted_mask].contiguous()
+        scales = scales[trusted_mask].contiguous()
+        rotations = rotations[trusted_mask].contiguous()
     # K class numerators plus support, two mixture/group numerators, a local
     # group-validity denominator and the squared-weight variance feature.
     feature_channels = class_spec.num_classes + 5
@@ -820,10 +892,8 @@ def rasterize_semantic_tdom(
         device=means3d.device,
         use_robust=use_robust,
         eps=config.eps,
+        gaussian_mask=(trusted_mask if filter_applied else None),
     )
-    opacities = gaussians.get_opacity.detach().to(dtype=torch.float32).contiguous()
-    scales = gaussians.get_scaling.detach().to(dtype=torch.float32).contiguous()
-    rotations = gaussians.get_rotation.detach().to(dtype=torch.float32).contiguous()
     empty = torch.empty(0, dtype=torch.float32, device=means3d.device)
     viewmatrix = camera.world_view_transform.detach().to(
         device=means3d.device, dtype=torch.float32
@@ -948,7 +1018,12 @@ def rasterize_semantic_tdom(
         ),
         "feature_channels": int(feature_channels),
         "finalize_tile_rows": int(config.finalize_tile_rows),
+        "geometry_validity_filter": geometry_validity,
     }
+    if filter_applied and result is not None and result.radii is not None:
+        full_radii = torch.zeros(input_gaussian_count, dtype=result.radii.dtype)
+        full_radii[trusted_mask.detach().cpu()] = result.radii
+        result = result._replace(radii=full_radii)
     del features
     with torch.cuda.device(means3d.device):
         allocated_after_finalize = torch.cuda.memory_allocated()

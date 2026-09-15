@@ -10,6 +10,7 @@ from semantic_atdom.semantics.tdom import (
     SemanticTdomConfig,
     UnknownReason,
     _semantic_render_features,
+    _trusted_geometry_mask,
     finalize_semantic_tdom,
     load_semantic_tdom_palette,
     write_semantic_tdom,
@@ -37,6 +38,31 @@ class SemanticTdomTests(unittest.TestCase):
             SemanticTdomConfig(min_free_cuda_bytes=-1)
         with self.assertRaisesRegex(ValueError, "max_group_disagreement"):
             SemanticTdomConfig(max_group_disagreement=2.01)
+        with self.assertRaisesRegex(ValueError, "max_gaussian_scale_ratio"):
+            SemanticTdomConfig(max_gaussian_scale_ratio=1.0)
+
+    def test_trusted_geometry_mask_rejects_only_scale_outliers(self):
+        mask, metrics = _trusted_geometry_mask(
+            torch.tensor(
+                [
+                    [0.2, 0.1, 0.1],
+                    [0.2, 0.2, 0.1],
+                    [0.2, 0.1, 0.2],
+                    [0.2, 0.2, 0.2],
+                    [5.0, 0.2, 0.2],
+                ]
+            ),
+            max_scale_ratio=20.0,
+        )
+
+        self.assertEqual(mask.tolist(), [True, True, True, True, False])
+        self.assertEqual(metrics["input_gaussian_count"], 5)
+        self.assertEqual(metrics["trusted_gaussian_count"], 4)
+        self.assertEqual(metrics["excluded_gaussian_count"], 1)
+        self.assertAlmostEqual(metrics["median_max_world_scale"], 0.2)
+        self.assertAlmostEqual(
+            metrics["max_trusted_world_scale"], 4.0, places=6
+        )
 
     def test_render_palette_overrides_colors_without_changing_class_spec(self):
         original_fingerprint = CLASS_SPEC.fingerprint
@@ -261,6 +287,26 @@ class SemanticTdomTests(unittest.TestCase):
         torch.testing.assert_close(features[0, :2], torch.tensor([0.0, 0.8]))
         self.assertEqual(float(features[0, 0]), 0.0)
 
+    def test_render_feature_mask_keeps_all_channels_aligned(self):
+        state = SemanticGaussianState.initialize(2, 2)
+        state.add_evidence(torch.tensor([[4.0, 0.0], [0.0, 4.0]]))
+        state.group_variance[:] = torch.tensor([[0.2, 0.1], [0.7, 0.4]])
+        state.group_count[:] = torch.tensor([2, 3])
+        state.group_disagreement_available = True
+
+        full = _semantic_render_features(
+            state, torch.device("cpu"), use_robust=True, eps=1e-8
+        )
+        filtered = _semantic_render_features(
+            state,
+            torch.device("cpu"),
+            use_robust=True,
+            eps=1e-8,
+            gaussian_mask=torch.tensor([False, True]),
+        )
+
+        torch.testing.assert_close(filtered, full[1:2])
+
     def test_uncertainty_is_undefined_without_semantic_evidence(self):
         result = finalize_semantic_tdom(
             torch.zeros((CLASS_SPEC.num_classes + 4, 1, 1)),
@@ -354,6 +400,9 @@ class SemanticTdomTests(unittest.TestCase):
             self.assertNotIn("render_palette", payload["unknown_gate"])
             self.assertNotIn("min_margin", payload["unknown_gate"])
             self.assertNotIn("max_normalized_entropy", payload["unknown_gate"])
+            self.assertEqual(
+                payload["unknown_gate"]["max_gaussian_scale_ratio"], 14.0
+            )
             self.assertEqual(
                 set(payload["unknown_reason_bits"]),
                 {

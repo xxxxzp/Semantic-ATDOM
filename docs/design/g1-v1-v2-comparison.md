@@ -117,6 +117,7 @@ A-TDOM 完成当前阶段几何优化和拓扑更新
 | LOO 共识 | 扣除当前组但保留先验 | 同时扣除当前组和先验，只使用其余观测的真实 evidence |
 | LOO 资格 | 主要按有效组数判断 | 其余有效组至少2个且总支持达到 `S_min`，否则可靠度固定为1 |
 | clone/split | 将父 evidence 按后代权重分配，强调张量总量守恒 | 后代复制父局部语义状态，优先保持渲染场连续，并标记 dirty/stale 等待重投影 |
+| Semantic TDOM 支持域 | 默认排除最大尺度超过场景中位最大尺度20倍的异常高斯 | 保留同一只读尺度异常过滤，并按完整 Phantom3 冻结快照将默认比值校准为14；它不改变 evidence 数学或几何训练，只防止近黑巨型高斯给地图边缘着色 |
 | hard-map gate | coverage、absolute support、support ratio、margin；还允许额外诊断 gate 参与拒绝 | 只允许 coverage、absolute evidence support、support ratio 三个结构 gate |
 | 不确定性 | margin/entropy/Top-1/group disagreement 与类别拒绝存在耦合 | Top-1、margin、entropy、mixture/group disagreement、variance proxy 全部独立输出 |
 | 无证据语义 | 部分量容易受先验解释影响 | 类别分布和不确定性为未定义/NaN，类别输出为 `ignore=255` |
@@ -276,6 +277,10 @@ V2 全局实验进一步修复了两个端到端问题：
 2. 大范围 RGB TDOM 与 semantic TDOM 均使用保持全局投影和深度顺序的精确纵向分片；
    解决9216×11264最终 pair 的全图 CUDA OOM。
 
+完整运行后还识别出一个分支继承回归：V2 从早于 `eb57e4d` 的提交点开发，没有带入
+V1 已验证的异常尺度语义支持域过滤，导致纯黑 RGB 边缘仍被赋予类别。最新 V2 恢复
+该过滤；它发生在语义光栅化前，不增加第四个 hard-map gate，见 ADR 0007。
+
 ## 兼容性与迁移规则
 
 - V1、V1.1 和 V2 的 sidecar 数学含义不同，禁止跨版本静默 resume。
@@ -307,6 +312,8 @@ V2 全局实验进一步修复了两个端到端问题：
 - G1 的跨组一致性只能抑制视角间离群，不能发现所有视角共同出现的 SAM 系统性错误。
 - Dirichlet-style state 和 variance proxy 未经过概率校准，不能解释为分类错误概率。
 - 三个 hard-map 阈值及 JS 参数尚无人工真值支持其最优性。
+- 异常尺度比14是在 Phantom3 冻结最终快照上按 RGB 无内容区支持域回归校准，
+  尚未通过语义真值或其他数据集校准；它不能直接解释为通用最优阈值。
 - 当前尚未完成正式语义准确率评测；“成功生成地图”不等于“语义质量已经充分”。
 - 当前固定网格没有 GIS CRS，不能宣称地理坐标已经校准。
 - 24 GB单卡目标硬件上的峰值显存和准实时预算仍需单独实测。

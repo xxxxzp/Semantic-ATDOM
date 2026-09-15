@@ -2009,15 +2009,11 @@ class GaussianTrainer(mp.Process):
     def Render_Evaluate_All_Images(self):
         with torch.no_grad():
             ALL_viewpoint_stack = self.scene.getTrainCameras().copy()
-            All_Predicted_Images = []
-            ALL_Image_Visibility_Filter = []
-            ALL_Image_PSNR = []
             progress_bar = tqdm(range(len(ALL_viewpoint_stack)), desc="Rendering progress")
             for i in range(len(ALL_viewpoint_stack)):
                 ImageOutputDir = os.path.join(self.args.Model_Path_Dir, "OutputImages", ALL_viewpoint_stack[i].image_name)
                 PSNR_File_Path = os.path.join(ImageOutputDir, "PSNR.txt")
                 os.makedirs(ImageOutputDir, exist_ok=True)
-                PSNR_File = open(PSNR_File_Path, 'w')
 
                 progress_bar.update(1)
 
@@ -2025,9 +2021,6 @@ class GaussianTrainer(mp.Process):
                 render_pkg = render(viewpoint_cam, self.gaussians, self.args, self.bg,
                                     Render_Mask=torch.ones(1, dtype=torch.bool).cuda())
                 image, visibility_filter = render_pkg["render"], render_pkg["visibility_filter"]
-
-                All_Predicted_Images.append(image)
-                ALL_Image_Visibility_Filter.append(visibility_filter)
 
                 ImageOutput = (image - image.min()) / (image.max() - image.min())
                 ImageOutput = ImageOutput.permute(1, 2, 0).cpu().numpy()
@@ -2038,10 +2031,9 @@ class GaussianTrainer(mp.Process):
                 gt_image = viewpoint_cam.original_image.cuda()
                 PSNR = psnr(image, gt_image)
                 PSNR = PSNR.cpu().sum().item() / 3
-                ALL_Image_PSNR.append(PSNR)
-
-                PSNR_File.write(str(self.AlreadyTrainingIterations) + f": {PSNR}, Visible_Gaussians_Num: {visibility_filter.shape[0]}\n")
-                PSNR_File.close()
+                with open(PSNR_File_Path, 'w') as PSNR_File:
+                    PSNR_File.write(str(self.AlreadyTrainingIterations) + f": {PSNR}, Visible_Gaussians_Num: {visibility_filter.shape[0]}\n")
+                del render_pkg, image, visibility_filter, gt_image
 
     # 保存当前模型
     def GS_Save(self, UseSecondPath=True):

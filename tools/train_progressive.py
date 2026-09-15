@@ -1816,12 +1816,14 @@ class GaussianTrainer(mp.Process):
 
             sub_iteration = sub_iteration + 1
 
-        # The final iteration's Python locals otherwise retain the render and
-        # autograd graph while the hard-budget prune allocates compacted model
-        # and optimizer tensors.  Release them before that transient copy.
-        del render_pkg, image, viewspace_point_tensor, visibility_filter
-        del radii, load_distribution, gt_image, Ll1, ssim_value, loss, load_loss
-        torch.cuda.empty_cache()
+        if iteration > 0:
+            # The final iteration's Python locals otherwise retain the render
+            # and autograd graph while the hard-budget prune allocates compacted
+            # model and optimizer tensors. Release them before that copy.
+            del render_pkg, image, viewspace_point_tensor, visibility_filter
+            del radii, load_distribution, gt_image, Ll1, ssim_value, loss
+            del load_loss
+            torch.cuda.empty_cache()
 
         # 在完成这一张影像的训练之后
         if Training_Type == "On_The_Fly" and not self.args.No_Sampling:

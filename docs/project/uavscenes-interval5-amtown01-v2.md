@@ -30,7 +30,7 @@
 CUDA_VISIBLE_DEVICES=0 conda run --no-capture-output -n semantic-atdom \
   python tools/train_progressive.py \
   --Source_Path_Dir /data3/xzp/data/UAVScenes_Onthefly/interval5_AMtown01 \
-  --Model_Path_Dir /data3/xzp/data/UAVScenes_Onthefly/interval5_AMtown01/outputs/semantic_atdom_v2_amtown01_observed_v1 \
+  --Model_Path_Dir /data3/xzp/data/UAVScenes_Onthefly/interval5_AMtown01/outputs/semantic_atdom_v2_amtown01_observed_v1_r2 \
   --StartFromImageNo 13 --EndAtImageNo 487 \
   --IterationFirstScene 2000 \
   --IterationPerMergeScene 100 \

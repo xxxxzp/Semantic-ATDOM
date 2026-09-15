@@ -33,6 +33,14 @@ def select_progressive_stages(
     )
 
 
+def progressive_stage_number(stage_path: Path) -> int:
+    """Resolve the authoritative stage number from a stage output/input path."""
+    name = Path(stage_path).name
+    if not name.isdigit():
+        raise ValueError("progressive stage path must end in a number: {}".format(stage_path))
+    return int(name)
+
+
 def _contains_images(path: Path) -> bool:
     try:
         return any(

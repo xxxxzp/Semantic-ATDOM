@@ -23,6 +23,7 @@ from semantic_atdom.utils.camera_utils import camera_to_JSON
 import json
 from semantic_atdom.scene.dataset_readers import sceneLoadTypeCallbacks
 from semantic_atdom.scene.progressive_layout import (
+    progressive_stage_number,
     resolve_progressive_dataset_layout,
     select_progressive_stages,
 )
@@ -2041,7 +2042,9 @@ class GaussianTrainer(mp.Process):
                         self.scene.model_path = Commond_from_DataPreProccesser[5]
                         NewImagesNum = Commond_from_DataPreProccesser[7]
 
-                        self.imagenum += len(self.NewCams)
+                        self.imagenum = progressive_stage_number(
+                            Commond_from_DataPreProccesser[5]
+                        )
                         print(f"-----------------------------This is {self.imagenum} image-----------------------------")
 
                         # 还原为 dict

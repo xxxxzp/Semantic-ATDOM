@@ -3,6 +3,7 @@ from tempfile import TemporaryDirectory
 import unittest
 
 from semantic_atdom.scene.progressive_layout import (
+    progressive_stage_number,
     resolve_progressive_dataset_layout,
     select_progressive_stages,
 )
@@ -10,6 +11,11 @@ from semantic_atdom.scene.dataset_readers import _image_identity
 
 
 class ProgressiveDatasetLayoutTests(unittest.TestCase):
+    def test_stage_number_comes_from_path_not_new_camera_count(self):
+        self.assertEqual(progressive_stage_number("/output/18"), 18)
+        with self.assertRaisesRegex(ValueError, "end in a number"):
+            progressive_stage_number("/output/latest")
+
     def test_camera_identity_preserves_decimal_timestamp(self):
         self.assertEqual(
             _image_identity("1658137107.639350179.jpg"),

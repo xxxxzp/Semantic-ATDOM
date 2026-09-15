@@ -868,6 +868,10 @@ class GaussianModel:
         if excess <= 0:
             return 0
 
+        # The last rasterization can leave several GiB in CUDA's cache.  The
+        # optimizer/state slices below need temporary space while both the old
+        # and compacted tensors coexist.
+        torch.cuda.empty_cache()
         importance = self._opacity.detach().reshape(-1)
         keep_indices = torch.topk(
             importance,

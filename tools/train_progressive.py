@@ -510,6 +510,7 @@ class DataPreProccesser(mp.Process):
         # 用于两个进程之间的信息传递
         self.DataPreProccesser_queue = None
         self.GaussianTrainer_queue = None
+        self.GaussianTrainer_process = None
 
         # 获取参数配置器
         self.args, self.lp, self.op, self.pp = GetArgs()
@@ -570,6 +571,17 @@ class DataPreProccesser(mp.Process):
         self.args.model_path = self.model_path_list[0] if self.args.ContinueFromImageNo == -1 else self.model_path_list[self.args.ContinueFromImageNo - self.args.StartFromImageNo]
         self.args.source_path = self.source_path_list[0] if self.args.ContinueFromImageNo == -1 else self.source_path_list[self.args.ContinueFromImageNo - self.args.StartFromImageNo]
         self.Diary.write(f"First scene source_path: {self.args.source_path}\nFirst scene model_path: {self.args.model_path}\n")
+
+    def _ensure_trainer_alive(self):
+        """Fail promptly if the training child exited without a stop message."""
+        process = self.GaussianTrainer_process
+        if process is not None and not process.is_alive():
+            process.join(timeout=0)
+            raise RuntimeError(
+                "GaussianTrainer exited unexpectedly with code {}".format(
+                    process.exitcode
+                )
+            )
 
     # 为某一部分影像创建梯度图
     def GetGradLogForCams(self, cams=[], save=False):
@@ -833,6 +845,7 @@ class DataPreProccesser(mp.Process):
                     self.GaussianTrainer_queue.put(msg)
 
                     while True:
+                        self._ensure_trainer_alive()
                         if not self.DataPreProccesser_queue.empty():
                             image = self.DataPreProccesser_queue.get()[0]
                             break
@@ -869,6 +882,7 @@ class DataPreProccesser(mp.Process):
         StartFrom = 0 if self.args.ContinueFromImageNo == -1 else self.args.ContinueFromImageNo - self.args.StartFromImageNo
         if StartFrom > len(self.source_path_list) - 2:
             while True:
+                self._ensure_trainer_alive()
                 if self.DataPreProccesser_queue.empty():
                     continue
                 command = self.DataPreProccesser_queue.get()
@@ -882,6 +896,7 @@ class DataPreProccesser(mp.Process):
                         ["Final_Refinement", self.args.model_path]
                     )
                     while True:
+                        self._ensure_trainer_alive()
                         if not self.DataPreProccesser_queue.empty():
                             if self.DataPreProccesser_queue.get()[0] == "stop":
                                 return 0
@@ -890,6 +905,7 @@ class DataPreProccesser(mp.Process):
 
         ProgressiveTrainingTime = StartFrom
         while True:
+            self._ensure_trainer_alive()
             # 在后端没有发送任何指令之前，不做任何行为
             if self.DataPreProccesser_queue.empty():
                 continue
@@ -946,6 +962,7 @@ class DataPreProccesser(mp.Process):
 
                         # 像后端发送指令和数据，开始对新进影像的训练，此时，需要注意先等后端把上一张影像完成训练之后，再进行传输
                         while True:
+                            self._ensure_trainer_alive()
                             if not self.DataPreProccesser_queue.empty():
                                 if self.DataPreProccesser_queue.get()[0] == "Progressive_finish":
                                     # 像后端发送指令和数据，开始对新进影像的训练
@@ -962,6 +979,7 @@ class DataPreProccesser(mp.Process):
 
                         # 像后端发送指令和数据，开始进行最终的全局优化，此时，需要注意先等后端把上一张影像完成训练之后，再进行传输
                         while True:
+                            self._ensure_trainer_alive()
                             if not self.DataPreProccesser_queue.empty():
                                 if self.DataPreProccesser_queue.get()[0] == "Progressive_finish":
                                     print("*****************************************************************************")
@@ -1798,6 +1816,13 @@ class GaussianTrainer(mp.Process):
 
             sub_iteration = sub_iteration + 1
 
+        # The final iteration's Python locals otherwise retain the render and
+        # autograd graph while the hard-budget prune allocates compacted model
+        # and optimizer tensors.  Release them before that transient copy.
+        del render_pkg, image, viewspace_point_tensor, visibility_filter
+        del radii, load_distribution, gt_image, Ll1, ssim_value, loss, load_loss
+        torch.cuda.empty_cache()
+
         # 在完成这一张影像的训练之后
         if Training_Type == "On_The_Fly" and not self.args.No_Sampling:
             with torch.no_grad():
@@ -2458,9 +2483,23 @@ class On_the_Fly_GS:
         print("Start Thread...\n")
         self.GaussianTrainer_Thread = mp.Process(target=self.GaussianTrainer.run)
         self.GaussianTrainer_Thread.start()
+        self.DataPreProccesser.GaussianTrainer_process = (
+            self.GaussianTrainer_Thread
+        )
         self.DataSaver_Thread = mp.Process(target=self.DataSaver.run)
         self.DataSaver_Thread.start()
-        self.DataPreProccesser.run()
+        try:
+            self.DataPreProccesser.run()
+        except BaseException:
+            if self.GaussianTrainer_Thread.is_alive():
+                self.GaussianTrainer_Thread.terminate()
+            self.GaussianTrainer_Thread.join()
+            self.DataSaver_queue.put(["stop"])
+            self.DataSaver_Thread.join(timeout=5)
+            if self.DataSaver_Thread.is_alive():
+                self.DataSaver_Thread.terminate()
+                self.DataSaver_Thread.join()
+            raise
 
         self.GaussianTrainer_queue.put(["stop"])
         self.GaussianTrainer_Thread.join()

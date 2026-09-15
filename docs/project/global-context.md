@@ -195,6 +195,9 @@ RGB、SfM 和 semantic roots 是只读输入。派生 PLY、索引和转换结�
 - variance 是包含先验、基于独立近似的未校准 proxy，不是分类错误概率。
 - Semantic TDOM 光栅化前默认排除最大尺度超过场景中位最大尺度14倍的异常高斯；
   这只是只读产品支持域清理，不是第四个 hard-map gate，也不影响 RGB 或几何训练。
+- 上述尺度过滤只是 Phantom3 上的临时回归抑制：它会使 RGB 与 Semantic 使用不同的
+  高斯子集，且不能定义通用 no-data footprint；后续须另行设计与 RGB 颜色、SAM 标签
+  均无关的权威像素有效域。
 - clone/split 的硬不变量是拓扑前后渲染语义场连续；后代复制父状态只是待数值测试的 V2 初始近似。
 - online group disagreement 必须真实更新；最终重建中仅多组证据提供有效支持，局部支持不足的像素是 NaN，不是0，也不应使整幅诊断图失效。
 

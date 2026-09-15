@@ -42,3 +42,31 @@ therefore uses 14 as the least restrictive tested value that closes this
 regression. This is empirical support-domain calibration, not a semantic
 accuracy threshold; it must remain configurable and be reevaluated on geometry
 with materially different scale statistics.
+
+## Known limitations and successor direction
+
+This decision is an accepted **provisional containment**, not the final
+definition of the Semantic TDOM valid footprint:
+
+- A scene-global median scale ratio is data dependent. It can remove a valid
+  large Gaussian in a genuinely multi-scale scene, or retain a smaller but
+  still erroneous Gaussian. Ratio 14 is only calibrated against one frozen
+  Phantom3 snapshot.
+- RGB TDOM still renders the complete Gaussian set while Semantic TDOM renders
+  the trusted subset. Their grids and frozen model identity remain paired, but
+  their effective per-pixel support domains are therefore not mathematically
+  identical.
+- Exact or near-black RGB is appearance, not a no-data definition. A valid
+  shadow, roof or dark surface may also be black, so RGB intensity must not
+  become a semantic rejection gate. The zero-black-pixel regression check
+  verifies this particular failure mode but does not prove a general valid
+  footprint.
+
+The successor design should define and publish an authoritative per-pixel
+footprint independently of RGB color and semantic labels, then use that same
+footprint when deciding whether the paired RGB and Semantic products contain
+data. Candidate sources include the union of valid source-camera footprints or
+existing geometry/training validity masks. Its exact source, update rule and
+interaction with the locked three semantic gates require a separate design
+decision. It must remain downstream-only and must not allow noisy SAM labels to
+affect geometry optimization.

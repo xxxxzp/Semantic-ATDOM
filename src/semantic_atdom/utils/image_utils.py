@@ -38,6 +38,7 @@ def psnr(img1, img2, mask=None):
         mse = (((img1 - img2)) ** 2).view(img1.shape[0], -1).mean(1, keepdim=True)
         return 20 * torch.log10(1.0 / torch.sqrt(mse))
     else:
+        mask = mask.to(device=img1.device)
         # 如果是2D图像，扩展成 [1, H, W]
         if img1.dim() == 2:
             img1 = img1.unsqueeze(0)
@@ -57,5 +58,4 @@ def psnr(img1, img2, mask=None):
         psnr = 20 * torch.log10(1.0 / (torch.sqrt(mse) + 1e-8))
 
         return psnr
-
 

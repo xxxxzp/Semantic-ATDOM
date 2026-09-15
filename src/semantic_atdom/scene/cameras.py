@@ -51,7 +51,9 @@ class Camera(nn.Module):
         elif Tri_Mask is not None and Tri_Mask.shape[0] == 2:
             self.Tri_Mask = Tri_Mask.to(self.data_device)
         else:
-            self.Tri_Mask = torch.ones(1, dtype=torch.bool).cuda()
+            self.Tri_Mask = torch.ones(
+                1, dtype=torch.bool, device=self.data_device
+            )
 
         # self.original_image.to("cpu")
 

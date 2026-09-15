@@ -1625,6 +1625,7 @@ class GaussianTrainer(mp.Process):
             if viewpoint_cam.Tri_Mask.shape[0] == 2:
                 self.AlreadyTrainingIterations -= 1
                 continue
+            render_mask = viewpoint_cam.Tri_Mask.to(device=self.bg.device)
 
             # 学习率下降
             if Training_Type == "Initialization" or self.args.No_Adaptive:
@@ -1645,7 +1646,7 @@ class GaussianTrainer(mp.Process):
             # 计算损失
             if Training_Type != "On_The_Fly":
                 # 进行影像渲染，渲染指定视点的影像
-                render_pkg = render(viewpoint_cam, self.gaussians, self.args, self.bg, Render_Mask=viewpoint_cam.Tri_Mask)
+                render_pkg = render(viewpoint_cam, self.gaussians, self.args, self.bg, Render_Mask=render_mask)
                 (
                     image,
                     viewspace_point_tensor,
@@ -1664,8 +1665,8 @@ class GaussianTrainer(mp.Process):
 
                 # 计算损失
                 if self.args.Use_Tri_Mask:
-                    image = image * viewpoint_cam.Tri_Mask
-                    load_distribution = load_distribution[viewpoint_cam.Tri_Mask.squeeze(0)]
+                    image = image * render_mask
+                    load_distribution = load_distribution[render_mask.squeeze(0)]
 
                 gt_image = viewpoint_cam.original_image.cuda()
                 Ll1 = l1_loss(image, gt_image)
@@ -1681,7 +1682,7 @@ class GaussianTrainer(mp.Process):
             else:
                 # 进行影像渲染，渲染指定视点的影像
                 render_pkg = render(viewpoint_cam, self.gaussians, self.args, self.bg,
-                                    Render_Mask=viewpoint_cam.Tri_Mask)
+                                    Render_Mask=render_mask)
                 (
                     image,
                     viewspace_point_tensor,
@@ -1700,8 +1701,8 @@ class GaussianTrainer(mp.Process):
 
                 # 计算损失
                 if self.args.Use_Tri_Mask:
-                    image = image * viewpoint_cam.Tri_Mask
-                    load_distribution = load_distribution[viewpoint_cam.Tri_Mask.squeeze(0)]
+                    image = image * render_mask
+                    load_distribution = load_distribution[render_mask.squeeze(0)]
 
                 gt_image = viewpoint_cam.original_image.cuda()
                 Ll1 = l1_loss(image, gt_image)
@@ -1822,7 +1823,7 @@ class GaussianTrainer(mp.Process):
             # model and optimizer tensors. Release them before that copy.
             del render_pkg, image, viewspace_point_tensor, visibility_filter
             del radii, load_distribution, gt_image, Ll1, ssim_value, loss
-            del load_loss
+            del load_loss, render_mask
             torch.cuda.empty_cache()
 
         # 在完成这一张影像的训练之后

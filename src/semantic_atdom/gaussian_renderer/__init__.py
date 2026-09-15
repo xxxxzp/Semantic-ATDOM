@@ -35,6 +35,8 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
 
     if Render_Mask is None:
         Render_Mask = torch.ones(1, dtype=torch.bool, device=bg_color.device)
+    else:
+        Render_Mask = Render_Mask.to(device=bg_color.device)
 
     if len(Render_Mask.shape) == 1:
         Use_Render_Mask = False

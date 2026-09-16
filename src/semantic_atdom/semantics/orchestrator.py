@@ -1983,9 +1983,19 @@ class AsyncProgressiveSemanticHook:
             )
         self._expected_gaussian_count = delta.new_count
         future = self._executor.submit(
-            self._execute_callable, self.orchestrator.state.apply_topology, delta
+            self._execute_callable, self._apply_topology_to_active_state, delta
         )
         future.add_done_callback(self._background_done)
+
+    def _apply_topology_to_active_state(self, delta) -> None:
+        """Apply queued topology to the state active at execution time.
+
+        An earlier online replay may replace ``core.orchestrator`` while this
+        delta waits in the single-worker queue. Resolving the state here keeps
+        the delta on the replacement state; binding ``state.apply_topology``
+        at submission time would silently mutate the detached predecessor.
+        """
+        self.orchestrator.state.apply_topology(delta)
 
     def begin_final(self) -> None:
         if self._closed:

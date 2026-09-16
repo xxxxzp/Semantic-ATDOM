@@ -95,3 +95,19 @@ not generate.
 
 This is an intentional output-schema break.  It removes the ambiguous legacy
 tree instead of indefinitely maintaining two public layouts.
+
+## Online semantic state replacement
+
+The output refactor's first full-run attempt exposed a pre-existing async
+ordering bug at stage 21.  An out-of-order semantic replay may atomically
+replace the active orchestrator state.  Topology updates queued behind that
+replay must therefore resolve the active state when the queued operation
+executes; they must not bind the predecessor state's method when submitted.
+Otherwise the detached predecessor advances while the published active state
+silently misses a topology delta.
+
+The invariant is covered by a deterministic CPU regression test that replaces
+the orchestrator while a topology update waits in the single-worker queue.  A
+real stage 13--22 replay additionally covers AMtown01's non-strict cumulative
+identity sequence: stages 18--21 retain a valid online state, and the final
+boundary reaches `exact_final` with zero lag and no errors.

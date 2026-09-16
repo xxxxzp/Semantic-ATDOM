@@ -1412,6 +1412,59 @@ class ProgressiveSemanticHookTests(unittest.TestCase):
         self.assertEqual(final.semantic_through_image, "000001")
         self.assertEqual(observed, [(1, 1, 1), (2, 2, 2), (3, 3, 3)])
 
+    def test_async_topology_targets_state_replaced_by_online_rebuild(self):
+        started = threading.Event()
+        release = threading.Event()
+
+        class Runner:
+            def __init__(self, count):
+                self.state = SemanticGaussianState.initialize(count, 2)
+
+        class Core:
+            def __init__(self):
+                self.orchestrator = Runner(1)
+
+            def synchronize(self, *args):
+                started.set()
+                release.wait(timeout=2)
+                # Online out-of-order replay atomically installs a freshly
+                # rebuilt orchestrator while later topology work is queued.
+                self.orchestrator = Runner(1)
+                return type_result(1)
+
+        def type_result(stage):
+            from semantic_atdom.semantics.orchestrator import SemanticSyncResult
+
+            return SemanticSyncResult(stage, "000001", (), (), 0, True, ())
+
+        hook = AsyncProgressiveSemanticHook(Core())
+        try:
+            snapshot = type("Snapshot", (), {"wait_ready": lambda self: None})()
+            request = type(
+                "Request",
+                (),
+                {
+                    "args": (1, (), snapshot, Path("unused"), False, (), None),
+                    "publication_status_override": None,
+                },
+            )()
+            hook._stage_pending = True
+            hook._pending_stage_count = 1
+            hook._idle_event.clear()
+            future = hook._executor.submit(hook._run_stage, request)
+            future.add_done_callback(hook._stage_done)
+            self.assertTrue(started.wait(timeout=1))
+
+            hook.apply_topology(TopologyDelta.append_prior(1, 1))
+            release.set()
+            hook.wait_for_idle()
+
+            self.assertEqual(hook.num_gaussians, 2)
+            self.assertEqual(hook.orchestrator.state.num_gaussians, 2)
+        finally:
+            release.set()
+            hook.close(wait=True)
+
 
 if __name__ == "__main__":
     unittest.main()

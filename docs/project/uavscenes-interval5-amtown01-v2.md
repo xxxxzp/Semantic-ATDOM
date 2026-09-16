@@ -52,6 +52,39 @@
 在 stage 20 后因拓扑失配降级，但最终 exact rebuild 完整覆盖 487/487 张观测，
 因此只将最终语义产品视为权威，不将该运行用于证明中间在线语义发布稳定性。
 
+## 发布式输出全量验收（2026-09-16）
+
+最终验收运行：
+
+`/data3/xzp/data/UAVScenes_Onthefly/interval5_AMtown01/outputs/runs/amtown01-v2-output-v1_20260916-185813_1549a12`
+
+- 绑定分支 `feature/uavscenes-interval5-amtown01` 的 clean commit
+  `1549a12b434162d9137a1c232bc5dd954876dd77`；运行耗时从
+  18:58:13 到 20:57:08（Asia/Shanghai），最终 manifest 为 `succeeded`，
+  `outputs/latest` 指向该目录。
+- 13--487 共 475 个渐进阶段、100,800 次累计优化迭代全部完成；最终模型包含
+  1,034,221 个高斯。渐进训练 3,563.305 秒，最终优化 183.502 秒，初始化
+  86.229 秒。
+- 487/487 张标签完成一次性权威 exact rebuild：314 个融合组，投影
+  863.988 秒，总耗时 901.102 秒；最终状态为 `exact_final`、lag=0、
+  errors/deferred 均为空，地图发布为 `complete`。
+- 最终全量指标：L1 0.040377、PSNR 24.802191 dB、SSIM 0.625142、LPIPS
+  0.509093。`qa/camera_renders/` 含 487 张渲染，`metrics/per_camera.csv`
+  含表头和 487 行逐相机指标。
+- 最终 RGB/Semantic TDOM 为 6656×12288，核心语义产品包含 ID、颜色、unknown
+  mask/reason、pixel evidence support 和 entropy。camera 与 TDOM 渐进视频均为
+  50 帧、4 fps，编码尺寸分别为 1292×1080 和 1920×1080。
+- run 总体积约 2.1 GiB；成功后不存在 `.work`、数字 stage 目录或过程恢复点。
+  最终 `training_state.pt` 和 `model/semantic/state.pt` 是模型归档，不是周期性过程
+  checkpoint。
+- manifest 中 24 个带哈希产物、地图 pair manifest 的全部 product files、active
+  semantic state/geometry 哈希均已重新计算验证；通用 `tools/render.py` 成功从
+  新目录加载 stage 487。
+
+为保持结果目录清晰，本轮 smoke、回归和中断运行已移动到系统回收站；
+`outputs/runs/` 只保留上述最终运行。迁移后的 r9 历史 baseline 位于 `runs/` 外，
+继续保留用于比较。
+
 ## 后续正式运行命令（发布式输出）
 
 ```shell

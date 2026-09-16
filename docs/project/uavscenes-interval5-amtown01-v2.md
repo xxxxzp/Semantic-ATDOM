@@ -34,13 +34,16 @@
   `PredictionImages100800.jpg` 和 `PSNR.txt`。首次收尾渲染暴露了未使用列表持有
   历史 CUDA 图像导致的线性显存增长；修复张量生命周期后，从最终点云和各阶段
   累计相机集合恢复渲染，完整 487 帧通过此前故障点。
-- final-only 输出策略加入后完整测试发现：175/175 通过。
+- 当时的 final-only 输出策略测试为 175/175 通过；本轮发布式输出重构后为
+  190/190 通过。
 - 正式结果目录：
   `/data3/xzp/data/UAVScenes_Onthefly/interval5_AMtown01/outputs/semantic_atdom_v2_amtown01_observed_v1_r9`。
-  已清除 474 个中间 stage 目录，结果由 86 GiB 收敛至 2.6 GiB；最终 checkpoint
-  使用可恢复 schema v2，点云为
-  `487/point_cloud/iteration_487/point_cloud.ply`，最终地图位于
-  `Map_Products/stage_000487_final_refinement`。
+  已清除 474 个中间 stage 目录，并迁移到自描述输出 schema v1；最终点云和训练
+  状态位于 `model/`，最终地图位于 `products/maps/releases/`，指标、日志、配置与
+  迁移清单分别位于 `metrics/`、`logs/` 和 `provenance/`。根目录
+  `manifest.json` 是结果入口。为维持旧地图清单的哈希链，仅保留其引用的预检缓存；
+  其余旧式数字 stage、`Map_Products`、`OutputImages`、`Intermediate_Results` 和双份
+  语义恢复槽均已移除。
 
 `r2`–`r7` 是定位显存驻留、预算裁剪和裁剪吞吐问题时保留的诊断运行，不应作为
 正式结果引用。`r8` 完整跑通了旧投影链路，但审计确认该链路忽略 COLMAP RADIAL
@@ -49,17 +52,17 @@
 在 stage 20 后因拓扑失配降级，但最终 exact rebuild 完整覆盖 487/487 张观测，
 因此只将最终语义产品视为权威，不将该运行用于证明中间在线语义发布稳定性。
 
-## 后续正式运行命令（final-only）
+## 后续正式运行命令（发布式输出）
 
 ```shell
 CUDA_VISIBLE_DEVICES=0 conda run --no-capture-output -n semantic-atdom \
   python tools/train_progressive.py \
   --Source_Path_Dir /data3/xzp/data/UAVScenes_Onthefly/interval5_AMtown01 \
-  --Model_Path_Dir /data3/xzp/data/UAVScenes_Onthefly/interval5_AMtown01/outputs/semantic_atdom_v2_amtown01_observed_v1_r10 \
+  --Model_Path_Dir /data3/xzp/data/UAVScenes_Onthefly/interval5_AMtown01/outputs \
+  --run_name amtown01-v2 \
   --StartFromImageNo 13 --EndAtImageNo 487 \
   --IterationFirstScene 2000 \
   --IterationPerMergeScene 100 \
-  --OutputModelInterval 0 \
   --GlobalOptimizationInterval 1 \
   --GlobalOptimizationIteration 100 \
   --FinalOptimizationIterations 4000 \
@@ -71,12 +74,20 @@ CUDA_VISIBLE_DEVICES=0 conda run --no-capture-output -n semantic-atdom \
   --progressive_identity_policy persistent_union \
   --render_TDOM --enable_semantics \
   --semantic_data_root /data3/xzp/data/UAVScenes_Onthefly/interval5_AMtown01/outputs/semantic_inputs/uavscenes_amtown01_observed_v1 \
-  --semantic_tdom_save_diagnostics \
   --semantic_tdom_render_tile_rows 256 \
-  --semantic_checkpoint_interval 5 \
-  --semantic_map_publication_interval 10 \
+  --render_all_cameras \
+  --progress_video both \
+  --progress_video_content rgb \
+  --progress_video_stride 10 \
+  --progress_video_fps 4 \
   --NoDebug
 ```
+
+运行目录自动创建为 `outputs/runs/<run_name>_<timestamp>_<git-sha>/`。只有完整成功
+发布的运行才会原子更新 `outputs/latest`；失败或中断的运行会保留诊断信息，但不会
+成为 latest。逐相机渲染由 `--render_all_cameras` 显式开启。渐进视频可以选择
+`camera`、`tdom` 或 `both`，内容可以选择 `rgb`、`semantic` 或 `side_by_side`；
+这些选项会产生额外渲染开销，因此默认关闭。
 
 必须使用 `--resolution 1`：RGB 与人工标签原始分辨率均为 2448×2048；默认的
 1.6K 自动缩放会破坏逐像素语义对应关系。
@@ -90,13 +101,15 @@ AMtown01 的 stage 18 会暂时省略两个已经出现过的 identity，stage 1
 `persistent_union` 明确声明这些临时省略不代表删除；未提供该参数时预检采用
 `strict_cumulative` 并拒绝这一数据。训练输入的 RADIAL/主点偏移会在读取时统一
 转换为同尺寸中心主点 pinhole，RGB、语义标签、稀疏关键点和有效区域共享同一
-rectification。正式运行默认使用 `OutputModelInterval=0`：渐进阶段不周期性保存
-完整模型，但进入最终优化前仍强制保存 stage 487，训练完成后再以最终 checkpoint
-覆盖它。成功结束后会删除除最终 stage 以外的数字阶段目录，避免空壳目录和历史
-模型占满输出盘。若显式设置正数间隔，每个对应阶段的 checkpoint 包含累计相机、
-optimizer、每图训练计数和 RNG 状态，并保留这些阶段目录用于恢复。
+rectification。正式运行默认不保存过程恢复点；成功后只发布一次最终 RGB 训练状态、
+点云和最终语义模型。若确有中断恢复需求，可显式设置
+`--recovery_checkpoint_every_stages N`，它只原子替换 `.work/recovery/latest.pt`，
+不会累积每个 stage 的完整模型；成功发布后该工作区会被删除。
 
-修复验收包括：`pytest -q` 175/175 通过；真实 13–487 persistent-union 预检仍为
+当前输出重构验收包括：`pytest -q` 190/190 通过；真实 13–487 persistent-union 预检仍为
 487/487；stage 13–20 极小训练穿过焦距变化和非累积阶段；stage 14 checkpoint 在
 新进程恢复后得到与连续训练相同的最终 L1/PSNR；真实 stage 13 全分辨率标签完成
 CUDA 投影和 final exact rebuild，状态为 `exact_final`、lag=0、无 error/deferred。
+
+输出目录的设计依据、保留策略、迁移边界和视频决策见
+`docs/decisions/0008-run-output-contract.md`。

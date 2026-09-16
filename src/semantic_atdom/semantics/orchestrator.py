@@ -2004,6 +2004,13 @@ class AsyncProgressiveSemanticHook:
             self._latest_stage_request = None
         self._executor.shutdown(wait=wait)
 
+    def wait_for_idle(self) -> None:
+        """Wait until every ordered semantic update submitted so far finishes."""
+        self._idle_event.wait()
+        if not self._closed:
+            self._executor.submit(lambda: None).result()
+        self._raise_background_error()
+
     def synchronize(
         self,
         geometry_stage: int,

@@ -375,7 +375,7 @@ class MapPublicationPolicy:
     """Independent map/checkpoint cadence and bounded overload behavior."""
 
     publication_stage_interval: int = 1
-    checkpoint_stage_interval: int = 5
+    checkpoint_stage_interval: int = 0
     min_free_cuda_bytes: int = 512 * 1024**2
     max_pair_output_bytes: int = 8 * 1024**3
     online_time_budget_seconds: float = 30.0
@@ -386,8 +386,8 @@ class MapPublicationPolicy:
     def __post_init__(self) -> None:
         if self.publication_stage_interval < 1:
             raise ValueError("publication_stage_interval must be positive")
-        if self.checkpoint_stage_interval < 1:
-            raise ValueError("checkpoint_stage_interval must be positive")
+        if self.checkpoint_stage_interval < 0:
+            raise ValueError("checkpoint_stage_interval must be non-negative")
         if self.min_free_cuda_bytes < 0 or self.max_pair_output_bytes < 1:
             raise ValueError("map publication byte budgets are invalid")
         if self.online_time_budget_seconds < 0:
@@ -406,10 +406,10 @@ class MapPublicationPolicy:
         final: bool,
         exists: bool,
     ) -> bool:
-        return (
-            not exists
-            or bool(final)
-            or int(geometry_stage) % self.checkpoint_stage_interval == 0
+        del exists
+        return bool(final) or (
+            self.checkpoint_stage_interval > 0
+            and int(geometry_stage) % self.checkpoint_stage_interval == 0
         )
 
     def to_dict(self) -> Mapping[str, object]:
@@ -613,13 +613,17 @@ def publish_tdom_pair(
                 os.replace(str(backup), str(output_root))
             raise
         published_manifest = output_root / "pair_manifest.json"
+        latest_root = output_root.parent
+        if latest_root.name == "releases":
+            latest_root = latest_root.parent
+        manifest_reference = published_manifest.relative_to(latest_root).as_posix()
         try:
             _save_json_atomic(
-                output_root.parent / "latest.json",
+                latest_root / "latest.json",
                 {
                     "schema_version": 1,
                     "product_key": shared_manifest["product_key"],
-                    "pair_manifest": str(output_root.name + "/pair_manifest.json"),
+                    "pair_manifest": manifest_reference,
                     "pair_manifest_sha256": sha256_file(published_manifest),
                 },
             )

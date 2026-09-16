@@ -10,6 +10,7 @@
 #
 
 from argparse import ArgumentParser, Namespace
+import json
 import sys
 import os
 
@@ -189,12 +190,14 @@ class OptimizationParams(ParamGroup):
         self.semantic_tdom_finalize_tile_rows = 256
         self.semantic_tdom_save_diagnostics = False
         self.semantic_tdom_save_probabilities = False
-        self.semantic_tdom_final_only = False
+        self.semantic_tdom_final_only = True
         self.semantic_tdom_max_output_bytes = 8 * 1024**3
         self.semantic_tdom_min_free_cuda_bytes = 512 * 1024**2
         self.semantic_tdom_max_gaussian_scale_ratio = 14.0
         self.semantic_map_publication_interval = 1
-        self.semantic_checkpoint_interval = 5
+        # Zero disables mutable semantic recovery slots during progressive
+        # stages. The final semantic model is still archived once.
+        self.semantic_checkpoint_interval = 0
         self.semantic_map_tile_size = 512
         self.semantic_online_time_budget_seconds = 30.0
         self.semantic_cuda_stream_priority = 0
@@ -203,21 +206,36 @@ class OptimizationParams(ParamGroup):
 
 def get_combined_args(parser : ArgumentParser):
     cmdlne_string = sys.argv[1:]
-    cfgfile_string = "Namespace()"
     args_cmdline = parser.parse_args(cmdlne_string)
+    merged_dict = {}
 
-    try:
+    if args_cmdline.model_path:
+        config_path = os.path.join(
+            args_cmdline.model_path, "provenance", "config.json"
+        )
+        try:
+            with open(config_path, encoding="utf-8") as config_file:
+                payload = json.load(config_file)
+            if payload.get("schema_version") != 1 or not isinstance(
+                payload.get("arguments"), dict
+            ):
+                raise ValueError("unsupported run config schema")
+            merged_dict.update(payload["arguments"])
+            print("Config file found: {}".format(config_path))
+        except FileNotFoundError:
+            pass
+
+    if not merged_dict:
         cfgfilepath = os.path.join(args_cmdline.model_path, "cfg_args")
-        print("Looking for config file in", cfgfilepath)
-        with open(cfgfilepath) as cfg_file:
-            print("Config file found: {}".format(cfgfilepath))
-            cfgfile_string = cfg_file.read()
-    except TypeError:
-        print("Config file not found at")
-        pass
-    args_cfgfile = eval(cfgfile_string)
+        print("Looking for legacy config file in", cfgfilepath)
+        try:
+            with open(cfgfilepath) as cfg_file:
+                print("Legacy config file found: {}".format(cfgfilepath))
+                args_cfgfile = eval(cfg_file.read(), {"Namespace": Namespace})
+            merged_dict.update(vars(args_cfgfile))
+        except (TypeError, FileNotFoundError):
+            pass
 
-    merged_dict = vars(args_cfgfile).copy()
     for k,v in vars(args_cmdline).items():
         if v != None:
             merged_dict[k] = v

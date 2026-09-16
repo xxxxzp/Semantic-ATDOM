@@ -1,5 +1,6 @@
 import os
 import hashlib
+import csv
 import random
 from pathlib import Path
 import torch
@@ -19,6 +20,15 @@ from semantic_atdom.utils.training_schedule import (
 )
 from semantic_atdom.utils.output_retention import (
     prune_intermediate_stage_outputs,
+)
+from semantic_atdom.utils.run_output import (
+    RunLayout,
+    allocate_run_root,
+    archive_semantic_state,
+    finalize_stage_model,
+    relative_artifact_records,
+    sha256_file,
+    write_json_atomic,
 )
 from argparse import ArgumentParser, Namespace
 from semantic_atdom.arguments import ModelParams, PipelineParams, OptimizationParams
@@ -49,6 +59,7 @@ import statistics
 import copy
 import warnings
 import subprocess
+import traceback
 from semantic_atdom.utils.graphics_utils import getWorld2View2, getProjectionMatrix
 import torchvision
 import torch.multiprocessing as mp
@@ -67,6 +78,7 @@ from semantic_atdom.semantics.preflight import run_dataset_preflight
 from semantic_atdom.semantics.tdom import (
     SemanticTdomConfig,
     load_semantic_tdom_palette,
+    rasterize_semantic_tdom,
 )
 from semantic_atdom.training_checkpoint import (
     CHECKPOINT_SCHEMA_VERSION,
@@ -145,10 +157,76 @@ def GetArgs():
     parser.add_argument("--quiet", action="store_true")  # quiet默认为False，当设置为True时，则在训练过程中不会输出任何内容到日志文件
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default=None)
+    parser.add_argument("--run_name", type=str, default="")
+    parser.add_argument("--render_all_cameras", action="store_true")
+    parser.add_argument(
+        "--progress_video",
+        choices=("none", "camera", "tdom", "both"),
+        default="none",
+    )
+    parser.add_argument(
+        "--progress_video_content",
+        choices=("rgb", "semantic", "side_by_side"),
+        default="rgb",
+    )
+    parser.add_argument("--progress_video_stride", type=int, default=1)
+    parser.add_argument("--progress_video_fps", type=float, default=4.0)
+    parser.add_argument(
+        "--recovery_checkpoint_every_stages", type=int, default=0
+    )
 
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
     '''以上是在构建参数配置器'''
+
+    if args.progress_video_stride < 1:
+        raise ValueError("--progress_video_stride must be positive")
+    if args.progress_video_fps <= 0:
+        raise ValueError("--progress_video_fps must be positive")
+    if args.recovery_checkpoint_every_stages < 0:
+        raise ValueError(
+            "--recovery_checkpoint_every_stages must be non-negative"
+        )
+    if (
+        args.progress_video != "none"
+        and args.progress_video_content != "rgb"
+        and not args.enable_semantics
+    ):
+        raise ValueError(
+            "semantic progress video content requires --enable_semantics"
+        )
+    if args.OutputModelInterval:
+        raise ValueError(
+            "--OutputModelInterval has been replaced by "
+            "--recovery_checkpoint_every_stages"
+        )
+    if args.render_RGB:
+        raise ValueError(
+            "--render_RGB has been replaced by --progress_video camera"
+        )
+    if args.run_name:
+        allocated = os.environ.get("SEMANTIC_ATDOM_RUN_ROOT")
+        if allocated is None:
+            allocated = str(
+                allocate_run_root(
+                    args.Model_Path_Dir,
+                    args.run_name,
+                    repository_root=Path(__file__).resolve().parent.parent,
+                )
+            )
+            os.environ["SEMANTIC_ATDOM_RUN_ROOT"] = allocated
+        args.Model_Path_Dir = allocated
+    layout = RunLayout.from_root(args.Model_Path_Dir)
+    args.run_root = str(layout.root)
+    args.work_dir = str(layout.work)
+    args.stage_output_dir = str(layout.stages)
+    args.semantic_work_dir = str(layout.semantic_work)
+    args.map_output_dir = str(layout.maps)
+    args.metrics_dir = str(layout.metrics)
+    args.logs_dir = str(layout.logs)
+    args.provenance_dir = str(layout.provenance)
+    args.qa_dir = str(layout.qa)
+    args.visualizations_dir = str(layout.visualizations)
 
     # 输出存储训练后模型的存储位置
     print("Optimizing " + args.Source_Path_Dir)
@@ -170,9 +248,9 @@ def GetArgs():
         args.ContinueFromImageNo = resume_stage
     elif args.ContinueFromImageNo != -1:
         args.start_checkpoint = os.path.join(
-            args.Model_Path_Dir,
-            str(args.ContinueFromImageNo),
-            "chkpnt{}.pth".format(args.ContinueFromImageNo),
+            args.work_dir,
+            "recovery",
+            "latest.pt",
         )
     if args.start_checkpoint and not os.path.isfile(args.start_checkpoint):
         raise FileNotFoundError(
@@ -196,20 +274,21 @@ def TrainingPreparation(args):
     if args.checkpoint_iterations:
         raise ValueError(
             "iteration checkpoints are not resumable at an arbitrary optimizer "
-            "step; use --OutputModelInterval for atomic stage-boundary checkpoints"
+            "step; use --recovery_checkpoint_every_stages for atomic "
+            "stage-boundary recovery"
         )
 
     # 输出训练日志
-    os.makedirs(args.Model_Path_Dir, exist_ok=True)
+    os.makedirs(args.logs_dir, exist_ok=True)
+    os.makedirs(args.metrics_dir, exist_ok=True)
 
     if args.ContinueFromImageNo == -1:
-        Diary = open(os.path.join(args.Model_Path_Dir, "Diary.txt"), "w")
-        EvaluateDiary = open(os.path.join(args.Model_Path_Dir, "EvaluateDiary.txt"), "w")
-        GaussianDiary = open(os.path.join(args.Model_Path_Dir, "GaussianDiary.txt"), "w")
+        Diary = open(os.path.join(args.logs_dir, "training.log"), "w")
+        EvaluateDiary = open(os.path.join(args.metrics_dir, "evaluations.jsonl"), "w")
     else:
-        Diary = open(os.path.join(args.Model_Path_Dir, "Diary.txt"), "a")
-        EvaluateDiary = open(os.path.join(args.Model_Path_Dir, "EvaluateDiary.txt"), "a")
-        GaussianDiary = open(os.path.join(args.Model_Path_Dir, "GaussianDiary.txt"), "a")
+        Diary = open(os.path.join(args.logs_dir, "training.log"), "a")
+        EvaluateDiary = open(os.path.join(args.metrics_dir, "evaluations.jsonl"), "a")
+    GaussianDiary = None
 
     # 这个字典用于存储每一张影像已经被训练了多少次
     ImagesAlreadyBeTrainedIterations = {}
@@ -234,19 +313,22 @@ def TrainingPreparation(args):
         os.path.abspath(args.Source_Path_Dir).encode("utf-8")
     ).hexdigest()[:16]
     args.dataset_cache_root = os.path.join(
-        args.Model_Path_Dir, "cache", dataset_id
+        args.work_dir, "cache", dataset_id
     )
     if args.enable_semantics:
         preflight = run_dataset_preflight(
             dataset_root=args.Source_Path_Dir,
             semantic_data_root=args.semantic_data_root,
-            output_root=args.Model_Path_Dir,
+            output_root=args.work_dir,
             start_stage=args.StartFromImageNo,
             end_stage=args.EndAtImageNo,
             image_folder_path=(args.Image_Folder_Path or None),
             identity_policy=args.progressive_identity_policy,
         )
-        args.dataset_preflight_path = str(preflight.report_path)
+        provenance_preflight = Path(args.provenance_dir) / "dataset_preflight.json"
+        provenance_preflight.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(preflight.report_path, provenance_preflight)
+        args.dataset_preflight_path = str(provenance_preflight)
         args.dataset_preflight_sha256 = preflight.report_sha256
         args.dataset_cache_root = str(preflight.report_path.parent)
         args.semantic_authoritative_exact_complete = (
@@ -270,7 +352,7 @@ def TrainingPreparation(args):
         )
     print(IM)
     source_path_list = [os.path.join(args.Source_Path_Dir, str(im)) for im in IM]
-    model_path_list = [os.path.join(args.Model_Path_Dir, str(im)) for im in IM]
+    model_path_list = [os.path.join(args.stage_output_dir, str(im)) for im in IM]
     Diary.write(f"source_path_Dir: {args.Source_Path_Dir}\nModel_Path_Dir: {args.Model_Path_Dir}\n")
     Diary.write(f"Progress: {IM}\n")
     Diary.write("\n")
@@ -567,7 +649,7 @@ def expand_image_gray(img_path, save_path, width0, height0, gray_value=128):
 # 前端，第一个线程，主要用于读取数据以及一些数据预处理
 class DataPreProccesser(mp.Process):
     # 构造函数
-    def __init__(self):
+    def __init__(self, args=None, lp=None, op=None, pp=None):
         super().__init__()
 
         self.Silence = True
@@ -578,7 +660,11 @@ class DataPreProccesser(mp.Process):
         self.GaussianTrainer_process = None
 
         # 获取参数配置器
-        self.args, self.lp, self.op, self.pp = GetArgs()
+        if args is None:
+            self.args, self.lp, self.op, self.pp = GetArgs()
+        else:
+            self.args = copy.deepcopy(args)
+            self.lp, self.op, self.pp = lp, op, pp
 
         # 用于统计峰值内存以及训练时间
         self.Peak_Memory = 0
@@ -1124,11 +1210,15 @@ class DataPreProccesser(mp.Process):
 # 后端，第二个线程，主要用于高斯训练
 class GaussianTrainer(mp.Process):
     # 构造函数
-    def __init__(self):
+    def __init__(self, args=None, lp=None, op=None, pp=None):
         super().__init__()
 
         # 获取参数配置器
-        self.args, self.lp, self.op, self.pp = GetArgs()
+        if args is None:
+            self.args, self.lp, self.op, self.pp = GetArgs()
+        else:
+            self.args = copy.deepcopy(args)
+            self.lp, self.op, self.pp = lp, op, pp
 
         self.ImagesAlreadyBeTrainedIterations = None
         self.ResetOpacityTime = 0
@@ -1144,6 +1234,8 @@ class GaussianTrainer(mp.Process):
         self.progressive_transition_index = 0
         self.CurrentGlobalOptimizationIterations = 0
         self.data_preprocessor_rng_state = None
+        self.progress_camera_event = 0
+        self.progress_tdom_event = 0
 
         self.Drone_Image_Block = False
         self.Progressive_Training_Block = False
@@ -1217,7 +1309,7 @@ class GaussianTrainer(mp.Process):
                     "continues: {}".format(error)
                 )
         grid_path = os.path.join(
-            self.args.Model_Path_Dir, "Map_Products", "map_grid.json"
+            self.args.map_output_dir, "grid.json"
         )
         if os.path.isfile(grid_path):
             try:
@@ -1308,7 +1400,7 @@ class GaussianTrainer(mp.Process):
             self.semantic_hook = AsyncProgressiveSemanticHook.create(
                 dataset_root=self.args.Source_Path_Dir,
                 output_root=os.path.join(
-                    self.args.Model_Path_Dir, "semantic"
+                    self.args.semantic_work_dir
                 ),
                 gaussians=self.gaussians,
                 config=config,
@@ -1355,8 +1447,8 @@ class GaussianTrainer(mp.Process):
         try:
             if render_semantic_tdom:
                 pair_output_root = os.path.join(
-                    self.args.Model_Path_Dir,
-                    "Map_Products",
+                    self.args.map_output_dir,
+                    "releases",
                     alignment["product_key"],
                 )
                 publication_request = MapPublicationRequest(
@@ -1509,6 +1601,9 @@ class GaussianTrainer(mp.Process):
                     self._render_legacy_tdom()
         self._initialize_semantic_hook()
         self._run_semantic_hook("initialization")
+        with torch.no_grad():
+            self._capture_progress_camera_views(self.scene.getTrainCameras())
+            self._capture_progress_tdom()
 
         # 向前端传递信息，表示初始训练已经完成，可以开始读取后续的影像
         self.SendImagePos_to_DataPreProccesser(True)
@@ -1563,7 +1658,11 @@ class GaussianTrainer(mp.Process):
         final = training_type == "Final_Refinement"
         if self.args.enable_semantics and (
             self.semantic_publication_policy is None
-            or (self.args.semantic_tdom_final_only and not final)
+            or (
+                self.args.semantic_tdom_final_only
+                and not final
+                and self.args.progress_video not in ("tdom", "both")
+            )
         ):
             return
 
@@ -1602,9 +1701,8 @@ class GaussianTrainer(mp.Process):
             )
             self.TDOM_grid.save(
                 os.path.join(
-                    self.args.Model_Path_Dir,
-                    "Map_Products",
-                    "map_grid.json",
+                    self.args.map_output_dir,
+                    "grid.json",
                 )
             )
 
@@ -1673,7 +1771,11 @@ class GaussianTrainer(mp.Process):
             },
             "crs": grid.crs,
             "dataset_preflight": {
-                "path": self.args.dataset_preflight_path,
+                "scope": "run_root",
+                "path": os.path.relpath(
+                    self.args.dataset_preflight_path,
+                    self.args.Model_Path_Dir,
+                ),
                 "sha256": self.args.dataset_preflight_sha256,
                 "authoritative_exact_complete": (
                     self.args.semantic_authoritative_exact_complete
@@ -1711,7 +1813,99 @@ class GaussianTrainer(mp.Process):
         )["render"]
         output = tdom_to_uint8(tdom)
         del tdom
+        if self.args.progress_video in ("tdom", "both"):
+            self.DataSaver_queue.put(["SaveTDOM", output, self.TDOM_alignment])
+
+    def _capture_progress_camera_views(self, cameras):
+        if self.args.progress_video not in ("camera", "both"):
+            return
+        cameras = list(cameras)
+        for index, camera in enumerate(cameras):
+            event = self.progress_camera_event
+            self.progress_camera_event += 1
+            is_final_event = (
+                int(self.imagenum) == int(self.args.EndAtImageNo)
+                and index == len(cameras) - 1
+            )
+            if (
+                event % int(self.args.progress_video_stride) != 0
+                and not is_final_event
+            ):
+                continue
+            render_pkg = render(
+                camera,
+                self.gaussians,
+                self.args,
+                self.bg,
+                Render_Mask=camera.Tri_Mask,
+            )
+            rgb_output = tdom_to_uint8(render_pkg["render"])
+            semantic_output = self._semantic_progress_frame(camera)
+            output = self._compose_progress_frame(rgb_output, semantic_output)
+            self.DataSaver_queue.put(
+                ["SaveImage", output, str(camera.image_name), int(self.imagenum)]
+            )
+            del render_pkg
+
+    def _capture_progress_tdom(self):
+        if (
+            self.args.progress_video not in ("tdom", "both")
+            or self.TDOM_Cam is None
+            or not self.args.enable_semantics
+        ):
+            return
+        event = self.progress_tdom_event
+        self.progress_tdom_event += 1
+        if (
+            event % int(self.args.progress_video_stride) != 0
+            and int(self.imagenum) != int(self.args.EndAtImageNo)
+        ):
+            return
+        rendered = render(
+            self.TDOM_Cam,
+            self.gaussians,
+            self.TDOM_pipeline,
+            self.background,
+            Render_Mask=torch.ones(1, dtype=torch.bool).cuda(),
+            TDOM=True,
+        )["render"]
+        rgb_output = tdom_to_uint8(rendered)
+        semantic_output = self._semantic_progress_frame(self.TDOM_Cam)
+        output = self._compose_progress_frame(rgb_output, semantic_output)
         self.DataSaver_queue.put(["SaveTDOM", output, self.TDOM_alignment])
+        del rendered
+
+    def _semantic_progress_frame(self, camera):
+        if self.args.progress_video_content == "rgb":
+            return None
+        if self.semantic_hook is None:
+            raise RuntimeError(
+                "semantic progress video requested without a valid semantic state"
+            )
+        self.semantic_hook.wait_for_idle()
+        core = self.semantic_hook.core
+        result = rasterize_semantic_tdom(
+            self.gaussians,
+            core.orchestrator.state,
+            camera,
+            core.dataset.class_spec,
+            config=self.semantic_tdom_config,
+        )
+        if result.colors is None:
+            raise RuntimeError("semantic progress render did not produce colors")
+        return result.colors.permute(1, 2, 0).detach().cpu().numpy()
+
+    def _compose_progress_frame(self, rgb, semantic):
+        content = self.args.progress_video_content
+        if content == "rgb":
+            return rgb
+        if semantic is None:
+            raise RuntimeError("semantic progress frame is missing")
+        if content == "semantic":
+            return semantic
+        if rgb.shape[:2] != semantic.shape[:2]:
+            raise RuntimeError("RGB and semantic progress frames are not aligned")
+        return np.concatenate((rgb, semantic), axis=1)
 
     # 3DGS模型训练核心函数
     def Train_Gaussians(self, iteration, Training_Type):
@@ -1999,15 +2193,6 @@ class GaussianTrainer(mp.Process):
                         )
                     )
 
-        # 如果需要，进行一次影像渲染或者TDOM的生成
-        if Training_Type == "On_The_Fly" and self.args.render_RGB:
-            print("GaussianTrainer: Save RGB Results...")
-            with torch.no_grad():
-                for i in range(len(self.NewCams)):
-                    render_pkg = render(self.NewCams[i], self.gaussians, self.args, self.bg, Render_Mask=self.NewCams[0].Tri_Mask)
-                    image = render_pkg["render"]
-                    self.DataSaver_queue.put(["SaveImage", image])
-                    self.DataSaver_queue.put(["SaveGT", self.NewCams[i].image_name])
         if self.args.render_TDOM:
             print("GaussianTrainer: Prepare TDOM publication...")
             with torch.no_grad():
@@ -2047,7 +2232,10 @@ class GaussianTrainer(mp.Process):
                 progress_bar = tqdm(range(0, self.imagenum), desc=f"Final Evaluate...", initial=0)
 
             if self.EvaluateDiary is None:
-                self.EvaluateDiary = open(os.path.join(self.args.Model_Path_Dir, "Intermediate_Results", "eval.txt"), "w")
+                self.EvaluateDiary = open(
+                    os.path.join(self.args.metrics_dir, "evaluations.jsonl"),
+                    "a",
+                )
 
             if self.ChosenImageNames == []:
                 validation_configs = ({'name': 'test', 'cameras': self.scene.getTestCameras()},
@@ -2100,10 +2288,25 @@ class GaussianTrainer(mp.Process):
                                                                                          self.gaussians.get_xyz.shape[0],
                                                                                          psnr_test, ssim_test, lpips_test))
 
-                    self.EvaluateDiary.write("[ITER {}] Evaluating {}: L1 {} Gaussians {} PSNR {} SSIM {} LPIPS {}\n".format(self.AlreadyTrainingIterations,
-                                                                                         config['name'], l1_test,
-                                                                                         self.gaussians.get_xyz.shape[0],
-                                                                                         psnr_test, ssim_test, lpips_test))
+                    evaluation_record = {
+                        "iteration": int(self.AlreadyTrainingIterations),
+                        "split": config["name"],
+                        "l1": float(l1_test),
+                        "gaussians": int(self.gaussians.get_xyz.shape[0]),
+                        "psnr": float(psnr_test),
+                        "ssim": float(ssim_test),
+                        "lpips": float(lpips_test),
+                        "complete_metrics": bool(self.Finish),
+                    }
+                    self.EvaluateDiary.write(
+                        json.dumps(evaluation_record, sort_keys=True) + "\n"
+                    )
+                    self.EvaluateDiary.flush()
+                    if self.Finish and config["name"] == "train":
+                        write_json_atomic(
+                            Path(self.args.metrics_dir) / "final_evaluation.json",
+                            {"schema_version": 1, **evaluation_record},
+                        )
 
                 # self.Diary.write(
                 #     "[ITER {}] Evaluating {}: L1 {} Gaussians {} PSNR {}\n".format(self.AlreadyTrainingIterations,
@@ -2149,11 +2352,10 @@ class GaussianTrainer(mp.Process):
         with torch.no_grad():
             ALL_viewpoint_stack = self.scene.getTrainCameras().copy()
             progress_bar = tqdm(range(len(ALL_viewpoint_stack)), desc="Rendering progress")
+            output_dir = Path(self.args.qa_dir) / "camera_renders"
+            output_dir.mkdir(parents=True, exist_ok=True)
+            rows = []
             for i in range(len(ALL_viewpoint_stack)):
-                ImageOutputDir = os.path.join(self.args.Model_Path_Dir, "OutputImages", ALL_viewpoint_stack[i].image_name)
-                PSNR_File_Path = os.path.join(ImageOutputDir, "PSNR.txt")
-                os.makedirs(ImageOutputDir, exist_ok=True)
-
                 progress_bar.update(1)
 
                 viewpoint_cam = ALL_viewpoint_stack[i]
@@ -2162,14 +2364,38 @@ class GaussianTrainer(mp.Process):
                 image, visibility_filter = render_pkg["render"], render_pkg["visibility_filter"]
 
                 ImageOutput = Image.fromarray(tdom_to_uint8(image))
-                ImageOutput.save(os.path.join(ImageOutputDir, f"PredictionImages{self.AlreadyTrainingIterations}.jpg"))
+                image_id = Path(str(viewpoint_cam.image_name)).name
+                ImageOutput.save(output_dir / (image_id + ".jpg"))
 
                 gt_image = viewpoint_cam.original_image.cuda()
                 PSNR = psnr(image, gt_image)
                 PSNR = PSNR.cpu().sum().item() / 3
-                with open(PSNR_File_Path, 'w') as PSNR_File:
-                    PSNR_File.write(str(self.AlreadyTrainingIterations) + f": {PSNR}, Visible_Gaussians_Num: {visibility_filter.shape[0]}\n")
+                rows.append(
+                    {
+                        "camera_id": image_id,
+                        "iteration": int(self.AlreadyTrainingIterations),
+                        "psnr": float(PSNR),
+                        "visible_gaussians": int(visibility_filter.sum().item()),
+                        "render": "qa/camera_renders/{}.jpg".format(image_id),
+                    }
+                )
                 del render_pkg, image, visibility_filter, gt_image
+            progress_bar.close()
+            metrics_path = Path(self.args.metrics_dir) / "per_camera.csv"
+            metrics_path.parent.mkdir(parents=True, exist_ok=True)
+            with metrics_path.open("w", encoding="utf-8", newline="") as stream:
+                writer = csv.DictWriter(
+                    stream,
+                    fieldnames=(
+                        "camera_id",
+                        "iteration",
+                        "psnr",
+                        "visible_gaussians",
+                        "render",
+                    ),
+                )
+                writer.writeheader()
+                writer.writerows(rows)
 
     # 保存当前模型
     def _checkpoint_payload(self, phase):
@@ -2202,11 +2428,22 @@ class GaussianTrainer(mp.Process):
     def _save_training_checkpoint(self, path, phase="stage_complete"):
         save_training_checkpoint(path, self._checkpoint_payload(phase))
 
+    def _save_recovery_checkpoint(self):
+        checkpoint_path = Path(self.args.work_dir) / "recovery" / "latest.pt"
+        print(
+            "\n[Recovery At Stage {}] Saving {}".format(
+                self.imagenum, checkpoint_path
+            )
+        )
+        self._save_training_checkpoint(checkpoint_path, phase="stage_complete")
+
     def GS_Save(self, UseSecondPath=True, final=False):
+        if not final:
+            raise ValueError("GS_Save is reserved for the final published model")
         imagedirname = self.imagenum
         print("\n[Save At Image {}] Saving Checkpoint".format(imagedirname))
         checkpoint_path = os.path.join(
-            self.args.Model_Path_Dir,
+            self.args.stage_output_dir,
             str(imagedirname),
             f"chkpnt{imagedirname}.pth",
         )
@@ -2342,13 +2579,18 @@ class GaussianTrainer(mp.Process):
                             if not self.args.enable_semantics:
                                 self._render_legacy_tdom()
                     self._run_semantic_hook("progressive")
+                    with torch.no_grad():
+                        self._capture_progress_camera_views(self.NewCams)
+                        self._capture_progress_tdom()
 
                     if (
-                        self.args.OutputModelInterval > 0
-                        and self.imagenum % self.args.OutputModelInterval == 0
+                        self.args.recovery_checkpoint_every_stages > 0
+                        and self.imagenum
+                        % self.args.recovery_checkpoint_every_stages
+                        == 0
                     ):
                         with torch.no_grad():
-                            self.GS_Save(True)
+                            self._save_recovery_checkpoint()
 
                     # 等待self.RenderNewDone变为True
                     while not self.RenderNewDone:
@@ -2367,12 +2609,9 @@ class GaussianTrainer(mp.Process):
 
                                     self.commond = None
                             elif self.commond[0] == "Final_Refinement_Prepare":
-                                # Persist the fully completed progressive stage
-                                # before final refinement starts.  A crash in
-                                # final refinement can therefore resume from a
-                                # semantically unambiguous boundary.
-                                with torch.no_grad():
-                                    self.GS_Save(True)
+                                if self.args.recovery_checkpoint_every_stages > 0:
+                                    with torch.no_grad():
+                                        self._save_recovery_checkpoint()
                                 self.RenderNewDone = True
                                 self.commond = None
                             elif self.commond[0] == "RenderNewDone":
@@ -2415,6 +2654,8 @@ class GaussianTrainer(mp.Process):
                             if not self.args.enable_semantics:
                                 self._render_legacy_tdom()
                     self._run_semantic_hook("final_refinement", final=True)
+                    with torch.no_grad():
+                        self._capture_progress_tdom()
 
                     self.Finish = True
 
@@ -2429,7 +2670,8 @@ class GaussianTrainer(mp.Process):
                     msg = ["GetDemo"]
                     self.DataSaver_queue.put(msg)
 
-                    self.Render_Evaluate_All_Images()
+                    if self.args.render_all_cameras:
+                        self.Render_Evaluate_All_Images()
 
                     # 向前端传递信息
                     msg = ["stop"]
@@ -2439,248 +2681,255 @@ class GaussianTrainer(mp.Process):
 
 # 后端，第三个线程，主要用于在不影响训练线程的情况下进行一些输出或者保存的工作
 class DataSaver(mp.Process):
-    # 构造函数
     def __init__(self):
         super().__init__()
-        self.GTImageRootPath = None
-        self.GTImagePath = None
         self.DataSaver_queue = None
         self.SaveDirRootPath = None
-        self.Intermediate_GT_Path = None
+        self.MetricsRootPath = None
+        self.VisualizationRootPath = None
+        self.ProgressVideo = "none"
+        self.ProgressVideoContent = "rgb"
+        self.ProgressVideoStride = 1
+        self.ProgressVideoFPS = 4.0
         self.Intermediate_RGB_Render_Path = None
         self.Intermediate_TDOM_Render_Path = None
-        self.Intermediate_TDOM_Gray_Render_Path = None
-        self.SaveGTNumber = 0
         self.SaveImageNumber = 0
         self.SaveTDOMNumber = 0
-        self.MaxTDOMWidth = 0
-        self.MaxTDOMHeight = 0
-        self.StartFromImageNo = 0
+        self.ImageEventNumber = 0
+        self.TDOMEventNumber = 0
+        self.PendingImage = None
+        self.PendingTDOM = None
 
-    # 指定保存位置并创建输出文件夹
     def MakeDirs(self):
-        self.Intermediate_GT_Path = os.path.join(self.SaveDirRootPath, "GT")
-        self.Intermediate_RGB_Render_Path = os.path.join(self.SaveDirRootPath, "Render")
-        self.Intermediate_TDOM_Render_Path = os.path.join(self.SaveDirRootPath, "TDOM")
-        self.Intermediate_TDOM_Gray_Render_Path = os.path.join(self.SaveDirRootPath, "TDOM_Gray")
-        os.makedirs(self.SaveDirRootPath, exist_ok=True)
-        os.makedirs(self.Intermediate_GT_Path, exist_ok=True)
-        os.makedirs(self.Intermediate_RGB_Render_Path, exist_ok=True)
-        os.makedirs(self.Intermediate_TDOM_Render_Path, exist_ok=True)
-        os.makedirs(self.Intermediate_TDOM_Gray_Render_Path, exist_ok=True)
+        self.Intermediate_RGB_Render_Path = os.path.join(
+            self.SaveDirRootPath, "camera"
+        )
+        self.Intermediate_TDOM_Render_Path = os.path.join(
+            self.SaveDirRootPath, "tdom"
+        )
+        if self.ProgressVideo in ("camera", "both"):
+            os.makedirs(self.Intermediate_RGB_Render_Path, exist_ok=True)
+        if self.ProgressVideo in ("tdom", "both"):
+            os.makedirs(self.Intermediate_TDOM_Render_Path, exist_ok=True)
 
-    # 保存一张RGB影像的GT
-    def SaveGT(self, image_name):
-        with torch.no_grad():
-            self.GTImagePath = os.path.join(self.GTImageRootPath, str(self.StartFromImageNo + self.SaveGTNumber + 1), "images")
-            SpanName = ".jpg"
-            FromPath = os.path.join(self.GTImagePath, image_name + SpanName)
-            if not os.path.exists(FromPath):
-                SpanName = ".JPG"
-                FromPath = os.path.join(self.GTImagePath, image_name + SpanName)
-            if not os.path.exists(FromPath):
-                SpanName = ".png"
-                FromPath = os.path.join(self.GTImagePath, image_name + SpanName)
-            if not os.path.exists(FromPath):
-                print("Image No Exist!!!")
-            else:
-                ToPath = os.path.join(self.Intermediate_GT_Path, str(self.SaveGTNumber) + SpanName)
-                shutil.copy2(FromPath, ToPath)
-                self.SaveGTNumber += 1
+    @staticmethod
+    def _as_uint8(image):
+        if isinstance(image, torch.Tensor):
+            return tdom_to_uint8(image)
+        value = np.asarray(image)
+        if value.ndim != 3 or value.shape[2] != 3 or value.dtype != np.uint8:
+            raise ValueError("progress frame must be uint8 [H, W, 3]")
+        return value
 
-    # 保存一张RGB影像
-    def SaveImage(self, image):
-        with torch.no_grad():
-            ImageOutput = Image.fromarray(tdom_to_uint8(image))
-            ImageOutput.save(os.path.join(self.Intermediate_RGB_Render_Path, f"{self.SaveImageNumber}.jpg"))
-            self.SaveImageNumber += 1
+    def _save_frame(self, directory, number, image, metadata):
+        path = Path(directory) / "{:06d}.jpg".format(number)
+        Image.fromarray(self._as_uint8(image)).save(path, quality=92)
+        write_json_atomic(path.with_suffix(".json"), metadata)
 
-    # 保存TDOM
+    def SaveImage(self, image, image_id, stage):
+        self.ImageEventNumber += 1
+        payload = (image, image_id, stage)
+        self.PendingImage = payload
+        if (self.ImageEventNumber - 1) % self.ProgressVideoStride != 0:
+            return
+        self._save_pending_image()
+
+    def _save_pending_image(self):
+        if self.PendingImage is None:
+            return
+        image, image_id, stage = self.PendingImage
+        self._save_frame(
+            self.Intermediate_RGB_Render_Path,
+            self.SaveImageNumber,
+            image,
+            {
+                "schema_version": 1,
+                "kind": "camera",
+                "camera_id": image_id,
+                "stage": int(stage),
+                "event_index": self.ImageEventNumber - 1,
+            },
+        )
+        self.SaveImageNumber += 1
+        self.PendingImage = None
+
     def SaveTDOM(self, tdom, alignment=None):
-        with torch.no_grad():
-            # rendering_filepath = os.path.join(self.Intermediate_TDOM_Render_Path, f"{self.SaveTDOMNumber}.jpg")
-            # torchvision.utils.save_image(tdom, rendering_filepath)
-            if isinstance(tdom, torch.Tensor):
-                ImageOutput = tdom_to_uint8(tdom)
+        self.TDOMEventNumber += 1
+        self.PendingTDOM = (tdom, alignment)
+        if (self.TDOMEventNumber - 1) % self.ProgressVideoStride != 0:
+            return
+        self._save_pending_tdom()
+
+    def _save_pending_tdom(self):
+        if self.PendingTDOM is None:
+            return
+        tdom, alignment = self.PendingTDOM
+        metadata = {
+            "schema_version": 1,
+            "kind": "tdom",
+            "stage": (
+                None if alignment is None else alignment.get("geometry_stage")
+            ),
+            "event_index": self.TDOMEventNumber - 1,
+        }
+        self._save_frame(
+            self.Intermediate_TDOM_Render_Path,
+            self.SaveTDOMNumber,
+            tdom,
+            metadata,
+        )
+        self.SaveTDOMNumber += 1
+        self.PendingTDOM = None
+
+    def _encode_video(self, frame_directory, output_name, label, anchor):
+        paths = sorted(Path(frame_directory).glob("*.jpg"))
+        if not paths:
+            return
+        frames = []
+        max_width = 0
+        max_height = 0
+        for path in paths:
+            frame = cv2.imread(str(path))
+            if frame is None:
+                raise RuntimeError("cannot read progress frame {}".format(path))
+            height, width = frame.shape[:2]
+            scale = min(1.0, 1920.0 / width, 1080.0 / height)
+            if scale < 1.0:
+                frame = cv2.resize(
+                    frame,
+                    (max(1, int(round(width * scale))), max(1, int(round(height * scale)))),
+                    interpolation=cv2.INTER_AREA,
+                )
+            max_height = max(max_height, frame.shape[0])
+            max_width = max(max_width, frame.shape[1])
+            frames.append(frame)
+        max_width += max_width % 2
+        max_height += max_height % 2
+        output_root = Path(self.VisualizationRootPath)
+        output_root.mkdir(parents=True, exist_ok=True)
+        output_path = output_root / output_name
+        writer = cv2.VideoWriter(
+            str(output_path),
+            cv2.VideoWriter_fourcc(*"mp4v"),
+            float(self.ProgressVideoFPS),
+            (max_width, max_height),
+        )
+        if not writer.isOpened():
+            raise RuntimeError("unable to open video encoder for {}".format(output_path))
+        total = len(frames)
+        for index, frame in enumerate(frames):
+            canvas = np.full((max_height, max_width, 3), 128, dtype=np.uint8)
+            if anchor == "bottom_right":
+                y = max_height - frame.shape[0]
+                x = max_width - frame.shape[1]
             else:
-                ImageOutput = np.asarray(tdom)
-                if ImageOutput.ndim != 3 or ImageOutput.shape[2] != 3:
-                    raise ValueError("TDOM output must have shape [H, W, 3]")
-                if ImageOutput.dtype != np.uint8:
-                    raise ValueError("preconverted TDOM output must be uint8")
-            height, width = ImageOutput.shape[:2]
-            if self.MaxTDOMWidth < width:
-                self.MaxTDOMWidth = width
-            if self.MaxTDOMHeight < height:
-                self.MaxTDOMHeight = height
-            ImageOutput = Image.fromarray(ImageOutput)
-            image_path = os.path.join(
-                self.Intermediate_TDOM_Render_Path,
-                f"{self.SaveTDOMNumber}.jpg",
+                y = (max_height - frame.shape[0]) // 2
+                x = (max_width - frame.shape[1]) // 2
+            canvas[y:y + frame.shape[0], x:x + frame.shape[1]] = frame
+            cv2.putText(
+                canvas,
+                "{} ({}/{})".format(label, index + 1, total),
+                (10, 32),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.8,
+                (0, 255, 0),
+                2,
+                cv2.LINE_AA,
             )
-            ImageOutput.save(image_path)
-            if alignment is not None:
-                with open(image_path, "rb") as stream:
-                    image_sha256 = hashlib.sha256(stream.read()).hexdigest()
-                payload = dict(alignment)
-                payload.update(
-                    {
-                        "schema_version": 1,
-                        "rgb_tdom_file": os.path.basename(image_path),
-                        "rgb_tdom_sha256": image_sha256,
-                    }
+            writer.write(canvas)
+        writer.release()
+        capture = cv2.VideoCapture(str(output_path))
+        frame_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
+        capture.release()
+        if frame_count != total:
+            raise RuntimeError(
+                "encoded video has {} frames, expected {}".format(
+                    frame_count, total
                 )
-                manifest_path = os.path.splitext(image_path)[0] + ".json"
-                temporary = manifest_path + ".tmp"
-                with open(temporary, "w", encoding="utf-8") as stream:
-                    json.dump(
-                        payload,
-                        stream,
-                        ensure_ascii=False,
-                        indent=2,
-                        sort_keys=True,
-                    )
-                    stream.write("\n")
-                    stream.flush()
-                    os.fsync(stream.fileno())
-                os.replace(temporary, manifest_path)
-            self.SaveTDOMNumber += 1
+            )
+        shutil.rmtree(frame_directory)
+        print("Progress video saved at {}".format(output_path))
 
-    # 根据RGB影像的保存结果生成Demo
-    def GetRGBDemo(self):
-        # 获取影像的尺寸
-        first_image_path = os.path.join(self.Intermediate_RGB_Render_Path, "0.jpg")
-        frame = cv2.imread(first_image_path)
-        height, width, layers = frame.shape
+    def GetDemo(self):
+        self._save_pending_image()
+        self._save_pending_tdom()
+        if self.SaveImageNumber:
+            self._encode_video(
+                self.Intermediate_RGB_Render_Path,
+                "progressive_camera_views.mp4",
+                "camera",
+                "center",
+            )
+        if self.SaveTDOMNumber:
+            self._encode_video(
+                self.Intermediate_TDOM_Render_Path,
+                "progressive_tdom.mp4",
+                "TDOM",
+                "bottom_right",
+            )
 
-        # 定义视频编码器和输出格式
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')  # 编码格式，例如'XVID'或'mp4v'
-        fps = 4  # 每秒帧数
-        Demo_PreIMAGE = cv2.VideoWriter(os.path.join(self.SaveDirRootPath, "Render.mp4"), fourcc, fps, (width, height))
-
-        # 将每帧添加到视频中
-        progress_bar = tqdm(range(0, self.SaveImageNumber + self.StartFromImageNo), desc="Get_RGB_Demo", initial=0)
-        for i in range(self.SaveImageNumber + self.StartFromImageNo):
-            text = f"({i + 1}/{self.SaveImageNumber + self.StartFromImageNo})"
-
-            if i <= self.StartFromImageNo - 1:
-                black_frame = np.zeros((height, width, 3), dtype=np.uint8)
-                cv2.putText(black_frame, text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2, cv2.LINE_AA)
-                Demo_PreIMAGE.write(black_frame)
-            else:
-                img_path = os.path.join(self.Intermediate_RGB_Render_Path, f"{i - self.StartFromImageNo}.jpg")
-                frame = cv2.imread(img_path)
-                cv2.putText(frame, text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2, cv2.LINE_AA)
-                Demo_PreIMAGE.write(frame)
-            progress_bar.update(1)
-
-        # 释放资源
-        Demo_PreIMAGE.release()
-        cv2.destroyAllWindows()
-
-        print(f"RGB_Demo save at {os.path.join(self.SaveDirRootPath, 'Render.mp4')}")
-
-    # 根据TDOM的保存结果生成Demo
-    def GetTDOMDemo(self):
-        scale = 0.5
-        height = int(self.MaxTDOMHeight * scale)
-        width = int(self.MaxTDOMWidth * scale)
-        new_size = (width, height)
-
-        # 定义视频编码器和输出格式
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')  # 编码格式，例如'XVID'或'mp4v'
-        fps = 4  # 每秒帧数
-        Demo_TDOM = cv2.VideoWriter(os.path.join(self.SaveDirRootPath, "TDOM.mp4"), fourcc, fps, (width, height))
-
-        # 将每帧添加到视频中
-        progress_bar = tqdm(range(0, self.SaveTDOMNumber + self.StartFromImageNo), desc="Get_TDOM_Demo", initial=0)
-        for i in range(self.SaveTDOMNumber + self.StartFromImageNo):
-            text = f"TDOM: ({i + 1}/{self.SaveTDOMNumber + self.StartFromImageNo})"
-
-            if i <= self.StartFromImageNo - 1:
-                black_frame = np.zeros((height, width, 3), dtype=np.uint8)
-                cv2.putText(black_frame, text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2, cv2.LINE_AA)
-                Demo_TDOM.write(black_frame)
-            else:
-                img_path = os.path.join(self.Intermediate_TDOM_Render_Path, f"{i - self.StartFromImageNo}.jpg")
-                expand_image_gray(
-                    img_path=img_path,
-                    save_path=os.path.join(self.Intermediate_TDOM_Gray_Render_Path, f"{i - self.StartFromImageNo}.jpg"),
-                    width0=self.MaxTDOMWidth,
-                    height0=self.MaxTDOMHeight,
-                    gray_value=128  # 中性灰
-                )
-                frame = cv2.imread(os.path.join(self.Intermediate_TDOM_Gray_Render_Path, f"{i - self.StartFromImageNo}.jpg"))
-                frame = cv2.resize(frame, new_size, interpolation=cv2.INTER_AREA)
-                cv2.putText(frame, text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2, cv2.LINE_AA)
-                Demo_TDOM.write(frame)
-            progress_bar.update(1)
-
-        # 释放资源
-        Demo_TDOM.release()
-        cv2.destroyAllWindows()
-
-        print(f"TDOM_Demo save at {os.path.join(self.SaveDirRootPath, 'TDOM.mp4')}")
-
-    # 输出时间消耗
     def SaveTimeCost(self, TimeCost, imagenum):
-        outputfile = open(os.path.join(self.SaveDirRootPath, "TimeCost.txt"), "w")
         print("########################################################")
-        keys = list(TimeCost.keys())
-        for key in keys:
-            print(f"{key}: {TimeCost[key]}s")
-            outputfile.write(f"{key}: {TimeCost[key]}s\n")
-
-            if key == "ProgressiveTrain":
-                print(f"TimePerImage: {TimeCost[key] / imagenum }s")
-                outputfile.write(f"TimePerImage: {TimeCost[key] / imagenum}s\n")
-        outputfile.close()
+        payload = {key: float(value) for key, value in TimeCost.items()}
+        payload["time_per_stage_seconds"] = float(
+            TimeCost["ProgressiveTrain"] / imagenum
+        )
+        for key, value in payload.items():
+            print("{}: {}s".format(key, value))
+        write_json_atomic(
+            Path(self.MetricsRootPath) / "timing.json",
+            {"schema_version": 1, **payload},
+        )
         print("########################################################")
 
-    # 运行
     def run(self):
         self.MakeDirs()
         while True:
-            if self.DataSaver_queue.empty():
-                continue
-            else:
-                Commond_from_GaussianTrainer = self.DataSaver_queue.get()
-                if Commond_from_GaussianTrainer[0] == "SaveImage":
-                    self.SaveImage(Commond_from_GaussianTrainer[1])
-                elif Commond_from_GaussianTrainer[0] == "SaveGT":
-                    self.SaveGT(Commond_from_GaussianTrainer[1])
-                elif Commond_from_GaussianTrainer[0] == "SaveTDOM":
-                    alignment = (
-                        Commond_from_GaussianTrainer[2]
-                        if len(Commond_from_GaussianTrainer) > 2
-                        else None
-                    )
-                    self.SaveTDOM(
-                        Commond_from_GaussianTrainer[1], alignment
-                    )
-                elif Commond_from_GaussianTrainer[0] == "GetDemo":
-                    if self.SaveImageNumber > 0:
-                        self.GetRGBDemo()
-                    if self.SaveTDOMNumber > 0:
-                        self.GetTDOMDemo()
-                elif Commond_from_GaussianTrainer[0] == "SaveTimeCost":
-                    TimeCost = Commond_from_GaussianTrainer[1]
-                    self.SaveTimeCost(TimeCost, Commond_from_GaussianTrainer[2])
-                elif Commond_from_GaussianTrainer[0] == "stop":
-                    break
+            command = self.DataSaver_queue.get()
+            if command[0] == "SaveImage":
+                self.SaveImage(command[1], command[2], command[3])
+            elif command[0] == "SaveTDOM":
+                alignment = command[2] if len(command) > 2 else None
+                self.SaveTDOM(command[1], alignment)
+            elif command[0] == "GetDemo":
+                self.GetDemo()
+            elif command[0] == "SaveTimeCost":
+                self.SaveTimeCost(command[1], command[2])
+            elif command[0] == "stop":
+                break
 
 # 运行主要函数
 class On_the_Fly_GS:
-    def __init__(self):
+    def __init__(self, args=None, lp=None, op=None, pp=None):
+        if args is None:
+            args, lp, op, pp = GetArgs()
+        self.layout = RunLayout.from_root(args.Model_Path_Dir)
+        self.layout.begin(
+            source_dataset=args.Source_Path_Dir,
+            repository_root=Path(__file__).resolve().parent.parent,
+            command=[sys.executable, str(Path(__file__).resolve()), *sys.argv[1:]],
+            options={
+                "render_all_cameras": bool(args.render_all_cameras),
+                "progress_video": args.progress_video,
+                "progress_video_content": args.progress_video_content,
+                "progress_video_stride": args.progress_video_stride,
+                "progress_video_fps": args.progress_video_fps,
+                "recovery_checkpoint_every_stages": (
+                    args.recovery_checkpoint_every_stages
+                ),
+                "semantic_checkpoint_interval": args.semantic_checkpoint_interval,
+            },
+        )
+        self.layout.write_config(vars(args))
         self.DataPreProccesser_queue = mp.Queue()
         self.GaussianTrainer_queue = mp.Queue()
         self.DataSaver_queue = mp.Queue()
 
-        self.DataPreProccesser = DataPreProccesser()
+        self.DataPreProccesser = DataPreProccesser(args, lp, op, pp)
         self.DataPreProccesser.DataPreProccesser_queue = self.DataPreProccesser_queue
         self.DataPreProccesser.GaussianTrainer_queue = self.GaussianTrainer_queue
 
-        self.GaussianTrainer = GaussianTrainer()
+        self.GaussianTrainer = GaussianTrainer(args, lp, op, pp)
         self.GaussianTrainer.DataPreProccesser_queue = self.DataPreProccesser_queue
         self.GaussianTrainer.GaussianTrainer_queue = self.GaussianTrainer_queue
         self.GaussianTrainer.DataSaver_queue = self.DataSaver_queue
@@ -2693,7 +2942,17 @@ class On_the_Fly_GS:
 
         self.DataSaver = DataSaver()
         self.DataSaver.DataSaver_queue = self.DataSaver_queue
-        self.DataSaver.SaveDirRootPath = os.path.join(self.GaussianTrainer.args.Model_Path_Dir, "Intermediate_Results")
+        self.DataSaver.SaveDirRootPath = str(self.layout.video_frames)
+        self.DataSaver.MetricsRootPath = str(self.layout.metrics)
+        self.DataSaver.VisualizationRootPath = str(self.layout.visualizations)
+        self.DataSaver.ProgressVideo = self.GaussianTrainer.args.progress_video
+        self.DataSaver.ProgressVideoContent = (
+            self.GaussianTrainer.args.progress_video_content
+        )
+        # The trainer applies stride before expensive rendering; the output
+        # worker receives only selected frames.
+        self.DataSaver.ProgressVideoStride = 1
+        self.DataSaver.ProgressVideoFPS = self.GaussianTrainer.args.progress_video_fps
         self.DataSaver.GTImageRootPath = self.GaussianTrainer.args.Source_Path_Dir
         self.DataSaver.StartFromImageNo = self.GaussianTrainer.args.StartFromImageNo
 
@@ -2703,8 +2962,8 @@ class On_the_Fly_GS:
                 sys.executable,
                 str(capture_script),
                 os.path.join(
-                    self.GaussianTrainer.args.Model_Path_Dir,
-                    "environment_fingerprint.json",
+                    self.GaussianTrainer.args.provenance_dir,
+                    "environment_start.json",
                 ),
             ],
             check=True,
@@ -2734,32 +2993,141 @@ class On_the_Fly_GS:
 
         self.GaussianTrainer_queue.put(["stop"])
         self.GaussianTrainer_Thread.join()
+        if self.GaussianTrainer_Thread.exitcode != 0:
+            raise RuntimeError(
+                "Gaussian trainer exited with code {}".format(
+                    self.GaussianTrainer_Thread.exitcode
+                )
+            )
         self.DataSaver_queue.put(["stop"])
         self.DataSaver_Thread.join()
-        if self.GaussianTrainer.args.OutputModelInterval == 0:
-            removed_stages = prune_intermediate_stage_outputs(
-                self.GaussianTrainer.args.Model_Path_Dir,
-                self.DataPreProccesser.IM[-1],
+        if self.DataSaver_Thread.exitcode != 0:
+            raise RuntimeError(
+                "output worker exited with code {}".format(
+                    self.DataSaver_Thread.exitcode
+                )
             )
-            print(
-                "Final-only output retention removed {} intermediate stage "
-                "directories.".format(len(removed_stages))
-            )
+        artifacts = self._finalize_success()
         subprocess.run(
             [
                 sys.executable,
                 str(capture_script),
                 os.path.join(
-                    self.GaussianTrainer.args.Model_Path_Dir,
-                    "final_environment_fingerprint.json",
+                    self.GaussianTrainer.args.provenance_dir,
+                    "environment_end.json",
                 ),
             ],
             check=True,
             cwd=str(Path(__file__).resolve().parent.parent),
         )
+        artifacts["provenance"] = "provenance"
+        self.layout.set_status("succeeded", artifacts=artifacts)
+        self.layout.publish_latest()
         print("\nAll Done!!!")
+
+    def _finalize_success(self):
+        final_stage = int(self.DataPreProccesser.IM[-1])
+        final_arguments = dict(vars(self.GaussianTrainer.args))
+        final_arguments["source_path"] = str(
+            Path(self.GaussianTrainer.args.Source_Path_Dir) / str(final_stage)
+        )
+        final_arguments["model_path"] = str(self.layout.root)
+        self.layout.write_config(final_arguments)
+        removed_stages = prune_intermediate_stage_outputs(
+            self.layout.stages, final_stage
+        )
+        print(
+            "Final publication removed {} intermediate stage directories.".format(
+                len(removed_stages)
+            )
+        )
+        records = {
+            "model": finalize_stage_model(self.layout, final_stage),
+            "maps": "products/maps",
+            "metrics": "metrics",
+            "logs": "logs",
+        }
+        if self.layout.qa.is_dir():
+            records["qa"] = "qa"
+        if self.layout.visualizations.is_dir():
+            records["visualizations"] = "visualizations"
+        if self.GaussianTrainer.args.enable_semantics:
+            records["semantic_model"] = archive_semantic_state(self.layout)
+            schema_source = (
+                Path(self.GaussianTrainer.args.semantic_data_root)
+                / "semantic"
+                / "class_spec.json"
+            )
+            if schema_source.is_file():
+                schema_destination = self.layout.semantic_model / "schema.json"
+                shutil.copy2(schema_source, schema_destination)
+                records["semantic_model"]["schema"] = {
+                    "path": schema_destination,
+                    "size_bytes": schema_destination.stat().st_size,
+                    "sha256": sha256_file(schema_destination),
+                }
+        self._write_summary(final_stage)
+        for candidate in (
+            self.layout.recovery,
+            self.layout.semantic_work,
+            self.layout.stages,
+            self.layout.cache,
+        ):
+            if candidate.exists():
+                shutil.rmtree(candidate)
+        if self.layout.video_frames.exists() and not any(
+            self.layout.video_frames.iterdir()
+        ):
+            self.layout.video_frames.rmdir()
+        if self.layout.work.exists() and not any(self.layout.work.iterdir()):
+            self.layout.work.rmdir()
+        return relative_artifact_records(self.layout, records)
+
+    def _write_summary(self, final_stage):
+        summary = {"schema_version": 1, "final_stage": int(final_stage)}
+        sources = {
+            "evaluation": self.layout.metrics / "final_evaluation.json",
+            "timing": self.layout.metrics / "timing.json",
+            "semantic": self.layout.semantic_model / "sync_status.json",
+            "semantic_rebuild": (
+                self.layout.semantic_model / "final_rebuild_metrics.json"
+            ),
+        }
+        for key, path in sources.items():
+            if path.is_file():
+                with path.open("r", encoding="utf-8") as stream:
+                    summary[key] = json.load(stream)
+        latest = self.layout.maps / "latest.json"
+        if latest.is_file():
+            with latest.open("r", encoding="utf-8") as stream:
+                pointer = json.load(stream)
+            pair_path = self.layout.maps / pointer["pair_manifest"]
+            if sha256_file(pair_path) != pointer["pair_manifest_sha256"]:
+                raise RuntimeError("final map pointer hash does not match release")
+            with pair_path.open("r", encoding="utf-8") as stream:
+                summary["map"] = json.load(stream)
+        write_json_atomic(self.layout.metrics / "summary.json", summary)
 
 if __name__ == "__main__":
     mp.set_start_method("spawn")
-
-    Run = On_the_Fly_GS()
+    active_layout = None
+    try:
+        parsed_args, parsed_lp, parsed_op, parsed_pp = GetArgs()
+        active_layout = RunLayout.from_root(parsed_args.Model_Path_Dir)
+        Run = On_the_Fly_GS(parsed_args, parsed_lp, parsed_op, parsed_pp)
+    except BaseException as error:
+        if active_layout is not None and active_layout.manifest.is_file():
+            status = "interrupted" if isinstance(error, KeyboardInterrupt) else "failed"
+            failure_path = active_layout.logs / "failure.txt"
+            failure_path.parent.mkdir(parents=True, exist_ok=True)
+            with failure_path.open("w", encoding="utf-8") as stream:
+                stream.write(traceback.format_exc())
+            active_layout.set_status(
+                status,
+                failure={
+                    "type": type(error).__name__,
+                    "message": str(error),
+                    "traceback": "logs/failure.txt",
+                },
+            )
+        raise

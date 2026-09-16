@@ -80,6 +80,7 @@ class RepositoryLayoutTests(unittest.TestCase):
             "convert_colmap.py",
             "evaluate_metrics.py",
             "prepare_id_labels.py",
+            "migrate_run_output.py",
         }
         self.assertEqual(supported, {path.name for path in (ROOT / "tools").glob("*.py")})
 
@@ -119,6 +120,7 @@ class RepositoryLayoutTests(unittest.TestCase):
                 "0005-evidence-conditioned-semantic-rendering.md",
                 "0006-bounded-online-semantic-products.md",
                 "0007-bound-semantic-render-support.md",
+                "0008-run-output-contract.md",
             },
             {path.name for path in decisions.glob("*.md")},
         )

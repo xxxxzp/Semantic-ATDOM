@@ -116,15 +116,74 @@ class MapPublicationPolicyTests(unittest.TestCase):
         self.assertFalse(policy.should_publish(31, final=False))
         self.assertTrue(policy.should_publish(33, final=False))
         self.assertTrue(policy.should_publish(31, final=True))
-        self.assertTrue(policy.should_checkpoint(31, final=False, exists=False))
+        self.assertFalse(policy.should_checkpoint(31, final=False, exists=False))
         self.assertFalse(policy.should_checkpoint(31, final=False, exists=True))
         self.assertTrue(policy.should_checkpoint(35, final=False, exists=True))
         self.assertFalse(policy.should_checkpoint(31, final=False, exists=True))
         self.assertEqual(policy.overload_policy, "degrade-diagnostics-then-skip")
         self.assertEqual(policy.queue_policy, "latest-wins")
 
+    def test_zero_checkpoint_interval_keeps_only_final_archive(self):
+        policy = MapPublicationPolicy(checkpoint_stage_interval=0)
+
+        self.assertFalse(policy.should_checkpoint(13, final=False, exists=False))
+        self.assertFalse(policy.should_checkpoint(487, final=False, exists=True))
+        self.assertTrue(policy.should_checkpoint(487, final=True, exists=False))
+
 
 class PairPublisherTests(unittest.TestCase):
+    def test_release_directory_updates_parent_map_pointer(self):
+        semantic = finalize_semantic_tdom(
+            torch.tensor([[[0.7]], [[0.2]], [[0.9]]]),
+            torch.tensor([[0.95]]),
+            CLASS_SPEC,
+            SemanticTdomConfig(),
+        )
+        grid = MapGridSpec.create(
+            plane_normal_world=(0.0, 0.0, 1.0),
+            pixel_x_axis_world=(1.0, 0.0, 0.0),
+            pixel_y_axis_world=(0.0, 1.0, 0.0),
+            plane_offset_world=0.0,
+            first_bounds=(0.0, 1.0, 0.0, 1.0),
+            requested_gsd=(1.0, 1.0),
+            tile_shape=(1, 1),
+        )
+        window = grid.window_for_bounds((0.0, 1.0, 0.0, 1.0))
+        with TemporaryDirectory() as directory:
+            maps = Path(directory) / "maps"
+            output = maps / "releases" / "stage_000001"
+            checkpoint = maps / "state.pt"
+            checkpoint.parent.mkdir(parents=True)
+            checkpoint.write_bytes(b"state")
+            publish_tdom_pair(
+                output_root=output,
+                rgb_image=np.zeros((1, 1, 3), dtype=np.uint8),
+                semantic_result=semantic,
+                class_spec=CLASS_SPEC,
+                semantic_config=SemanticTdomConfig(),
+                shared_manifest={
+                    "product_key": "stage_000001",
+                    "geometry_stage": 1,
+                    "projection_geometry_hash": "a" * 64,
+                    "rgb_model_hash": "b" * 64,
+                    "semantic_state_hash": sha256_file(checkpoint),
+                    "semantic_status": "approx_online",
+                    "alignment": {
+                        "grid": grid.to_dict(),
+                        "window": window.to_dict(),
+                        "image_width": 1,
+                        "image_height": 1,
+                    },
+                },
+            )
+
+            latest = json.loads((maps / "latest.json").read_text())
+            self.assertEqual(
+                latest["pair_manifest"],
+                "releases/stage_000001/pair_manifest.json",
+            )
+            self.assertFalse((maps / "releases" / "latest.json").exists())
+
     def test_pair_manifest_commits_two_products_and_all_hashes_last(self):
         semantic = finalize_semantic_tdom(
             torch.tensor([[[0.7]], [[0.2]], [[0.9]]]),

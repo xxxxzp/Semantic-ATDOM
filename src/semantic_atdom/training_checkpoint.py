@@ -1,6 +1,7 @@
 """Versioned, resumable checkpoints for progressive RGB training."""
 
 import os
+import json
 from pathlib import Path
 import random
 import re
@@ -25,6 +26,15 @@ def checkpoint_stage_from_path(path: Path) -> int:
         match = re.fullmatch(r"(?:chkpnt)?(\d+)", candidate)
         if match is not None:
             return int(match.group(1))
+    metadata_path = path.with_suffix(path.suffix + ".json")
+    if metadata_path.is_file():
+        try:
+            with metadata_path.open("r", encoding="utf-8") as stream:
+                payload = json.load(stream)
+            if payload.get("schema_version") == CHECKPOINT_SCHEMA_VERSION:
+                return int(payload["stage"])
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
     raise ValueError("cannot infer progressive stage from checkpoint path {}".format(path))
 
 
@@ -138,6 +148,24 @@ def save_training_checkpoint(path: Path, payload) -> None:
     with temporary.open("rb") as stream:
         os.fsync(stream.fileno())
     os.replace(temporary, path)
+    metadata_path = path.with_suffix(path.suffix + ".json")
+    metadata_temporary = metadata_path.with_name(metadata_path.name + ".tmp")
+    with metadata_temporary.open("w", encoding="utf-8") as stream:
+        json.dump(
+            {
+                "schema_version": CHECKPOINT_SCHEMA_VERSION,
+                "stage": int(payload["stage"]),
+                "iteration": int(payload["iteration"]),
+                "phase": str(payload["phase"]),
+            },
+            stream,
+            indent=2,
+            sort_keys=True,
+        )
+        stream.write("\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(metadata_temporary, metadata_path)
 
 
 def load_training_checkpoint(path: Path, *, map_location="cpu"):

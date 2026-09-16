@@ -42,9 +42,23 @@ class Scene:
         self.model_path = args.model_path
         self.loaded_iter = None
         self.gaussians = gaussians
+        published_model = Path(self.model_path) / "model" / "gaussians.ply"
 
         if load_iteration:
-            if load_iteration == -1:
+            if published_model.is_file():
+                manifest_path = Path(self.model_path) / "manifest.json"
+                if manifest_path.is_file():
+                    with manifest_path.open("r", encoding="utf-8") as stream:
+                        manifest = json.load(stream)
+                    metrics_path = Path(self.model_path) / "metrics" / "summary.json"
+                    if metrics_path.is_file():
+                        with metrics_path.open("r", encoding="utf-8") as stream:
+                            self.loaded_iter = int(json.load(stream)["final_stage"])
+                    else:
+                        self.loaded_iter = int(manifest.get("final_stage", -1))
+                else:
+                    self.loaded_iter = -1
+            elif load_iteration == -1:
                 self.loaded_iter = searchForMaxIteration(os.path.join(self.model_path, "point_cloud"))
             else:
                 self.loaded_iter = load_iteration
@@ -94,10 +108,13 @@ class Scene:
             self.test_cameras[resolution_scale] = cameraList_from_camInfos(scene_info.test_cameras, resolution_scale, args)
 
         if self.loaded_iter:
-            self.gaussians.load_ply(os.path.join(self.model_path,
-                                                           "point_cloud",
-                                                           "iteration_" + str(self.loaded_iter),
-                                                           "point_cloud.ply"))
+            if published_model.is_file():
+                self.gaussians.load_ply(str(published_model))
+            else:
+                self.gaussians.load_ply(os.path.join(self.model_path,
+                                                               "point_cloud",
+                                                               "iteration_" + str(self.loaded_iter),
+                                                               "point_cloud.ply"))
         else:
             self.gaussians.create_from_pcd(scene_info.point_cloud, self.cameras_extent)
 

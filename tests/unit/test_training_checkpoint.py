@@ -21,6 +21,16 @@ class TrainingCheckpointTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "cannot infer"):
             checkpoint_stage_from_path(Path("/output/latest/model.pth"))
 
+    def test_rolling_checkpoint_stage_comes_from_atomic_metadata(self):
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "latest.pt"
+            path.write_bytes(b"placeholder")
+            path.with_suffix(".pt.json").write_text(
+                '{"schema_version": 2, "stage": 31}'
+            )
+
+            self.assertEqual(checkpoint_stage_from_path(path), 31)
+
     def test_camera_masks_round_trip_in_packed_form(self):
         mask = torch.tensor(
             [[[True, False, True], [False, False, True]]], dtype=torch.bool

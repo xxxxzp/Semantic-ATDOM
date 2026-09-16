@@ -17,6 +17,8 @@ class OutputRetentionTests(unittest.TestCase):
         args = parser.parse_args([])
 
         self.assertEqual(args.OutputModelInterval, 0)
+        self.assertEqual(args.semantic_checkpoint_interval, 0)
+        self.assertTrue(args.semantic_tdom_final_only)
 
     def test_final_only_retention_removes_only_numeric_stage_directories(self):
         with TemporaryDirectory() as directory:

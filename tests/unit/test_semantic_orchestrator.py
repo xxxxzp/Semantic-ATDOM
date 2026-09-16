@@ -521,7 +521,7 @@ class ProgressiveSemanticHookTests(unittest.TestCase):
                 NeverProject(),
                 root / "state",
                 publication_policy=MapPublicationPolicy(
-                    checkpoint_stage_interval=5
+                    checkpoint_stage_interval=1
                 ),
             )
             frozen = FrozenGaussianSnapshot(Gaussians())
@@ -619,8 +619,8 @@ class ProgressiveSemanticHookTests(unittest.TestCase):
                     / "pair_manifest.json"
                 ).read_text(encoding="utf-8")
             )
-            self.assertIsNone(second_pair["semantic_checkpoint_hash"])
-            self.assertEqual(
+            self.assertIsNotNone(second_pair["semantic_checkpoint_hash"])
+            self.assertNotEqual(
                 json.loads(
                     (root / "state" / "latest.json").read_text(
                         encoding="utf-8"
@@ -874,7 +874,13 @@ class ProgressiveSemanticHookTests(unittest.TestCase):
                 state, dataset.class_spec, OnlineSemanticConfig()
             )
             hook = ProgressiveSemanticHook(
-                dataset, runner, NeverProject(), root / "output"
+                dataset,
+                runner,
+                NeverProject(),
+                root / "output",
+                publication_policy=MapPublicationPolicy(
+                    checkpoint_stage_interval=1
+                ),
             )
 
             result = hook.synchronize(

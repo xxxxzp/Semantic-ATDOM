@@ -1,5 +1,6 @@
 import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
@@ -76,7 +77,9 @@ class FinalRenderMemoryTests(unittest.TestCase):
         def fake_render(*_args, **_kwargs):
             return {
                 "render": _BoundedRenderImage(),
-                "visibility_filter": SimpleNamespace(shape=(1,)),
+                "visibility_filter": SimpleNamespace(
+                    sum=lambda: torch.tensor(1)
+                ),
             }
 
         with tempfile.TemporaryDirectory() as root, mock.patch(
@@ -86,7 +89,9 @@ class FinalRenderMemoryTests(unittest.TestCase):
             new=lambda *_args: torch.tensor([3.0]),
         ), mock.patch(
             "tools.train_progressive.tqdm",
-            new=lambda *_args, **_kwargs: SimpleNamespace(update=lambda _n: None),
+            new=lambda *_args, **_kwargs: SimpleNamespace(
+                update=lambda _n: None, close=lambda: None
+            ),
         ), mock.patch(
             "tools.train_progressive.Image.fromarray",
             return_value=_SavedImage(),
@@ -94,7 +99,10 @@ class FinalRenderMemoryTests(unittest.TestCase):
             "tools.train_progressive.tdom_to_uint8",
             new=lambda _image: np.zeros((2, 2, 3), dtype=np.uint8),
         ):
-            trainer.args = SimpleNamespace(Model_Path_Dir=root)
+            trainer.args = SimpleNamespace(
+                qa_dir=str(Path(root) / "qa"),
+                metrics_dir=str(Path(root) / "metrics"),
+            )
             trainer.Render_Evaluate_All_Images()
 
         self.assertLessEqual(_BoundedRenderImage.peak, 2)

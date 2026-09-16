@@ -141,7 +141,10 @@ class OptimizationParams(ParamGroup):
         self.ContinueFromImageNo = -1
         self.ImagesNumLimitation = -1
         self.gpu = 0
-        self.OutputModelInterval = 5
+        # Completed production runs retain only their final model by default.
+        # Set this above zero explicitly when intermediate recovery points are
+        # worth their substantial serialization time and disk cost.
+        self.OutputModelInterval = 0
         self.GlobalOptimizationInterval = 1
         self.GlobalOptimizationIteration = 100
         self.progressive_identity_policy = "strict_cumulative"

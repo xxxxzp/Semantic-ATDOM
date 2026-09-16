@@ -17,6 +17,9 @@ from semantic_atdom.utils.training_schedule import (
     progressive_stage_iterations,
     total_training_iterations,
 )
+from semantic_atdom.utils.output_retention import (
+    prune_intermediate_stage_outputs,
+)
 from argparse import ArgumentParser, Namespace
 from semantic_atdom.arguments import ModelParams, PipelineParams, OptimizationParams
 from PIL import Image
@@ -2733,6 +2736,15 @@ class On_the_Fly_GS:
         self.GaussianTrainer_Thread.join()
         self.DataSaver_queue.put(["stop"])
         self.DataSaver_Thread.join()
+        if self.GaussianTrainer.args.OutputModelInterval == 0:
+            removed_stages = prune_intermediate_stage_outputs(
+                self.GaussianTrainer.args.Model_Path_Dir,
+                self.DataPreProccesser.IM[-1],
+            )
+            print(
+                "Final-only output retention removed {} intermediate stage "
+                "directories.".format(len(removed_stages))
+            )
         subprocess.run(
             [
                 sys.executable,

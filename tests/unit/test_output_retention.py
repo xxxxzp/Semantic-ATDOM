@@ -1,0 +1,52 @@
+from argparse import ArgumentParser
+from pathlib import Path
+from tempfile import TemporaryDirectory
+import unittest
+
+from semantic_atdom.arguments import OptimizationParams
+from semantic_atdom.utils.output_retention import (
+    prune_intermediate_stage_outputs,
+)
+
+
+class OutputRetentionTests(unittest.TestCase):
+    def test_periodic_model_output_is_disabled_by_default(self):
+        parser = ArgumentParser()
+        OptimizationParams(parser)
+
+        args = parser.parse_args([])
+
+        self.assertEqual(args.OutputModelInterval, 0)
+
+    def test_final_only_retention_removes_only_numeric_stage_directories(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            for stage in (13, 454, 487):
+                stage_root = root / str(stage)
+                stage_root.mkdir()
+                (stage_root / "sentinel").write_text(str(stage))
+            cache = root / "cache"
+            cache.mkdir()
+            (cache / "sentinel").write_text("keep")
+
+            removed = prune_intermediate_stage_outputs(root, 487)
+
+            self.assertEqual(removed, (13, 454))
+            self.assertFalse((root / "13").exists())
+            self.assertFalse((root / "454").exists())
+            self.assertEqual((root / "487" / "sentinel").read_text(), "487")
+            self.assertEqual((cache / "sentinel").read_text(), "keep")
+
+    def test_missing_final_stage_fails_before_removing_anything(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "13").mkdir()
+
+            with self.assertRaisesRegex(RuntimeError, "final-stage directory"):
+                prune_intermediate_stage_outputs(root, 487)
+
+            self.assertTrue((root / "13").is_dir())
+
+
+if __name__ == "__main__":
+    unittest.main()

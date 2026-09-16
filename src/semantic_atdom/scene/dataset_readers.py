@@ -23,6 +23,12 @@ import json
 from pathlib import Path
 from plyfile import PlyData, PlyElement
 from semantic_atdom.utils.sh_utils import SH2RGB
+from semantic_atdom.utils.camera_calibration import (
+    rectify_array,
+    rectify_points,
+    rectification_valid_mask,
+    rectified_pinhole_from_colmap,
+)
 from semantic_atdom.scene.gaussian_model import BasicPointCloud
 import time
 from scipy.spatial import Delaunay
@@ -52,6 +58,62 @@ class CameraInfo(NamedTuple):
     width: int
     height: int
     Tri_Mask: torch.Tensor
+    calibration: object = None
+
+
+def _camera_projection(intrinsic):
+    calibration = rectified_pinhole_from_colmap(
+        intrinsic.model,
+        intrinsic.params,
+        width=intrinsic.width,
+        height=intrinsic.height,
+    )
+    return (
+        focal2fov(calibration.target_fy, intrinsic.height),
+        focal2fov(calibration.target_fx, intrinsic.width),
+        calibration,
+    )
+
+
+def _rectify_image(image, calibration):
+    if image is None or not calibration.requires_rectification:
+        return image
+    array = rectify_array(
+        np.asarray(image), calibration, interpolation="linear", border_value=0
+    )
+    return Image.fromarray(array, mode=image.mode)
+
+
+def load_rectified_image(image_path, calibration):
+    with Image.open(image_path) as image:
+        image.load()
+        return _rectify_image(image, calibration)
+
+
+def _rectify_training_mask(mask, calibration):
+    if mask is not None and getattr(mask, "shape", (0,))[0] == 2:
+        return mask
+    if not calibration.requires_rectification:
+        return mask
+    valid = rectification_valid_mask(calibration)
+    if mask is None:
+        return torch.from_numpy(valid).unsqueeze(0)
+    is_tensor = isinstance(mask, torch.Tensor)
+    array = mask.detach().cpu().numpy() if is_tensor else np.asarray(mask)
+    had_channel = array.ndim == 3
+    if had_channel:
+        if array.shape[0] != 1:
+            raise ValueError("training mask must have shape [H, W] or [1, H, W]")
+        array = array[0]
+    rectified = rectify_array(
+        array.astype(np.uint8),
+        calibration,
+        interpolation="nearest",
+        border_value=0,
+    ).astype(bool)
+    rectified &= valid
+    result = torch.from_numpy(rectified) if is_tensor else rectified
+    return result.unsqueeze(0) if had_channel else result
 
 class SceneInfo(NamedTuple):
     point_cloud: BasicPointCloud
@@ -516,17 +578,10 @@ def Get_Tri_Mask(extr, width, height, Get3D_ID=False, device='cuda', Silence=Fal
     else:
         mask = np.ones((height, width), dtype=np.uint8)
 
-    # 转为 PyTorch tensor 并降采样
+    # Keep the mask on the calibrated source grid.  Camera loading performs
+    # the one authoritative resize after rectification.
     mask = torch.from_numpy(mask).float().unsqueeze(0).unsqueeze(0)  # (1,1,H,W)
-
-    if width > 1600:
-        target_width = 1600  # 你希望的目标宽度
-        target_height = int(height * target_width / width)  # 你希望的目标高度
-        downsampled_mask = F.interpolate(mask, size=(target_height, target_width), mode='nearest')
-        downsampled_mask = downsampled_mask.squeeze().bool()
-        downsampled_mask = downsampled_mask
-    else:
-        downsampled_mask = mask.squeeze().bool()
+    downsampled_mask = mask.squeeze().bool()
 
     time2 = time.time()
     if not Silence:
@@ -590,30 +645,7 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder, Do_Get_Tri_
         R = np.transpose(qvec2rotmat(extr.qvec))
         T = np.array(extr.tvec)
 
-        if intr.model=="SIMPLE_PINHOLE":
-            focal_length_x = intr.params[0]
-            FovY = focal2fov(focal_length_x, height)
-            FovX = focal2fov(focal_length_x, width)
-        elif intr.model=="PINHOLE":
-            focal_length_x = intr.params[0]
-            focal_length_y = intr.params[1]
-            FovY = focal2fov(focal_length_y, height)
-            FovX = focal2fov(focal_length_x, width)
-        elif intr.model=="RADIAL":
-            focal_length_x = intr.params[0]
-            FovY = focal2fov(focal_length_x, height)
-            FovX = focal2fov(focal_length_x, width)
-        elif intr.model=="SIMPLE_RADIAL":
-            focal_length_x = intr.params[0]
-            FovY = focal2fov(focal_length_x, height)
-            FovX = focal2fov(focal_length_x, width)
-        elif intr.model == "OPENCV":
-            focal_length_x = intr.params[0]
-            focal_length_y = intr.params[1]
-            FovY = focal2fov(focal_length_y, height)
-            FovX = focal2fov(focal_length_x, width)
-        else:
-            assert False, "Colmap camera model not handled: only undistorted datasets (PINHOLE or SIMPLE_PINHOLE cameras) supported!"
+        FovY, FovX, calibration = _camera_projection(intr)
 
         if os.path.exists(image_path):
             image = Image.open(image_path)
@@ -623,13 +655,16 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder, Do_Get_Tri_
         else:
             image_path = _with_image_suffix(image_path, ".png")
             image = Image.open(image_path)
+        image = _rectify_image(image, calibration)
 
         Tri_Mask = None
         if Do_Get_Tri_Mask:
             Tri_Mask = Get_Tri_Mask(extr, width, height, No_Key_Region=No_Key_Region)
+        Tri_Mask = _rectify_training_mask(Tri_Mask, calibration)
 
         cam_info = CameraInfo(uid=uid, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
-                              image_path=image_path, image_name=image_name, width=width, height=height, Tri_Mask=Tri_Mask)
+                              image_path=image_path, image_name=image_name, width=width, height=height, Tri_Mask=Tri_Mask,
+                              calibration=calibration)
         cam_infos.append(cam_info)
     sys.stdout.write('\n')
     return cam_infos
@@ -651,30 +686,7 @@ def On_the_Fly_readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder, 
         R = np.transpose(qvec2rotmat(extr.qvec))
         T = np.array(extr.tvec)
 
-        if intr.model=="SIMPLE_PINHOLE":
-            focal_length_x = intr.params[0]
-            FovY = focal2fov(focal_length_x, height)
-            FovX = focal2fov(focal_length_x, width)
-        elif intr.model=="PINHOLE":
-            focal_length_x = intr.params[0]
-            focal_length_y = intr.params[1]
-            FovY = focal2fov(focal_length_y, height)
-            FovX = focal2fov(focal_length_x, width)
-        elif intr.model=="RADIAL":
-            focal_length_x = intr.params[0]
-            FovY = focal2fov(focal_length_x, height)
-            FovX = focal2fov(focal_length_x, width)
-        elif intr.model=="SIMPLE_RADIAL":
-            focal_length_x = intr.params[0]
-            FovY = focal2fov(focal_length_x, height)
-            FovX = focal2fov(focal_length_x, width)
-        elif intr.model == "OPENCV":
-            focal_length_x = intr.params[0]
-            focal_length_y = intr.params[1]
-            FovY = focal2fov(focal_length_y, height)
-            FovX = focal2fov(focal_length_x, width)
-        else:
-            assert False, "Colmap camera model not handled: only undistorted datasets (PINHOLE or SIMPLE_PINHOLE cameras) supported!"
+        FovY, FovX, calibration = _camera_projection(intr)
 
         image_path = os.path.join(images_folder, os.path.basename(extr.name))
         image_name = _image_identity(image_path)
@@ -688,6 +700,7 @@ def On_the_Fly_readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder, 
             else:
                 image_path = _with_image_suffix(image_path, ".png")
                 image = Image.open(image_path)
+            image = _rectify_image(image, calibration)
 
             if Do_Get_Tri_Mask:
                 Tri_Mask = Get_Tri_Mask(extr, width, height)
@@ -696,9 +709,11 @@ def On_the_Fly_readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder, 
         else:
             image = None
             Tri_Mask = None
+        Tri_Mask = _rectify_training_mask(Tri_Mask, calibration)
 
         cam_info = CameraInfo(uid=uid, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
-                              image_path=image_path, image_name=image_name, width=width, height=height, Tri_Mask=Tri_Mask)
+                              image_path=image_path, image_name=image_name, width=width, height=height, Tri_Mask=Tri_Mask,
+                              calibration=calibration)
         cam_infos.append(cam_info)
     sys.stdout.write('\n')
     return cam_infos
@@ -724,30 +739,7 @@ def SingleImage_readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder,
         R = np.transpose(qvec2rotmat(extr.qvec))
         T = np.array(extr.tvec)
 
-        if intr.model == "SIMPLE_PINHOLE":
-            focal_length_x = intr.params[0]
-            FovY = focal2fov(focal_length_x, height)
-            FovX = focal2fov(focal_length_x, width)
-        elif intr.model == "PINHOLE":
-            focal_length_x = intr.params[0]
-            focal_length_y = intr.params[1]
-            FovY = focal2fov(focal_length_y, height)
-            FovX = focal2fov(focal_length_x, width)
-        elif intr.model == "RADIAL":
-            focal_length_x = intr.params[0]
-            FovY = focal2fov(focal_length_x, height)
-            FovX = focal2fov(focal_length_x, width)
-        elif intr.model=="SIMPLE_RADIAL":
-            focal_length_x = intr.params[0]
-            FovY = focal2fov(focal_length_x, height)
-            FovX = focal2fov(focal_length_x, width)
-        elif intr.model == "OPENCV":
-            focal_length_x = intr.params[0]
-            focal_length_y = intr.params[1]
-            FovY = focal2fov(focal_length_y, height)
-            FovX = focal2fov(focal_length_x, width)
-        else:
-            assert False, "Colmap camera model not handled: only undistorted datasets (PINHOLE or SIMPLE_PINHOLE cameras) supported!"
+        FovY, FovX, calibration = _camera_projection(intr)
 
         image_path = os.path.join(images_folder, os.path.basename(extr.name))
         image_name = _image_identity(image_path)
@@ -762,6 +754,7 @@ def SingleImage_readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder,
             # print(image_path)
 
             image = Image.open(image_path)
+            image = _rectify_image(image, calibration)
             # print(image_path)
 
             # Progressive Gaussian expansion always needs the sparse 2D/3D
@@ -775,19 +768,33 @@ def SingleImage_readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder,
                 Silence=Silence,
                 No_Key_Region=No_Key_Region,
             )
+            if calibration.requires_rectification:
+                xys = rectify_points(xys, calibration)
+                tri = Delaunay(xys)
             point3D_ids_list[image_name] = point3D_ids
             xys_list[image_name] = xys
             tri_list[image_name] = tri
             Tri_Mask = sampling_mask if Do_Get_Tri_Mask else None
+            Tri_Mask = _rectify_training_mask(Tri_Mask, calibration)
 
         else:
             image = None
-            Tri_Mask = None
+            if Do_Get_Tri_Mask:
+                Tri_Mask = Get_Tri_Mask(
+                    extr,
+                    width,
+                    height,
+                    Silence=Silence,
+                    No_Key_Region=No_Key_Region,
+                )
+            else:
+                Tri_Mask = None
+            Tri_Mask = _rectify_training_mask(Tri_Mask, calibration)
 
 
         cam_info = CameraInfo(uid=uid, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
                                   image_path=image_path, image_name=image_name, width=width, height=height,
-                                  Tri_Mask=Tri_Mask)
+                                  Tri_Mask=Tri_Mask, calibration=calibration)
         cam_infos.append(cam_info)
 
     sys.stdout.write('\n')

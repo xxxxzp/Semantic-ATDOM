@@ -133,11 +133,16 @@ def run_dataset_preflight(
     start_stage: int,
     end_stage: int,
     image_folder_path: Optional[Path] = None,
+    identity_policy: str = "strict_cumulative",
 ) -> DatasetPreflightResult:
     """Validate selected stages and semantic observations without writing inputs."""
     if semantic_data_root is None or not str(semantic_data_root).strip():
         raise SemanticSchemaError(
             "--semantic_data_root is required when semantics are enabled"
+        )
+    if identity_policy not in ("strict_cumulative", "persistent_union"):
+        raise SemanticSchemaError(
+            "identity_policy must be strict_cumulative or persistent_union"
         )
     dataset_root = Path(dataset_root).expanduser().resolve()
     semantic_data_root = Path(semantic_data_root).expanduser().resolve()
@@ -167,7 +172,8 @@ def run_dataset_preflight(
 
     stage_records = []
     previous_ids = set()
-    final_names = ()
+    seen_ids = set()
+    persistent_names = {}
     shared_image_root = (
         Path(image_folder_path).expanduser().resolve()
         if image_folder_path is not None and str(image_folder_path).strip()
@@ -198,6 +204,14 @@ def run_dataset_preflight(
         image_ids = overlap.image_ids
         current_ids = set(image_ids)
         identity_set_is_cumulative = previous_ids.issubset(current_ids)
+        if not identity_set_is_cumulative and identity_policy == "strict_cumulative":
+            raise SemanticSchemaError(
+                "stage {} identity set is not cumulative; dropped {}. "
+                "Use identity_policy='persistent_union' only when omitted "
+                "identities intentionally remain active.".format(
+                    stage, sorted(previous_ids - current_ids)
+                )
+            )
         if not snapshot_ids.issubset(current_ids):
             raise SemanticSchemaError(
                 "stage {} local COLMAP identities are absent from cumulative overlap identities".format(
@@ -217,6 +231,9 @@ def run_dataset_preflight(
             raise SemanticSchemaError(
                 "stage {} is missing RGB images: {}".format(stage, absent_rgb[:10])
             )
+        new_ids = current_ids - (
+            seen_ids if identity_policy == "persistent_union" else previous_ids
+        )
         stage_records.append(
             {
                 "stage": stage,
@@ -224,7 +241,7 @@ def run_dataset_preflight(
                 "snapshot_camera_count": len(snapshot_ids),
                 "stage_number_matches_camera_count": len(image_ids) == stage,
                 "identity_set_is_cumulative": identity_set_is_cumulative,
-                "new_image_ids": sorted(current_ids - previous_ids),
+                "new_image_ids": sorted(new_ids),
                 "dropped_image_ids": sorted(previous_ids - current_ids),
                 "images_bin_sha256": sha256_file(sparse_root / "images.bin"),
                 "cameras_bin_sha256": sha256_file(sparse_root / "cameras.bin"),
@@ -233,7 +250,16 @@ def run_dataset_preflight(
             }
         )
         previous_ids = current_ids
-        final_names = tuple((image_id, rgb_index[image_id].name) for image_id in image_ids)
+        seen_ids.update(current_ids)
+        current_names = {
+            image_id: rgb_index[image_id].name for image_id in image_ids
+        }
+        if identity_policy == "persistent_union":
+            persistent_names.update(current_names)
+        else:
+            persistent_names = current_names
+
+    final_names = tuple(persistent_names.items())
 
     semantic_dataset = SemanticDataset(semantic_data_root)
     class_counts = np.zeros(semantic_dataset.class_spec.num_classes, dtype=np.int64)
@@ -289,6 +315,7 @@ def run_dataset_preflight(
         "dataset_root": str(dataset_root),
         "semantic_data_root": str(semantic_data_root),
         "selected_stages": list(selected),
+        "identity_policy": identity_policy,
         "stage_records": stage_records,
         "final_image_ids": [item[0] for item in sorted(final_names)],
         "labels_complete": len(labels) == len(final_names),

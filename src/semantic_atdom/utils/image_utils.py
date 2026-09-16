@@ -14,21 +14,11 @@ import torch
 
 
 def tdom_to_uint8(tdom: torch.Tensor) -> np.ndarray:
-    """Convert CHW RGB TDOM exactly like the historical save path.
-
-    The uint8 conversion deliberately happens after the CPU transfer. This
-    preserves the established NumPy truncation semantics while ensuring that
-    no CUDA tensor is retained by the multiprocessing save queue.
-    """
+    """Convert a radiometric ``[0, 1]`` CHW RGB render to uint8."""
     if not isinstance(tdom, torch.Tensor) or tdom.ndim != 3 or tdom.shape[0] != 3:
         raise ValueError("TDOM tensor must have shape [3, H, W]")
-    detached = tdom.detach()
-    minimum = detached.min()
-    value_range = (detached.max() - minimum).clamp_min(1e-8)
-    normalized = (
-        (detached - minimum) / value_range
-    ).permute(1, 2, 0).cpu().numpy()
-    return (normalized * 255).astype(np.uint8)
+    image = tdom.detach().clamp(0.0, 1.0).permute(1, 2, 0).cpu().numpy()
+    return (image * 255).astype(np.uint8)
 
 def mse(img1, img2):
     return (((img1 - img2)) ** 2).view(img1.shape[0], -1).mean(1, keepdim=True)
@@ -58,4 +48,3 @@ def psnr(img1, img2, mask=None):
         psnr = 20 * torch.log10(1.0 / (torch.sqrt(mse) + 1e-8))
 
         return psnr
-

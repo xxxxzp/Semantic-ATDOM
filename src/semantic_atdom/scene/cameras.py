@@ -17,7 +17,8 @@ from semantic_atdom.utils.graphics_utils import getWorld2View2, getProjectionMat
 class Camera(nn.Module):
     def __init__(self, colmap_id, R, T, FoVx, FoVy, image, gt_alpha_mask,
                  image_name, uid,
-                 trans=np.array([0.0, 0.0, 0.0]), scale=1.0, Tri_Mask=None, data_device = "cuda"
+                 trans=np.array([0.0, 0.0, 0.0]), scale=1.0, Tri_Mask=None, data_device = "cuda",
+                 image_path=None, calibration=None
                  ):
         super(Camera, self).__init__()
 
@@ -28,6 +29,8 @@ class Camera(nn.Module):
         self.FoVx = FoVx
         self.FoVy = FoVy
         self.image_name = image_name
+        self.image_path = image_path
+        self.calibration = calibration
 
         try:
             self.data_device = torch.device(data_device)

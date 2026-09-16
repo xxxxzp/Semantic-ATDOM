@@ -11,10 +11,26 @@
 
 from semantic_atdom.scene.cameras import Camera
 import numpy as np
+import torch
+import torch.nn.functional as F
 from semantic_atdom.utils.general_utils import PILtoTorch
 from semantic_atdom.utils.graphics_utils import fov2focal
 
 WARNED = False
+
+
+def resize_camera_mask(mask, resolution):
+    if mask is None or getattr(mask, "shape", (0,))[0] == 2:
+        return mask
+    value = mask if isinstance(mask, torch.Tensor) else torch.from_numpy(np.asarray(mask))
+    if value.ndim == 2:
+        value = value.unsqueeze(0)
+    target = (int(resolution[1]), int(resolution[0]))
+    if tuple(value.shape[-2:]) != target:
+        value = F.interpolate(
+            value.unsqueeze(0).float(), size=target, mode="nearest"
+        ).squeeze(0).bool()
+    return value
 
 def loadCam(args, id, cam_info, resolution_scale):
     orig_w, orig_h = cam_info.image.size
@@ -43,13 +59,17 @@ def loadCam(args, id, cam_info, resolution_scale):
     gt_image = resized_image_rgb[:3, ...]
     loaded_mask = None
 
-    if resized_image_rgb.shape[1] == 4:
+    if resized_image_rgb.shape[0] == 4:
         loaded_mask = resized_image_rgb[3:4, ...]
+
+    tri_mask = resize_camera_mask(cam_info.Tri_Mask, resolution)
 
     return Camera(colmap_id=cam_info.uid, R=cam_info.R, T=cam_info.T, 
                   FoVx=cam_info.FovX, FoVy=cam_info.FovY, 
-                  image=gt_image, gt_alpha_mask=loaded_mask, Tri_Mask=cam_info.Tri_Mask,
-                  image_name=cam_info.image_name, uid=id, data_device=args.data_device)
+                  image=gt_image, gt_alpha_mask=loaded_mask, Tri_Mask=tri_mask,
+                  image_name=cam_info.image_name, uid=id, data_device=args.data_device,
+                  image_path=cam_info.image_path,
+                  calibration=getattr(cam_info, "calibration", None))
 
 def cameraList_from_camInfos(cam_infos, resolution_scale, args):
     camera_list = []

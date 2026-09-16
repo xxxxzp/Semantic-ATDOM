@@ -144,6 +144,7 @@ class OptimizationParams(ParamGroup):
         self.OutputModelInterval = 5
         self.GlobalOptimizationInterval = 1
         self.GlobalOptimizationIteration = 100
+        self.progressive_identity_policy = "strict_cumulative"
         self.Source_Path_Dir = ""
         self.Model_Path_Dir = ""
         self.IterationFirstScene = 2000

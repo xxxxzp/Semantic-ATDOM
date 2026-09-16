@@ -19,7 +19,11 @@ from semantic_atdom.scene.gaussian_model import GaussianModel
 from semantic_atdom.utils.general_utils import PILtoTorch
 from semantic_atdom.scene.cameras import Camera
 from semantic_atdom.arguments import ModelParams
-from semantic_atdom.utils.camera_utils import cameraList_from_camInfos, camera_to_JSON
+from semantic_atdom.utils.camera_utils import (
+    cameraList_from_camInfos,
+    camera_to_JSON,
+    resize_camera_mask,
+)
 import torch
 from PIL import Image
 import numpy as np
@@ -176,14 +180,17 @@ class Scene:
             gt_image = resized_image_rgb[:3, ...]
             loaded_mask = None
 
-            if resized_image_rgb.shape[1] == 4:
+            if resized_image_rgb.shape[0] == 4:
                 loaded_mask = resized_image_rgb[3:4, ...]
 
             NewCam = Camera(colmap_id=cam_info.uid, R=cam_info.R, T=cam_info.T,
                             FoVx=cam_info.FovX, FoVy=cam_info.FovY,
                             image=gt_image, gt_alpha_mask=loaded_mask,
+                            Tri_Mask=resize_camera_mask(cam_info.Tri_Mask, resolution),
                             image_name=cam_info.image_name, uid=len(self.train_cameras[resolution_scale]),
-                            data_device=args.data_device)
+                            data_device=args.data_device,
+                            image_path=cam_info.image_path,
+                            calibration=getattr(cam_info, "calibration", None))
 
             self.train_cameras[resolution_scale].append(NewCam)
 
@@ -261,14 +268,17 @@ class Scene:
                 gt_image = resized_image_rgb[:3, ...]
                 loaded_mask = None
 
-                if resized_image_rgb.shape[1] == 4:
+                if resized_image_rgb.shape[0] == 4:
                     loaded_mask = resized_image_rgb[3:4, ...]
 
                 NewCam = Camera(colmap_id=cam_info.uid, R=cam_info.R, T=cam_info.T,
                                 FoVx=cam_info.FovX, FoVy=cam_info.FovY,
                                 image=gt_image, gt_alpha_mask=loaded_mask,
+                                Tri_Mask=resize_camera_mask(cam_info.Tri_Mask, resolution),
                                 image_name=cam_info.image_name, uid=len(self.train_cameras[resolution_scale]),
-                                data_device=args.data_device)
+                                data_device=args.data_device,
+                                image_path=cam_info.image_path,
+                                calibration=getattr(cam_info, "calibration", None))
 
                 self.train_cameras[resolution_scale].append(NewCam)
                 NewCams.append(NewCam)

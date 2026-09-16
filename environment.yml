@@ -28,6 +28,7 @@ dependencies:
   - plyfile
   - tqdm
   - matplotlib
+  - pytest
   - pyqt
   - tensorboard
   - tifffile

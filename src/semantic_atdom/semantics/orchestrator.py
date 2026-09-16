@@ -50,6 +50,7 @@ from semantic_atdom.semantics.tdom import (
     rasterize_semantic_tdom,
 )
 from semantic_atdom.utils.image_utils import tdom_to_uint8
+from semantic_atdom.utils.camera_calibration import rectify_array
 
 
 def _image_id(value: object) -> str:
@@ -553,6 +554,14 @@ class CudaSemanticProjector:
 
     def project(self, gaussians, camera, observation: SemanticObservation):
         labels = observation.labels
+        calibration = getattr(camera, "calibration", None)
+        if calibration is not None and calibration.requires_rectification:
+            labels = rectify_array(
+                labels,
+                calibration,
+                interpolation="nearest",
+                border_value=self.class_spec.ignore_id,
+            )
         expected_shape = (camera.image_height, camera.image_width)
         if tuple(labels.shape) != expected_shape:
             raise SemanticSchemaError(
@@ -1223,6 +1232,9 @@ class ProgressiveSemanticHook:
         processed = []
         errors = []
         deferred = []
+        ledger_images = {
+            entry.image_id for entry in self.orchestrator.ledger.entries
+        }
         if not online_usable:
             errors.append(
                 "online semantic state unavailable: {}".format(
@@ -1242,15 +1254,99 @@ class ProgressiveSemanticHook:
                     )
                 )
                 deferred.extend(missing_cameras)
-        if online_usable:
+        reordered_rebuild = False
+        newly_ready = tuple(
+            image_id
+            for image_id in ordered
+            if image_id not in ledger_images
+            and (
+                self.dataset.semantic_root / "labels" / (image_id + ".png")
+            ).is_file()
+            and (
+                self.dataset.semantic_root / "metadata" / (image_id + ".json")
+            ).is_file()
+        )
+        missing_overlap_identities = tuple(
+            sorted(set(camera_by_id) - set(all_ordered), key=_acquisition_key)
+        )
+        can_ingest_online = not missing_overlap_identities
+        if online_usable and not final and missing_overlap_identities:
+            errors.append(
+                "overlap snapshot omits persistent cameras {}; deferring new "
+                "semantic observations until a complete overlap snapshot".format(
+                    ", ".join(missing_overlap_identities)
+                )
+            )
+            deferred.extend(newly_ready)
+        if (
+            online_usable
+            and not final
+            and can_ingest_online
+            and ledger_images
+            and newly_ready
+            and min(_acquisition_key(item) for item in newly_ready)
+            < max(_acquisition_key(item) for item in ledger_images)
+        ):
+            # An incremental accumulator cannot insert an observation before
+            # already-closed acquisition groups.  Replaying every currently
+            # ready observation is the only order-independent correction.
+            replay_ids = tuple(
+                image_id
+                for image_id in ordered
+                if image_id in camera_by_id
+                and (
+                    self.dataset.semantic_root
+                    / "labels"
+                    / (image_id + ".png")
+                ).is_file()
+                and (
+                    self.dataset.semantic_root
+                    / "metadata"
+                    / (image_id + ".json")
+                ).is_file()
+            )
+            try:
+                rebuilt = FinalSemanticRebuilder(
+                    self.dataset,
+                    self.projector,
+                    self.orchestrator.config,
+                ).rebuild(
+                    replay_ids,
+                    camera_by_id,
+                    gaussians,
+                    overlap,
+                    online_state=self.orchestrator.state,
+                )
+                replacement = OnlineSemanticOrchestrator(
+                    rebuilt.state,
+                    self.dataset.class_spec,
+                    self.orchestrator.config,
+                    ledger=rebuilt.ledger,
+                    label_provenance=rebuilt.label_provenance,
+                )
+                replacement.current_geometry_stage = geometry_stage
+                self.orchestrator = replacement
+                ledger_images = {
+                    entry.image_id for entry in rebuilt.ledger.entries
+                }
+                processed.extend(
+                    image_id for image_id in newly_ready if image_id in ledger_images
+                )
+                reordered_rebuild = True
+            except Exception as error:
+                errors.append(
+                    "out-of-order online rebuild: {}".format(error)
+                )
+                online_usable = False
+
+        if online_usable and not reordered_rebuild:
             try:
                 self._refresh_active_window(camera_by_id, gaussians)
             except Exception as error:
                 errors.append("active-window refresh: {}".format(error))
-        ledger_images = {
-            entry.image_id for entry in self.orchestrator.ledger.entries
-        }
-        for position, image_id in enumerate(ordered if online_usable else ()):
+        for position, image_id in enumerate(
+            ordered if online_usable and can_ingest_online else ()
+        ):
             if image_id in ledger_images:
                 try:
                     self._verify_recorded_metadata(image_id)

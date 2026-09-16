@@ -90,6 +90,9 @@ class FinalRenderMemoryTests(unittest.TestCase):
         ), mock.patch(
             "tools.train_progressive.Image.fromarray",
             return_value=_SavedImage(),
+        ), mock.patch(
+            "tools.train_progressive.tdom_to_uint8",
+            new=lambda _image: np.zeros((2, 2, 3), dtype=np.uint8),
         ):
             trainer.args = SimpleNamespace(Model_Path_Dir=root)
             trainer.Render_Evaluate_All_Images()

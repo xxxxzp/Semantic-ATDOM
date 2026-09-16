@@ -10,7 +10,7 @@ import torch
 
 
 class RenderArgumentTests(unittest.TestCase):
-    def test_tdom_queue_conversion_preserves_legacy_bytes(self):
+    def test_tdom_queue_conversion_preserves_radiometric_values(self):
         tdom = torch.tensor(
             [
                 [[-0.5, 0.0], [0.5, 1.0]],
@@ -19,15 +19,14 @@ class RenderArgumentTests(unittest.TestCase):
             ],
             dtype=torch.float32,
         )
-        legacy = (tdom - tdom.min()) / (tdom.max() - tdom.min())
-        legacy = legacy.permute(1, 2, 0).numpy()
-        legacy = (legacy * 255).astype(np.uint8)
+        expected = tdom.clamp(0.0, 1.0).permute(1, 2, 0).numpy()
+        expected = (expected * 255).astype(np.uint8)
 
-        np.testing.assert_array_equal(tdom_to_uint8(tdom), legacy)
+        np.testing.assert_array_equal(tdom_to_uint8(tdom), expected)
 
     def test_constant_tdom_converts_without_nan(self):
         converted = tdom_to_uint8(torch.ones((3, 2, 4)))
-        np.testing.assert_array_equal(converted, np.zeros((2, 4, 3), np.uint8))
+        np.testing.assert_array_equal(converted, np.full((2, 4, 3), 255, np.uint8))
 
     def test_model_params_preserve_external_image_folder(self):
         parser = ArgumentParser()

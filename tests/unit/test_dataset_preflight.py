@@ -202,6 +202,41 @@ class DatasetPreflightTests(unittest.TestCase):
             self.assertEqual(report["stage_records"][1]["camera_count"], 2)
             self.assertEqual(report["stage_records"][1]["snapshot_camera_count"], 1)
 
+    def test_non_cumulative_identity_sets_require_an_explicit_union_policy(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            dataset, semantic_data = self._fixture(root)
+            sparse = dataset / "2" / "sparse" / "0"
+            _write_images_binary(sparse / "images.bin", ("000003.jpg",))
+            (sparse / "imagesNames.txt").write_text("000003.jpg", encoding="utf-8")
+            np.savetxt(
+                sparse / "imageMatchMatrix.txt",
+                np.eye(1, dtype=np.int64),
+                fmt="%d",
+                delimiter=",",
+            )
+
+            with self.assertRaisesRegex(SemanticSchemaError, "not cumulative"):
+                run_dataset_preflight(
+                    dataset_root=dataset,
+                    semantic_data_root=semantic_data,
+                    output_root=root / "strict-output",
+                    start_stage=1,
+                    end_stage=2,
+                )
+
+            result = run_dataset_preflight(
+                dataset_root=dataset,
+                semantic_data_root=semantic_data,
+                output_root=root / "union-output",
+                start_stage=1,
+                end_stage=2,
+                identity_policy="persistent_union",
+            )
+            report = json.loads(result.report_path.read_text(encoding="utf-8"))
+            self.assertEqual(result.final_image_ids, ("000001", "000003"))
+            self.assertEqual(report["identity_policy"], "persistent_union")
+
 
 if __name__ == "__main__":
     unittest.main()

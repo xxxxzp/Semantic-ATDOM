@@ -20,6 +20,33 @@ class _RecordingQueue:
 
 
 class ProgressiveEmptyStageTests(unittest.TestCase):
+    def test_existing_radial_camera_keeps_a_rectified_validity_mask(self):
+        extrinsic = SimpleNamespace(
+            camera_id=1,
+            qvec=np.array([1.0, 0.0, 0.0, 0.0]),
+            tvec=np.zeros(3),
+            name="existing.png",
+        )
+        intrinsic = SimpleNamespace(
+            id=1,
+            model="RADIAL",
+            width=8,
+            height=6,
+            params=np.array([5.0, 4.0, 3.0, 0.2, 0.03]),
+        )
+
+        cameras, _, _, _ = dataset_readers.SingleImage_readColmapCameras(
+            {1: extrinsic},
+            {1: intrinsic},
+            "/unused",
+            CurrentImagesNames=["existing"],
+            Silence=True,
+        )
+
+        self.assertIsNone(cameras[0].image)
+        self.assertEqual(tuple(cameras[0].Tri_Mask.shape), (1, 6, 8))
+        self.assertFalse(bool(cameras[0].Tri_Mask.all()))
+
     def test_progressive_sampling_metadata_does_not_require_training_mask(self):
         extrinsic = SimpleNamespace(
             camera_id=1,

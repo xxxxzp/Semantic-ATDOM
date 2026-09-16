@@ -7,6 +7,7 @@ from semantic_atdom.arguments import OptimizationParams
 from semantic_atdom.utils.output_retention import (
     prune_intermediate_stage_outputs,
 )
+from tools.train_progressive import semantic_online_required
 
 
 class OutputRetentionTests(unittest.TestCase):
@@ -19,6 +20,25 @@ class OutputRetentionTests(unittest.TestCase):
         self.assertEqual(args.OutputModelInterval, 0)
         self.assertEqual(args.semantic_checkpoint_interval, 0)
         self.assertTrue(args.semantic_tdom_final_only)
+
+    def test_final_only_rgb_outputs_defer_semantics_until_final_boundary(self):
+        parser = ArgumentParser()
+        OptimizationParams(parser)
+        args = parser.parse_args([])
+        args.enable_semantics = True
+        args.progress_video = "both"
+        args.progress_video_content = "rgb"
+
+        self.assertFalse(semantic_online_required(args))
+
+        args.progress_video_content = "semantic"
+        self.assertTrue(semantic_online_required(args))
+        args.progress_video = "none"
+        args.semantic_checkpoint_interval = 5
+        self.assertTrue(semantic_online_required(args))
+        args.semantic_checkpoint_interval = 0
+        args.semantic_tdom_final_only = False
+        self.assertTrue(semantic_online_required(args))
 
     def test_final_only_retention_removes_only_numeric_stage_directories(self):
         with TemporaryDirectory() as directory:

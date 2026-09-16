@@ -34,8 +34,8 @@
   `PredictionImages100800.jpg` 和 `PSNR.txt`。首次收尾渲染暴露了未使用列表持有
   历史 CUDA 图像导致的线性显存增长；修复张量生命周期后，从最终点云和各阶段
   累计相机集合恢复渲染，完整 487 帧通过此前故障点。
-- 当时的 final-only 输出策略测试为 175/175 通过；本轮发布式输出重构与异步
-  state 替换修复后为 191/191 通过。
+- 当时的 final-only 输出策略测试为 175/175 通过；本轮发布式输出重构、异步
+  state 替换修复和 final-boundary 语义调度后为 192/192 通过。
 - 正式结果目录：
   `/data3/xzp/data/UAVScenes_Onthefly/interval5_AMtown01/outputs/semantic_atdom_v2_amtown01_observed_v1_r9`。
   已清除 474 个中间 stage 目录，并迁移到自描述输出 schema v1；最终点云和训练
@@ -106,13 +106,15 @@ rectification。正式运行默认不保存过程恢复点；成功后只发布�
 `--recovery_checkpoint_every_stages N`，它只原子替换 `.work/recovery/latest.pt`，
 不会累积每个 stage 的完整模型；成功发布后该工作区会被删除。
 
-当前输出重构验收包括：`pytest -q` 191/191 通过；真实 13–487 persistent-union 预检仍为
+当前输出重构验收包括：`pytest -q` 192/192 通过；真实 13–487 persistent-union 预检仍为
 487/487；stage 13–20 极小训练穿过焦距变化和非累积阶段；stage 14 checkpoint 在
 新进程恢复后得到与连续训练相同的最终 L1/PSNR；真实 stage 13 全分辨率标签完成
 CUDA 投影和 final exact rebuild，状态为 `exact_final`、lag=0、无 error/deferred。
 此外，真实 stage 13–22 按正式迭代参数重放，验证乱序在线重建替换 state 后，排队
 拓扑更新仍作用于新的 active state；stage 21 不再发生计数失配，最终同样为
 `exact_final`、lag=0、errors=[]。
+final-only + RGB 视频的两阶段真实 CUDA 验证还确认了渐进阶段没有语义同步任务，
+最终边界仍完成 `exact_final` 和成对地图发布。
 
 输出目录的设计依据、保留策略、迁移边界和视频决策见
 `docs/decisions/0008-run-output-contract.md`。

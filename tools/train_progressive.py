@@ -259,6 +259,22 @@ def GetArgs():
 
     return args, lp, op, pp
 
+
+def semantic_online_required(args):
+    """Whether a requested product consumes progressive semantic state."""
+    semantic_video = (
+        args.progress_video != "none"
+        and args.progress_video_content in ("semantic", "side_by_side")
+    )
+    return bool(
+        args.enable_semantics
+        and (
+            not args.semantic_tdom_final_only
+            or args.semantic_checkpoint_interval > 0
+            or semantic_video
+        )
+    )
+
 def TrainingPreparation(args):
     TimeCost = {}
 
@@ -1599,7 +1615,8 @@ class GaussianTrainer(mp.Process):
                 self._prepare_semantic_map_safely("Initialization")
                 if not self.args.enable_semantics:
                     self._render_legacy_tdom()
-        self._initialize_semantic_hook()
+        if semantic_online_required(self.args):
+            self._initialize_semantic_hook()
         self._run_semantic_hook("initialization")
         with torch.no_grad():
             self._capture_progress_camera_views(self.scene.getTrainCameras())
@@ -2918,6 +2935,7 @@ class On_the_Fly_GS:
                     args.recovery_checkpoint_every_stages
                 ),
                 "semantic_checkpoint_interval": args.semantic_checkpoint_interval,
+                "semantic_online": semantic_online_required(args),
             },
         )
         self.layout.write_config(vars(args))

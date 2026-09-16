@@ -111,3 +111,12 @@ the orchestrator while a topology update waits in the single-worker queue.  A
 real stage 13--22 replay additionally covers AMtown01's non-strict cumulative
 identity sequence: stages 18--21 retain a valid online state, and the final
 boundary reaches `exact_final` with zero lag and no errors.
+
+When publication is final-only, progress videos contain RGB, and semantic
+recovery checkpoints are disabled, no requested artifact consumes progressive
+semantic state.  In that case the semantic sidecar is intentionally initialized
+only at the final boundary and performs one authoritative exact rebuild.  This
+removes otherwise wasted per-stage projection/topology work and GPU contention.
+Online semantics remains enabled when any consumer requires it: intermediate
+semantic publication, semantic/side-by-side progress video, or semantic
+recovery checkpoints.

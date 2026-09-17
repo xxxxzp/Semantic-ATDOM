@@ -228,3 +228,26 @@ Phantom3 stage 14–414 的完整运行暴露了四类与模型质量无关的�
 - final refinement 仍为 `exact_final`、publication complete、lag 0、errors 为空。
 
 另一次错误的 stage 120 冷启动还暴露了输入边界：该阶段 overlap 累计集合有 120 个身份，但本地 COLMAP snapshot 只有 23 台相机，缺失前序 persistent-union 历史，随后会在 CUDA 中异步越界。preflight 现在要求无恢复点的首阶段 snapshot 覆盖其完整累计身份集合；否则在训练前明确拒绝，并提示从完整锚点开始或提供兼容 recovery checkpoint。stage 120 现会报告缺少 97 个身份，而不是进入训练后崩溃。
+
+## 11. 优化后 Phantom3 全量验收
+
+在单元测试和 stage 14–18 小范围真实数据 smoke 通过后，使用同一 Phantom3 stage 14–414、100 万高斯预算和 120 帧训练视频参数完成全量复跑：
+
+```text
+/data3/xzp/data/Onthefly/phantom3/outputs/runs/phantom3-v2-optimized_20260917-185358_34718da
+```
+
+该运行成功结束，数据 preflight 覆盖 414 个最终影像，全部标签和源绑定完整。最终语义状态为 `exact_final`，publication complete，through image 为 `000414`，lag 为 0，deferred 和 errors 均为空。最终地图为 10240×12800；pair manifest、RGB/semantic 子 manifest、9 个发布产品和 `latest.json` 指针的 SHA-256 均已重新计算并通过校验。
+
+完整验收结果：
+
+- 414 个逐相机 JPEG 全部生成，CSV 含 414 条记录；逐相机 masked PSNR 均值 `31.074394461037457`，与最终聚合 PSNR `31.074394461037453` 的误差小于 `4e-15`；
+- 最终指标为 L1 `0.01830371`、PSNR `31.07439446`、SSIM `0.89079155`、LPIPS `0.26681690`，最终高斯数 680884；
+- 训练视频为 H.264、3840×1080、4 FPS、120 帧、30 秒；首帧为 stage 14，末帧为 stage 414 `exact_final`，全部帧 lag 为 0；视觉抽查确认画布随观测范围扩大，RGB TDOM、轨迹和 Semantic TDOM 对齐；
+- 118 个渐进视频边界的语义等待合计 86.521 秒，平均 0.733 秒，最大 1.409 秒；未再出现旧逻辑 56–58 秒/阶段的历史重放长尾；
+- `ProgressiveEndToEnd` 从旧全量运行的 1585.291 秒降至 1271.417 秒，减少 313.875 秒（19.80%）；geometry 本体基本不变，说明收益来自移除错误的在线全历史重放，而不是降低训练量；
+- 全程墙钟时间为 2014.231 秒，对比旧运行 2374.792 秒减少 360.561 秒（15.18%）；
+- 输出目录从 1,461,265,441 bytes 降至 890,692,167 bytes，减少 39.05%；默认不存在 `training_state.pt` 或 checkpoint，成功后不存在 `.work/`；
+- 阶段记录的 CUDA peak allocated 最大约 2.90 GiB、peak reserved 最大约 9.39 GiB；最终精确语义重建 peak allocated 约 1.90 GiB，未发生 OOM；训练日志没有 Traceback、CUDA error、NaN 或失败记录。
+
+最终精确语义重建耗时 204.714 秒，其中投影 190.872 秒。它是冻结最终几何后保证权威语义结果所必需的 O(images × visible geometry) 工作，不能用在线近似替代。后续若继续优化，应以批量投影、可见性缓存或等价的分块流水为方向，并以最终 state/map 一致性为硬约束；本轮没有发现需要再次修改训练逻辑并重跑全量数据的新正确性问题。

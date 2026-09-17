@@ -71,9 +71,23 @@ _INLINE_RECORD_SEPARATOR = re.compile(r"0000[1-9A-Fa-f][0-9A-Fa-f]{11}")
 
 
 def _read_exported_text(path: Path) -> str:
-    """Read vendor text exports that may contain an inline record marker."""
+    """Read vendor text exports that may contain an inline record marker.
+
+    The exporter repeats one pointer-shaped marker between records and after
+    the final record.  Discover that exact marker from the file tail before
+    replacing it.  A global regex substitution is ambiguous for zero-padded
+    image ids such as ``000014`` because the id plus the start of the marker
+    also looks like a hexadecimal pointer.
+    """
     content = path.read_text(encoding="utf-8")
-    return _INLINE_RECORD_SEPARATOR.sub("\n", content)
+    content_without_trailing_whitespace = content.rstrip()
+    marker_length = 16
+    if len(content_without_trailing_whitespace) < marker_length:
+        return content
+    marker = content_without_trailing_whitespace[-marker_length:]
+    if _INLINE_RECORD_SEPARATOR.fullmatch(marker) is None:
+        return content
+    return content.replace(marker, "\n")
 
 
 _GEOMETRY_ATTRIBUTE_NAMES = RGB_MODEL_ATTRIBUTE_NAMES

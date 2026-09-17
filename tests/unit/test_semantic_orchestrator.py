@@ -138,6 +138,24 @@ class AcquisitionOverlapTests(unittest.TestCase):
             result.normalized("1658137108.010", "1658137107.900"), 0.5
         )
 
+    def test_fixed_layout_preserves_zero_padded_id_before_inline_marker(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            marker = "00007FFE9CAB9DE0"
+            (root / "match_matrix_image_name.txt").write_text(
+                "000013,000014" + marker,
+                encoding="utf-8",
+            )
+            (root / "match_matrix_value.txt").write_text(
+                "100,25" + marker + "25,50" + marker,
+                encoding="utf-8",
+            )
+
+            result = AcquisitionOverlap.load(root)
+
+        self.assertEqual(result.image_ids, ("000013", "000014"))
+        self.assertEqual(result.normalized("000013", "000014"), 0.5)
+
     def test_anchor_overlap_prevents_transitive_group_growth(self):
         matrix = overlap(
             ["000001", "000002", "000003"],

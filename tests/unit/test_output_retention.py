@@ -26,14 +26,13 @@ class OutputRetentionTests(unittest.TestCase):
         OptimizationParams(parser)
         args = parser.parse_args([])
         args.enable_semantics = True
-        args.progress_video = "both"
-        args.progress_video_content = "rgb"
+        args.render_training_progress = False
 
         self.assertFalse(semantic_online_required(args))
 
-        args.progress_video_content = "semantic"
+        args.render_training_progress = True
         self.assertTrue(semantic_online_required(args))
-        args.progress_video = "none"
+        args.render_training_progress = False
         args.semantic_checkpoint_interval = 5
         self.assertTrue(semantic_online_required(args))
         args.semantic_checkpoint_interval = 0

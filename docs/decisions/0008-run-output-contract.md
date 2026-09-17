@@ -3,6 +3,10 @@ status: accepted
 date: 2026-09-16
 ---
 
+> The public naming and progressive-video sections are superseded by ADR 0009
+> and output schema v2.  The lifecycle, retention, recovery, and publication
+> decisions below remain in force.
+
 # Separate progressive-training work state from published run results
 
 The historical output tree mixed six different lifecycles at one level:

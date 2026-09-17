@@ -2021,6 +2021,11 @@ class AsyncProgressiveSemanticHook:
             self._executor.submit(lambda: None).result()
         self._raise_background_error()
 
+    def current_status(self, geometry_stage: int) -> SemanticSyncResult:
+        """Return the committed status after callers have established ordering."""
+        self._raise_background_error()
+        return self._current_status(int(geometry_stage))
+
     def synchronize(
         self,
         geometry_stage: int,

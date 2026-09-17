@@ -14,7 +14,7 @@ import subprocess
 from typing import Any, Dict, Mapping, Optional
 
 
-RUN_OUTPUT_SCHEMA_VERSION = 1
+RUN_OUTPUT_SCHEMA_VERSION = 2
 
 
 def _utc_now() -> str:
@@ -153,12 +153,12 @@ class RunLayout:
         return self.root / "provenance"
 
     @property
-    def qa(self) -> Path:
-        return self.root / "qa"
+    def renders(self) -> Path:
+        return self.root / "renders"
 
     @property
-    def visualizations(self) -> Path:
-        return self.root / "visualizations"
+    def videos(self) -> Path:
+        return self.root / "videos"
 
     @property
     def work(self) -> Path:
@@ -268,8 +268,8 @@ class RunLayout:
             "metrics_dir",
             "logs_dir",
             "provenance_dir",
-            "qa_dir",
-            "visualizations_dir",
+            "renders_dir",
+            "videos_dir",
         }
         payload = {}
         for key, value in arguments.items():

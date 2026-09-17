@@ -49,8 +49,8 @@ class _BoundedRenderImage:
 
 
 class _SavedImage:
-    def save(self, _path):
-        pass
+    def save(self, path):
+        Path(path).touch()
 
 
 class FinalRenderMemoryTests(unittest.TestCase):
@@ -78,7 +78,7 @@ class FinalRenderMemoryTests(unittest.TestCase):
             return {
                 "render": _BoundedRenderImage(),
                 "visibility_filter": SimpleNamespace(
-                    sum=lambda: torch.tensor(1)
+                    numel=lambda: 1
                 ),
             }
 
@@ -100,10 +100,15 @@ class FinalRenderMemoryTests(unittest.TestCase):
             new=lambda _image: np.zeros((2, 2, 3), dtype=np.uint8),
         ):
             trainer.args = SimpleNamespace(
-                qa_dir=str(Path(root) / "qa"),
+                renders_dir=str(Path(root) / "renders"),
                 metrics_dir=str(Path(root) / "metrics"),
             )
             trainer.Render_Evaluate_All_Images()
+            render_path = Path(root) / "renders" / "cameras" / "image_0.jpg"
+            self.assertTrue(render_path.is_file())
+            metrics = (Path(root) / "metrics" / "per_camera.csv").read_text()
+            self.assertIn("renders/cameras/image_0.jpg", metrics)
+            self.assertIn(",1,", metrics)
 
         self.assertLessEqual(_BoundedRenderImage.peak, 2)
 

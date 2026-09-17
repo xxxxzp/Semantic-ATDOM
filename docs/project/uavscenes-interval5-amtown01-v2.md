@@ -52,7 +52,7 @@
 在 stage 20 后因拓扑失配降级，但最终 exact rebuild 完整覆盖 487/487 张观测，
 因此只将最终语义产品视为权威，不将该运行用于证明中间在线语义发布稳定性。
 
-## 发布式输出全量验收（2026-09-16）
+## 输出 schema v1 历史全量验收（2026-09-16）
 
 最终验收运行：
 
@@ -69,7 +69,7 @@
   863.988 秒，总耗时 901.102 秒；最终状态为 `exact_final`、lag=0、
   errors/deferred 均为空，地图发布为 `complete`。
 - 最终全量指标：L1 0.040377、PSNR 24.802191 dB、SSIM 0.625142、LPIPS
-  0.509093。`qa/camera_renders/` 含 487 张渲染，`metrics/per_camera.csv`
+  0.509093。历史 schema v1 的 `qa/camera_renders/` 含 487 张渲染，`metrics/per_camera.csv`
   含表头和 487 行逐相机指标。
 - 最终 RGB/Semantic TDOM 为 6656×12288，核心语义产品包含 ID、颜色、unknown
   mask/reason、pixel evidence support 和 entropy。camera 与 TDOM 渐进视频均为
@@ -109,18 +109,18 @@ CUDA_VISIBLE_DEVICES=0 conda run --no-capture-output -n semantic-atdom \
   --semantic_data_root /data3/xzp/data/UAVScenes_Onthefly/interval5_AMtown01/outputs/semantic_inputs/uavscenes_amtown01_observed_v1 \
   --semantic_tdom_render_tile_rows 256 \
   --render_all_cameras \
-  --progress_video both \
-  --progress_video_content rgb \
-  --progress_video_stride 10 \
-  --progress_video_fps 4 \
+  --render_training_progress \
+  --training_progress_target_frames 120 \
+  --training_progress_fps 4 \
   --NoDebug
 ```
 
 运行目录自动创建为 `outputs/runs/<run_name>_<timestamp>_<git-sha>/`。只有完整成功
 发布的运行才会原子更新 `outputs/latest`；失败或中断的运行会保留诊断信息，但不会
-成为 latest。逐相机渲染由 `--render_all_cameras` 显式开启。渐进视频可以选择
-`camera`、`tdom` 或 `both`，内容可以选择 `rgb`、`semantic` 或 `side_by_side`；
-这些选项会产生额外渲染开销，因此默认关闭。
+成为 latest。逐相机渲染由 `--render_all_cameras` 显式开启并发布到
+`renders/cameras/`。`--render_training_progress` 显式生成同步的 RGB/Semantic
+TDOM 训练过程视频 `videos/training_progress.mp4`；该选项会产生额外渲染开销，
+因此默认关闭。
 
 必须使用 `--resolution 1`：RGB 与人工标签原始分辨率均为 2448×2048；默认的
 1.6K 自动缩放会破坏逐像素语义对应关系。

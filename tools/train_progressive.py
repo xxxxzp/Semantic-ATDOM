@@ -99,6 +99,31 @@ except ImportError:
 
 WARNED = False
 
+TRAINING_PROGRESS_WIDTH = 3840
+TRAINING_PROGRESS_HEIGHT = 1080
+TRAINING_PROGRESS_MAP_DOWNSAMPLE = 8
+
+
+def select_training_progress_stages(start_stage, end_stage, target_frames):
+    """Choose online stage boundaries while reserving one final-refinement frame."""
+    start_stage = int(start_stage)
+    end_stage = int(end_stage)
+    target_frames = int(target_frames)
+    if end_stage < start_stage:
+        raise ValueError("end stage must not precede start stage")
+    if target_frames < 3:
+        raise ValueError("target frame count must be at least 3")
+    available = end_stage - start_stage + 1
+    progressive_budget = min(available, target_frames - 1)
+    if progressive_budget == available:
+        return tuple(range(start_stage, end_stage + 1))
+    positions = np.linspace(
+        start_stage, end_stage, num=progressive_budget, endpoint=True
+    )
+    selected = {int(round(value)) for value in positions}
+    selected.update((start_stage, end_stage))
+    return tuple(sorted(selected))
+
 def SemanticWarning(message):
     """Warnings-as-errors must never couple semantics back into geometry."""
     try:
@@ -159,18 +184,11 @@ def GetArgs():
     parser.add_argument("--start_checkpoint", type=str, default=None)
     parser.add_argument("--run_name", type=str, default="")
     parser.add_argument("--render_all_cameras", action="store_true")
+    parser.add_argument("--render_training_progress", action="store_true")
     parser.add_argument(
-        "--progress_video",
-        choices=("none", "camera", "tdom", "both"),
-        default="none",
+        "--training_progress_target_frames", type=int, default=120
     )
-    parser.add_argument(
-        "--progress_video_content",
-        choices=("rgb", "semantic", "side_by_side"),
-        default="rgb",
-    )
-    parser.add_argument("--progress_video_stride", type=int, default=1)
-    parser.add_argument("--progress_video_fps", type=float, default=4.0)
+    parser.add_argument("--training_progress_fps", type=float, default=4.0)
     parser.add_argument(
         "--recovery_checkpoint_every_stages", type=int, default=0
     )
@@ -179,21 +197,23 @@ def GetArgs():
     args.save_iterations.append(args.iterations)
     '''以上是在构建参数配置器'''
 
-    if args.progress_video_stride < 1:
-        raise ValueError("--progress_video_stride must be positive")
-    if args.progress_video_fps <= 0:
-        raise ValueError("--progress_video_fps must be positive")
+    if args.training_progress_target_frames < 3:
+        raise ValueError(
+            "--training_progress_target_frames must be at least 3"
+        )
+    if args.training_progress_fps <= 0:
+        raise ValueError("--training_progress_fps must be positive")
     if args.recovery_checkpoint_every_stages < 0:
         raise ValueError(
             "--recovery_checkpoint_every_stages must be non-negative"
         )
-    if (
-        args.progress_video != "none"
-        and args.progress_video_content != "rgb"
-        and not args.enable_semantics
-    ):
+    if args.render_training_progress and not args.enable_semantics:
         raise ValueError(
-            "semantic progress video content requires --enable_semantics"
+            "--render_training_progress requires --enable_semantics"
+        )
+    if args.render_training_progress and not args.render_TDOM:
+        raise ValueError(
+            "--render_training_progress requires --render_TDOM"
         )
     if args.OutputModelInterval:
         raise ValueError(
@@ -202,7 +222,8 @@ def GetArgs():
         )
     if args.render_RGB:
         raise ValueError(
-            "--render_RGB has been replaced by --progress_video camera"
+            "--render_RGB is unsupported; use --render_training_progress "
+            "for the synchronized RGB/Semantic TDOM timeline"
         )
     if args.run_name:
         allocated = os.environ.get("SEMANTIC_ATDOM_RUN_ROOT")
@@ -225,8 +246,8 @@ def GetArgs():
     args.metrics_dir = str(layout.metrics)
     args.logs_dir = str(layout.logs)
     args.provenance_dir = str(layout.provenance)
-    args.qa_dir = str(layout.qa)
-    args.visualizations_dir = str(layout.visualizations)
+    args.renders_dir = str(layout.renders)
+    args.videos_dir = str(layout.videos)
 
     # 输出存储训练后模型的存储位置
     print("Optimizing " + args.Source_Path_Dir)
@@ -262,16 +283,12 @@ def GetArgs():
 
 def semantic_online_required(args):
     """Whether a requested product consumes progressive semantic state."""
-    semantic_video = (
-        args.progress_video != "none"
-        and args.progress_video_content in ("semantic", "side_by_side")
-    )
     return bool(
         args.enable_semantics
         and (
             not args.semantic_tdom_final_only
             or args.semantic_checkpoint_interval > 0
-            or semantic_video
+            or args.render_training_progress
         )
     )
 
@@ -1250,8 +1267,14 @@ class GaussianTrainer(mp.Process):
         self.progressive_transition_index = 0
         self.CurrentGlobalOptimizationIterations = 0
         self.data_preprocessor_rng_state = None
-        self.progress_camera_event = 0
-        self.progress_tdom_event = 0
+        self.training_progress_stages = set(
+            select_training_progress_stages(
+                self.args.StartFromImageNo,
+                self.args.EndAtImageNo,
+                self.args.training_progress_target_frames,
+            )
+        )
+        self.last_semantic_sync_result = None
 
         self.Drone_Image_Block = False
         self.Progressive_Training_Block = False
@@ -1497,6 +1520,7 @@ class GaussianTrainer(mp.Process):
                 final=final,
                 publication_request=publication_request,
             )
+            self.last_semantic_sync_result = result
             print(
                 "Semantic sync [{}]: geometry={}, through={}, lag={}, map={}".format(
                     stage_name,
@@ -1529,6 +1553,7 @@ class GaussianTrainer(mp.Process):
             hook.close(reason=error, wait=bool(final))
             self.gaussians.set_topology_observer(None)
             self.semantic_hook = None
+            self.last_semantic_sync_result = None
             return None
 
     def InitialGaussianTrain(self):
@@ -1619,8 +1644,7 @@ class GaussianTrainer(mp.Process):
             self._initialize_semantic_hook()
         self._run_semantic_hook("initialization")
         with torch.no_grad():
-            self._capture_progress_camera_views(self.scene.getTrainCameras())
-            self._capture_progress_tdom()
+            self._capture_training_progress_tdom("Initialization")
 
         # 向前端传递信息，表示初始训练已经完成，可以开始读取后续的影像
         self.SendImagePos_to_DataPreProccesser(True)
@@ -1673,12 +1697,13 @@ class GaussianTrainer(mp.Process):
         if not self.args.render_TDOM:
             return
         final = training_type == "Final_Refinement"
+        progress_due = self._training_progress_due(training_type, final=final)
         if self.args.enable_semantics and (
             self.semantic_publication_policy is None
             or (
                 self.args.semantic_tdom_final_only
                 and not final
-                and self.args.progress_video not in ("tdom", "both")
+                and not progress_due
             )
         ):
             return
@@ -1817,69 +1842,88 @@ class GaussianTrainer(mp.Process):
             )
 
     def _render_legacy_tdom(self):
-        """Preserve the RGB-only path when semantic pairing is disabled."""
-        if self.TDOM_Cam is None:
-            return
-        tdom = render(
-            self.TDOM_Cam,
-            self.gaussians,
-            self.TDOM_pipeline,
-            self.background,
-            Render_Mask=torch.ones(1, dtype=torch.bool).cuda(),
-            TDOM=True,
-        )["render"]
-        output = tdom_to_uint8(tdom)
-        del tdom
-        if self.args.progress_video in ("tdom", "both"):
-            self.DataSaver_queue.put(["SaveTDOM", output, self.TDOM_alignment])
+        """RGB-only runs no longer publish an ambiguous progress artifact."""
+        return
 
-    def _capture_progress_camera_views(self, cameras):
-        if self.args.progress_video not in ("camera", "both"):
-            return
-        cameras = list(cameras)
-        for index, camera in enumerate(cameras):
-            event = self.progress_camera_event
-            self.progress_camera_event += 1
-            is_final_event = (
-                int(self.imagenum) == int(self.args.EndAtImageNo)
-                and index == len(cameras) - 1
-            )
-            if (
-                event % int(self.args.progress_video_stride) != 0
-                and not is_final_event
-            ):
-                continue
-            render_pkg = render(
-                camera,
-                self.gaussians,
-                self.args,
-                self.bg,
-                Render_Mask=camera.Tri_Mask,
-            )
-            rgb_output = tdom_to_uint8(render_pkg["render"])
-            semantic_output = self._semantic_progress_frame(camera)
-            output = self._compose_progress_frame(rgb_output, semantic_output)
-            self.DataSaver_queue.put(
-                ["SaveImage", output, str(camera.image_name), int(self.imagenum)]
-            )
-            del render_pkg
+    def _training_progress_due(self, training_type, final=False):
+        if not self.args.render_training_progress:
+            return False
+        if final or training_type == "Final_Refinement":
+            return True
+        return int(self.imagenum) in self.training_progress_stages
 
-    def _capture_progress_tdom(self):
-        if (
-            self.args.progress_video not in ("tdom", "both")
-            or self.TDOM_Cam is None
-            or not self.args.enable_semantics
-        ):
+    @staticmethod
+    def _camera_order_key(camera):
+        value = str(camera.image_name)
+        try:
+            return (0, float(value))
+        except ValueError:
+            return (1, value)
+
+    @staticmethod
+    def _project_world_points(camera, points):
+        points = np.asarray(points, dtype=np.float32)
+        points = torch.as_tensor(
+            points,
+            dtype=torch.float32,
+            device=camera.full_proj_transform.device,
+        )
+        homogeneous = torch.cat(
+            (points, torch.ones_like(points[:, :1])), dim=1
+        )
+        clip = homogeneous @ camera.full_proj_transform
+        ndc = clip[:, :2] / clip[:, 3:].clamp_min(1e-8)
+        pixels = torch.empty_like(ndc)
+        pixels[:, 0] = (
+            (ndc[:, 0] + 1.0) * float(camera.image_width) - 1.0
+        ) * 0.5
+        pixels[:, 1] = (
+            (ndc[:, 1] + 1.0) * float(camera.image_height) - 1.0
+        ) * 0.5
+        return pixels.detach().cpu().tolist()
+
+    def _training_progress_camera(self):
+        factor = TRAINING_PROGRESS_MAP_DOWNSAMPLE
+        width = max(2, int(self.TDOM_Cam.image_width) // factor)
+        height = max(2, int(self.TDOM_Cam.image_height) // factor)
+        width += width % 2
+        height += height % 2
+        return DummyCamera(
+            self.TDOM_Cam.R,
+            self.TDOM_Cam.T,
+            self.TDOM_Cam.FoVx,
+            self.TDOM_Cam.FoVy,
+            width,
+            height,
+        )
+
+    def _capture_training_progress_tdom(self, training_type, final=False):
+        if not self._training_progress_due(training_type, final=final):
             return
-        event = self.progress_tdom_event
-        self.progress_tdom_event += 1
-        if (
-            event % int(self.args.progress_video_stride) != 0
-            and int(self.imagenum) != int(self.args.EndAtImageNo)
-        ):
-            return
+        if self.TDOM_Cam is None or self.TDOM_alignment is None:
+            raise RuntimeError(
+                "training progress frame is due but its TDOM camera is missing"
+            )
+        if self.semantic_hook is None or self.last_semantic_sync_result is None:
+            raise RuntimeError(
+                "training progress frame requires a synchronized semantic state"
+            )
+        self.semantic_hook.wait_for_idle()
+        committed_status = self.semantic_hook.current_status(self.imagenum)
+        semantic_through = committed_status.semantic_through_image
+        if semantic_through is None or int(committed_status.lag_batches) != 0:
+            raise RuntimeError(
+                "training progress semantic state is not exact for stage {} "
+                "(through={}, lag={})".format(
+                    self.imagenum,
+                    semantic_through,
+                    committed_status.lag_batches,
+                )
+            )
+
+        camera = self._training_progress_camera()
         rendered = render(
-            self.TDOM_Cam,
+            camera,
             self.gaussians,
             self.TDOM_pipeline,
             self.background,
@@ -1887,14 +1931,61 @@ class GaussianTrainer(mp.Process):
             TDOM=True,
         )["render"]
         rgb_output = tdom_to_uint8(rendered)
-        semantic_output = self._semantic_progress_frame(self.TDOM_Cam)
-        output = self._compose_progress_frame(rgb_output, semantic_output)
-        self.DataSaver_queue.put(["SaveTDOM", output, self.TDOM_alignment])
-        del rendered
+        semantic_output = self._semantic_progress_frame(camera)
+
+        cameras = sorted(
+            self.scene.getTrainCameras(), key=self._camera_order_key
+        )
+        trajectory_world = [
+            item.camera_center.detach().cpu().tolist() for item in cameras
+        ]
+        trajectory_pixels = self._project_world_points(
+            camera, trajectory_world
+        )
+        grid = self.TDOM_alignment["grid"]
+        origin = np.asarray(grid["origin_world"], dtype=np.float32)
+        axis_x = np.asarray(grid["pixel_x_axis_world"], dtype=np.float32)
+        axis_y = np.asarray(grid["pixel_y_axis_world"], dtype=np.float32)
+        basis_pixels = self._project_world_points(
+            camera, [origin, origin + axis_x, origin + axis_y]
+        )
+        column_direction = 1 if basis_pixels[1][0] > basis_pixels[0][0] else -1
+        row_direction = 1 if basis_pixels[2][1] > basis_pixels[0][1] else -1
+        denominator = max(
+            1, int(self.args.EndAtImageNo) - int(self.args.StartFromImageNo)
+        )
+        metadata = {
+            "schema_version": 1,
+            "stage": int(self.imagenum),
+            "phase": (
+                "final_refinement" if final else training_type.lower()
+            ),
+            "iteration": int(self.AlreadyTrainingIterations),
+            "observed_cameras": len(cameras),
+            "start_stage": int(self.args.StartFromImageNo),
+            "end_stage": int(self.args.EndAtImageNo),
+            "progress": min(
+                1.0,
+                max(
+                    0.0,
+                    (int(self.imagenum) - int(self.args.StartFromImageNo))
+                    / float(denominator),
+                ),
+            ),
+            "semantic_through_image": semantic_through,
+            "window": self.TDOM_alignment["window"],
+            "grid": grid,
+            "map_downsample": TRAINING_PROGRESS_MAP_DOWNSAMPLE,
+            "column_plane_direction": column_direction,
+            "row_plane_direction": row_direction,
+            "trajectory_pixels": trajectory_pixels,
+        }
+        self.DataSaver_queue.put(
+            ["SaveTrainingProgress", rgb_output, semantic_output, metadata]
+        )
+        del rendered, rgb_output, semantic_output, camera
 
     def _semantic_progress_frame(self, camera):
-        if self.args.progress_video_content == "rgb":
-            return None
         if self.semantic_hook is None:
             raise RuntimeError(
                 "semantic progress video requested without a valid semantic state"
@@ -1908,21 +1999,19 @@ class GaussianTrainer(mp.Process):
             core.dataset.class_spec,
             config=self.semantic_tdom_config,
         )
-        if result.colors is None:
-            raise RuntimeError("semantic progress render did not produce colors")
-        return result.colors.permute(1, 2, 0).detach().cpu().numpy()
-
-    def _compose_progress_frame(self, rgb, semantic):
-        content = self.args.progress_video_content
-        if content == "rgb":
-            return rgb
-        if semantic is None:
-            raise RuntimeError("semantic progress frame is missing")
-        if content == "semantic":
-            return semantic
-        if rgb.shape[:2] != semantic.shape[:2]:
-            raise RuntimeError("RGB and semantic progress frames are not aligned")
-        return np.concatenate((rgb, semantic), axis=1)
+        if result.colors is not None:
+            return result.colors.permute(1, 2, 0).detach().cpu().numpy()
+        palette = self.semantic_tdom_config.render_palette
+        if palette is None:
+            palette = tuple(
+                item.color for item in core.dataset.class_spec.classes
+            )
+        palette = np.asarray(palette, dtype=np.uint8)
+        class_ids = result.class_ids.detach().cpu().numpy().astype(np.int64)
+        colors = palette[np.clip(class_ids, 0, len(palette) - 1)]
+        unknown = result.unknown_mask.detach().cpu().numpy()
+        colors[unknown] = 0
+        return colors
 
     # 3DGS模型训练核心函数
     def Train_Gaussians(self, iteration, Training_Type):
@@ -2369,7 +2458,7 @@ class GaussianTrainer(mp.Process):
         with torch.no_grad():
             ALL_viewpoint_stack = self.scene.getTrainCameras().copy()
             progress_bar = tqdm(range(len(ALL_viewpoint_stack)), desc="Rendering progress")
-            output_dir = Path(self.args.qa_dir) / "camera_renders"
+            output_dir = Path(self.args.renders_dir) / "cameras"
             output_dir.mkdir(parents=True, exist_ok=True)
             rows = []
             for i in range(len(ALL_viewpoint_stack)):
@@ -2392,8 +2481,8 @@ class GaussianTrainer(mp.Process):
                         "camera_id": image_id,
                         "iteration": int(self.AlreadyTrainingIterations),
                         "psnr": float(PSNR),
-                        "visible_gaussians": int(visibility_filter.sum().item()),
-                        "render": "qa/camera_renders/{}.jpg".format(image_id),
+                        "visible_gaussians": int(visibility_filter.numel()),
+                        "render": "renders/cameras/{}.jpg".format(image_id),
                     }
                 )
                 del render_pkg, image, visibility_filter, gt_image
@@ -2597,8 +2686,7 @@ class GaussianTrainer(mp.Process):
                                 self._render_legacy_tdom()
                     self._run_semantic_hook("progressive")
                     with torch.no_grad():
-                        self._capture_progress_camera_views(self.NewCams)
-                        self._capture_progress_tdom()
+                        self._capture_training_progress_tdom("On_The_Fly")
 
                     if (
                         self.args.recovery_checkpoint_every_stages > 0
@@ -2672,7 +2760,9 @@ class GaussianTrainer(mp.Process):
                                 self._render_legacy_tdom()
                     self._run_semantic_hook("final_refinement", final=True)
                     with torch.no_grad():
-                        self._capture_progress_tdom()
+                        self._capture_training_progress_tdom(
+                            "Final_Refinement", final=True
+                        )
 
                     self.Finish = True
 
@@ -2703,31 +2793,19 @@ class DataSaver(mp.Process):
         self.DataSaver_queue = None
         self.SaveDirRootPath = None
         self.MetricsRootPath = None
-        self.VisualizationRootPath = None
-        self.ProgressVideo = "none"
-        self.ProgressVideoContent = "rgb"
-        self.ProgressVideoStride = 1
-        self.ProgressVideoFPS = 4.0
-        self.Intermediate_RGB_Render_Path = None
-        self.Intermediate_TDOM_Render_Path = None
-        self.SaveImageNumber = 0
-        self.SaveTDOMNumber = 0
-        self.ImageEventNumber = 0
-        self.TDOMEventNumber = 0
-        self.PendingImage = None
-        self.PendingTDOM = None
+        self.VideoRootPath = None
+        self.RenderTrainingProgress = False
+        self.TrainingProgressFPS = 4.0
+        self.LegendEntries = []
+        self.TrainingProgressFramePath = None
+        self.TrainingProgressFrameNumber = 0
 
     def MakeDirs(self):
-        self.Intermediate_RGB_Render_Path = os.path.join(
-            self.SaveDirRootPath, "camera"
+        self.TrainingProgressFramePath = os.path.join(
+            self.SaveDirRootPath, "training_progress"
         )
-        self.Intermediate_TDOM_Render_Path = os.path.join(
-            self.SaveDirRootPath, "tdom"
-        )
-        if self.ProgressVideo in ("camera", "both"):
-            os.makedirs(self.Intermediate_RGB_Render_Path, exist_ok=True)
-        if self.ProgressVideo in ("tdom", "both"):
-            os.makedirs(self.Intermediate_TDOM_Render_Path, exist_ok=True)
+        if self.RenderTrainingProgress:
+            os.makedirs(self.TrainingProgressFramePath, exist_ok=True)
 
     @staticmethod
     def _as_uint8(image):
@@ -2738,152 +2816,387 @@ class DataSaver(mp.Process):
             raise ValueError("progress frame must be uint8 [H, W, 3]")
         return value
 
-    def _save_frame(self, directory, number, image, metadata):
-        path = Path(directory) / "{:06d}.jpg".format(number)
-        Image.fromarray(self._as_uint8(image)).save(path, quality=92)
-        write_json_atomic(path.with_suffix(".json"), metadata)
+    def SaveTrainingProgress(self, rgb, semantic, metadata):
+        rgb = self._as_uint8(rgb)
+        semantic = self._as_uint8(semantic)
+        if rgb.shape != semantic.shape:
+            raise ValueError("RGB and semantic TDOM frames must be aligned")
+        number = self.TrainingProgressFrameNumber
+        root = Path(self.TrainingProgressFramePath)
+        stem = "{:06d}".format(number)
+        Image.fromarray(rgb).save(root / (stem + "_rgb.jpg"), quality=92)
+        Image.fromarray(semantic).save(root / (stem + "_semantic.png"))
+        payload = dict(metadata)
+        payload["frame_index"] = number
+        payload["rgb_frame"] = stem + "_rgb.jpg"
+        payload["semantic_frame"] = stem + "_semantic.png"
+        write_json_atomic(root / (stem + ".json"), payload)
+        self.TrainingProgressFrameNumber += 1
 
-    def SaveImage(self, image, image_id, stage):
-        self.ImageEventNumber += 1
-        payload = (image, image_id, stage)
-        self.PendingImage = payload
-        if (self.ImageEventNumber - 1) % self.ProgressVideoStride != 0:
-            return
-        self._save_pending_image()
+    @staticmethod
+    def _nice_scale_length(value):
+        exponent = math.floor(math.log10(max(value, 1e-12)))
+        fraction = value / (10 ** exponent)
+        if fraction < 1.5:
+            nice = 1.0
+        elif fraction < 3.5:
+            nice = 2.0
+        elif fraction < 7.5:
+            nice = 5.0
+        else:
+            nice = 10.0
+        return nice * (10 ** exponent)
 
-    def _save_pending_image(self):
-        if self.PendingImage is None:
-            return
-        image, image_id, stage = self.PendingImage
-        self._save_frame(
-            self.Intermediate_RGB_Render_Path,
-            self.SaveImageNumber,
-            image,
-            {
-                "schema_version": 1,
-                "kind": "camera",
-                "camera_id": image_id,
-                "stage": int(stage),
-                "event_index": self.ImageEventNumber - 1,
-            },
+    @staticmethod
+    def _load_progress_records(frame_directory):
+        records = []
+        for path in sorted(Path(frame_directory).glob("[0-9]*.json")):
+            with path.open("r", encoding="utf-8") as stream:
+                record = json.load(stream)
+            record["_root"] = str(path.parent)
+            records.append(record)
+        if not records:
+            return []
+        expected = list(range(len(records)))
+        actual = [int(record["frame_index"]) for record in records]
+        if actual != expected:
+            raise RuntimeError("training progress frame sequence is not contiguous")
+        return records
+
+    @staticmethod
+    def _tile_indices(window):
+        value = window.get("tile_indices", window)
+        return (
+            int(value.get("min_x", value.get("tile_min_x"))),
+            int(value.get("max_x", value.get("tile_max_x"))),
+            int(value.get("min_y", value.get("tile_min_y"))),
+            int(value.get("max_y", value.get("tile_max_y"))),
         )
-        self.SaveImageNumber += 1
-        self.PendingImage = None
 
-    def SaveTDOM(self, tdom, alignment=None):
-        self.TDOMEventNumber += 1
-        self.PendingTDOM = (tdom, alignment)
-        if (self.TDOMEventNumber - 1) % self.ProgressVideoStride != 0:
+    def _draw_legend(self, canvas, panel_x, map_top):
+        if not self.LegendEntries:
             return
-        self._save_pending_tdom()
-
-    def _save_pending_tdom(self):
-        if self.PendingTDOM is None:
-            return
-        tdom, alignment = self.PendingTDOM
-        metadata = {
-            "schema_version": 1,
-            "kind": "tdom",
-            "stage": (
-                None if alignment is None else alignment.get("geometry_stage")
-            ),
-            "event_index": self.TDOMEventNumber - 1,
-        }
-        self._save_frame(
-            self.Intermediate_TDOM_Render_Path,
-            self.SaveTDOMNumber,
-            tdom,
-            metadata,
+        row_height = 23
+        width = 310
+        height = 18 + row_height * len(self.LegendEntries)
+        overlay = canvas.copy()
+        cv2.rectangle(
+            overlay,
+            (panel_x + 12, map_top + 12),
+            (panel_x + 12 + width, map_top + 12 + height),
+            (0, 0, 0),
+            -1,
         )
-        self.SaveTDOMNumber += 1
-        self.PendingTDOM = None
-
-    def _encode_video(self, frame_directory, output_name, label, anchor):
-        paths = sorted(Path(frame_directory).glob("*.jpg"))
-        if not paths:
-            return
-        frames = []
-        max_width = 0
-        max_height = 0
-        for path in paths:
-            frame = cv2.imread(str(path))
-            if frame is None:
-                raise RuntimeError("cannot read progress frame {}".format(path))
-            height, width = frame.shape[:2]
-            scale = min(1.0, 1920.0 / width, 1080.0 / height)
-            if scale < 1.0:
-                frame = cv2.resize(
-                    frame,
-                    (max(1, int(round(width * scale))), max(1, int(round(height * scale)))),
-                    interpolation=cv2.INTER_AREA,
-                )
-            max_height = max(max_height, frame.shape[0])
-            max_width = max(max_width, frame.shape[1])
-            frames.append(frame)
-        max_width += max_width % 2
-        max_height += max_height % 2
-        output_root = Path(self.VisualizationRootPath)
-        output_root.mkdir(parents=True, exist_ok=True)
-        output_path = output_root / output_name
-        writer = cv2.VideoWriter(
-            str(output_path),
-            cv2.VideoWriter_fourcc(*"mp4v"),
-            float(self.ProgressVideoFPS),
-            (max_width, max_height),
-        )
-        if not writer.isOpened():
-            raise RuntimeError("unable to open video encoder for {}".format(output_path))
-        total = len(frames)
-        for index, frame in enumerate(frames):
-            canvas = np.full((max_height, max_width, 3), 128, dtype=np.uint8)
-            if anchor == "bottom_right":
-                y = max_height - frame.shape[0]
-                x = max_width - frame.shape[1]
-            else:
-                y = (max_height - frame.shape[0]) // 2
-                x = (max_width - frame.shape[1]) // 2
-            canvas[y:y + frame.shape[0], x:x + frame.shape[1]] = frame
+        cv2.addWeighted(overlay, 0.72, canvas, 0.28, 0, canvas)
+        for index, item in enumerate(self.LegendEntries):
+            y = map_top + 33 + index * row_height
+            color = tuple(reversed(tuple(int(v) for v in item["color"])))
+            cv2.rectangle(
+                canvas,
+                (panel_x + 24, y - 12),
+                (panel_x + 40, y + 4),
+                color,
+                -1,
+            )
             cv2.putText(
                 canvas,
-                "{} ({}/{})".format(label, index + 1, total),
-                (10, 32),
+                "{}  {}".format(item["id"], item["name"]),
+                (panel_x + 50, y + 2),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                0.8,
-                (0, 255, 0),
+                0.48,
+                (235, 235, 235),
+                1,
+                cv2.LINE_AA,
+            )
+
+    def _compose_training_progress_frame(
+        self, record, global_window, total_frames
+    ):
+        width = TRAINING_PROGRESS_WIDTH
+        height = TRAINING_PROGRESS_HEIGHT
+        margin = 24
+        gutter = 24
+        header_height = 78
+        footer_height = 22
+        panel_width = (width - 2 * margin - gutter) // 2
+        map_height = height - header_height - footer_height
+        right_panel_x = margin + panel_width + gutter
+        canvas = np.zeros((height, width, 3), dtype=np.uint8)
+        root = Path(record["_root"])
+        rgb = cv2.imread(str(root / record["rgb_frame"]), cv2.IMREAD_COLOR)
+        semantic = cv2.imread(
+            str(root / record["semantic_frame"]), cv2.IMREAD_COLOR
+        )
+        if rgb is None or semantic is None or rgb.shape != semantic.shape:
+            raise RuntimeError(
+                "training progress source frames are missing or misaligned"
+            )
+
+        grid = record["grid"]
+        window = record["window"]
+        factor = int(record["map_downsample"])
+        tile_width = int(grid["tile_shape"][0]) // factor
+        tile_height = int(grid["tile_shape"][1]) // factor
+        global_min_x, global_max_x, global_min_y, global_max_y = global_window
+        window_min_x, window_max_x, window_min_y, window_max_y = (
+            self._tile_indices(window)
+        )
+        global_width = (global_max_x - global_min_x + 1) * tile_width
+        global_height = (global_max_y - global_min_y + 1) * tile_height
+        scale = min(panel_width / global_width, map_height / global_height)
+        display_width = max(1, int(round(rgb.shape[1] * scale)))
+        display_height = max(1, int(round(rgb.shape[0] * scale)))
+        interpolation = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_NEAREST
+        rgb = cv2.resize(rgb, (display_width, display_height), interpolation=interpolation)
+        semantic = cv2.resize(
+            semantic,
+            (display_width, display_height),
+            interpolation=cv2.INTER_NEAREST,
+        )
+        global_display_width = int(round(global_width * scale))
+        global_display_height = int(round(global_height * scale))
+        base_x = margin + (panel_width - global_display_width) // 2
+        base_y = header_height + (map_height - global_display_height) // 2
+        if int(record["column_plane_direction"]) > 0:
+            offset_x = (window_min_x - global_min_x) * tile_width
+        else:
+            offset_x = (global_max_x - window_max_x) * tile_width
+        if int(record["row_plane_direction"]) > 0:
+            offset_y = (window_min_y - global_min_y) * tile_height
+        else:
+            offset_y = (global_max_y - window_max_y) * tile_height
+        offset_x = int(round(offset_x * scale))
+        offset_y = int(round(offset_y * scale))
+        rgb_x, rgb_y = base_x + offset_x, base_y + offset_y
+        sem_x = right_panel_x + (panel_width - global_display_width) // 2 + offset_x
+        canvas[rgb_y:rgb_y + display_height, rgb_x:rgb_x + display_width] = rgb
+        canvas[rgb_y:rgb_y + display_height, sem_x:sem_x + display_width] = semantic
+        for x in (rgb_x, sem_x):
+            cv2.rectangle(
+                canvas,
+                (x, rgb_y),
+                (x + display_width - 1, rgb_y + display_height - 1),
+                (210, 210, 210),
+                1,
+            )
+
+        trajectory = record.get("trajectory_pixels", [])
+        points = []
+        for point in trajectory:
+            px = rgb_x + int(round(float(point[0]) * scale))
+            py = rgb_y + int(round(float(point[1]) * scale))
+            if (
+                rgb_x <= px < rgb_x + display_width
+                and rgb_y <= py < rgb_y + display_height
+            ):
+                points.append((px, py))
+        if len(points) > 1:
+            cv2.polylines(
+                canvas,
+                [np.asarray(points, dtype=np.int32)],
+                False,
+                (255, 255, 0),
                 2,
                 cv2.LINE_AA,
             )
-            writer.write(canvas)
-        writer.release()
-        capture = cv2.VideoCapture(str(output_path))
-        frame_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
-        capture.release()
-        if frame_count != total:
-            raise RuntimeError(
-                "encoded video has {} frames, expected {}".format(
-                    frame_count, total
-                )
+        if points:
+            cv2.circle(canvas, points[-1], 6, (0, 165, 255), -1, cv2.LINE_AA)
+
+        gsd_x = float(grid["gsd"][0]) * factor
+        pixels_per_unit = scale / gsd_x
+        scale_units = self._nice_scale_length(160.0 / pixels_per_unit)
+        scale_pixels = max(1, int(round(scale_units * pixels_per_unit)))
+        bar_x = margin + 24
+        bar_y = height - 38
+        cv2.line(canvas, (bar_x, bar_y), (bar_x + scale_pixels, bar_y), (255, 255, 255), 3)
+        cv2.putText(
+            canvas,
+            "{:g} map units".format(scale_units),
+            (bar_x, bar_y - 10),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.48,
+            (255, 255, 255),
+            1,
+            cv2.LINE_AA,
+        )
+        arrow_x = margin + panel_width - 46
+        arrow_y = height - 38
+        arrow_delta = 30 if int(record["row_plane_direction"]) > 0 else -30
+        cv2.arrowedLine(
+            canvas,
+            (arrow_x, arrow_y),
+            (arrow_x, arrow_y + arrow_delta),
+            (255, 255, 255),
+            2,
+            cv2.LINE_AA,
+            tipLength=0.28,
+        )
+        cv2.putText(
+            canvas,
+            "+Y",
+            (arrow_x + 8, arrow_y + arrow_delta),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.48,
+            (255, 255, 255),
+            1,
+            cv2.LINE_AA,
+        )
+
+        phase_label = str(record["phase"]).replace("_", " ")
+        title = (
+            "Stage {stage}/{end_stage}  |  Cameras {observed_cameras}  |  "
+            "Iteration {iteration:,}  |  {progress:.1%}  |  {phase_label}  |  "
+            "Frame {frame}/{total}"
+        ).format(
+            frame=int(record["frame_index"]) + 1,
+            total=total_frames,
+            phase_label=phase_label,
+            **record
+        )
+        cv2.putText(
+            canvas,
+            title,
+            (margin, 31),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.63,
+            (235, 235, 235),
+            1,
+            cv2.LINE_AA,
+        )
+        cv2.putText(
+            canvas,
+            "RGB TDOM + flight trajectory",
+            (margin, 64),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.70,
+            (255, 255, 255),
+            2,
+            cv2.LINE_AA,
+        )
+        cv2.putText(
+            canvas,
+            "Semantic TDOM",
+            (right_panel_x, 64),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.70,
+            (255, 255, 255),
+            2,
+            cv2.LINE_AA,
+        )
+        self._draw_legend(canvas, right_panel_x, header_height)
+        progress_width = int(round(width * float(record["progress"])))
+        cv2.rectangle(canvas, (0, height - 6), (progress_width, height - 1), (0, 180, 255), -1)
+        return canvas
+
+    def _encode_training_progress(self):
+        records = self._load_progress_records(self.TrainingProgressFramePath)
+        if not records:
+            return
+        grid_ids = {record["grid"]["grid_id"] for record in records}
+        directions = {
+            (
+                int(record["column_plane_direction"]),
+                int(record["row_plane_direction"]),
+                int(record["map_downsample"]),
             )
-        shutil.rmtree(frame_directory)
-        print("Progress video saved at {}".format(output_path))
+            for record in records
+        }
+        if len(grid_ids) != 1 or len(directions) != 1:
+            raise RuntimeError("training progress frames do not share one map grid")
+        windows = [record["window"] for record in records]
+        tile_windows = [self._tile_indices(item) for item in windows]
+        global_window = (
+            min(item[0] for item in tile_windows),
+            max(item[1] for item in tile_windows),
+            min(item[2] for item in tile_windows),
+            max(item[3] for item in tile_windows),
+        )
+        output_root = Path(self.VideoRootPath)
+        output_root.mkdir(parents=True, exist_ok=True)
+        output_path = output_root / "training_progress.mp4"
+        temporary = output_path.with_suffix(".publishing.mp4")
+        command = [
+            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+            "-f", "rawvideo", "-pix_fmt", "bgr24",
+            "-s", "{}x{}".format(TRAINING_PROGRESS_WIDTH, TRAINING_PROGRESS_HEIGHT),
+            "-r", str(float(self.TrainingProgressFPS)), "-i", "-",
+            "-an", "-c:v", "libx264", "-preset", "medium", "-crf", "18",
+            "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(temporary),
+        ]
+        process = subprocess.Popen(command, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            for record in records:
+                frame = self._compose_training_progress_frame(
+                    record, global_window, len(records)
+                )
+                process.stdin.write(frame.tobytes())
+            process.stdin.close()
+            stderr = process.stderr.read().decode("utf-8", errors="replace")
+            process.stderr.close()
+            returncode = process.wait()
+        except Exception:
+            process.kill()
+            process.wait()
+            if temporary.exists():
+                temporary.unlink()
+            raise
+        if returncode != 0:
+            if temporary.exists():
+                temporary.unlink()
+            raise RuntimeError("ffmpeg failed to encode progress video: " + stderr)
+        probe = json.loads(
+            subprocess.check_output(
+                [
+                    "ffprobe", "-v", "error", "-select_streams", "v:0",
+                    "-show_entries", "stream=codec_name,width,height,nb_frames",
+                    "-of", "json", str(temporary),
+                ],
+                text=True,
+            )
+        )["streams"][0]
+        if (
+            probe.get("codec_name") != "h264"
+            or int(probe.get("width", 0)) != TRAINING_PROGRESS_WIDTH
+            or int(probe.get("height", 0)) != TRAINING_PROGRESS_HEIGHT
+            or int(probe.get("nb_frames", 0)) != len(records)
+        ):
+            temporary.unlink(missing_ok=True)
+            raise RuntimeError("encoded training progress video failed validation")
+        os.replace(temporary, output_path)
+        public_records = []
+        for record in records:
+            public = {
+                key: value
+                for key, value in record.items()
+                if not key.startswith("_")
+                and key not in {"trajectory_pixels", "rgb_frame", "semantic_frame"}
+            }
+            public_records.append(public)
+        write_json_atomic(
+            Path(self.MetricsRootPath) / "training_progress.json",
+            {
+                "schema_version": 1,
+                "video": "videos/training_progress.mp4",
+                "codec": "h264",
+                "width": TRAINING_PROGRESS_WIDTH,
+                "height": TRAINING_PROGRESS_HEIGHT,
+                "fps": float(self.TrainingProgressFPS),
+                "frame_count": len(records),
+                "global_tile_window": {
+                    "tile_min_x": global_window[0],
+                    "tile_max_x": global_window[1],
+                    "tile_min_y": global_window[2],
+                    "tile_max_y": global_window[3],
+                },
+                "frames": public_records,
+            },
+        )
+        shutil.rmtree(self.TrainingProgressFramePath)
+        print("Training progress video saved at {}".format(output_path))
 
     def GetDemo(self):
-        self._save_pending_image()
-        self._save_pending_tdom()
-        if self.SaveImageNumber:
-            self._encode_video(
-                self.Intermediate_RGB_Render_Path,
-                "progressive_camera_views.mp4",
-                "camera",
-                "center",
-            )
-        if self.SaveTDOMNumber:
-            self._encode_video(
-                self.Intermediate_TDOM_Render_Path,
-                "progressive_tdom.mp4",
-                "TDOM",
-                "bottom_right",
-            )
+        if self.TrainingProgressFrameNumber:
+            self._encode_training_progress()
 
     def SaveTimeCost(self, TimeCost, imagenum):
         print("########################################################")
@@ -2903,11 +3216,10 @@ class DataSaver(mp.Process):
         self.MakeDirs()
         while True:
             command = self.DataSaver_queue.get()
-            if command[0] == "SaveImage":
-                self.SaveImage(command[1], command[2], command[3])
-            elif command[0] == "SaveTDOM":
-                alignment = command[2] if len(command) > 2 else None
-                self.SaveTDOM(command[1], alignment)
+            if command[0] == "SaveTrainingProgress":
+                self.SaveTrainingProgress(
+                    command[1], command[2], command[3]
+                )
             elif command[0] == "GetDemo":
                 self.GetDemo()
             elif command[0] == "SaveTimeCost":
@@ -2927,10 +3239,13 @@ class On_the_Fly_GS:
             command=[sys.executable, str(Path(__file__).resolve()), *sys.argv[1:]],
             options={
                 "render_all_cameras": bool(args.render_all_cameras),
-                "progress_video": args.progress_video,
-                "progress_video_content": args.progress_video_content,
-                "progress_video_stride": args.progress_video_stride,
-                "progress_video_fps": args.progress_video_fps,
+                "render_training_progress": bool(
+                    args.render_training_progress
+                ),
+                "training_progress_target_frames": (
+                    args.training_progress_target_frames
+                ),
+                "training_progress_fps": args.training_progress_fps,
                 "recovery_checkpoint_every_stages": (
                     args.recovery_checkpoint_every_stages
                 ),
@@ -2962,15 +3277,41 @@ class On_the_Fly_GS:
         self.DataSaver.DataSaver_queue = self.DataSaver_queue
         self.DataSaver.SaveDirRootPath = str(self.layout.video_frames)
         self.DataSaver.MetricsRootPath = str(self.layout.metrics)
-        self.DataSaver.VisualizationRootPath = str(self.layout.visualizations)
-        self.DataSaver.ProgressVideo = self.GaussianTrainer.args.progress_video
-        self.DataSaver.ProgressVideoContent = (
-            self.GaussianTrainer.args.progress_video_content
+        self.DataSaver.VideoRootPath = str(self.layout.videos)
+        self.DataSaver.RenderTrainingProgress = bool(
+            self.GaussianTrainer.args.render_training_progress
         )
-        # The trainer applies stride before expensive rendering; the output
-        # worker receives only selected frames.
-        self.DataSaver.ProgressVideoStride = 1
-        self.DataSaver.ProgressVideoFPS = self.GaussianTrainer.args.progress_video_fps
+        self.DataSaver.TrainingProgressFPS = (
+            self.GaussianTrainer.args.training_progress_fps
+        )
+        if self.DataSaver.RenderTrainingProgress:
+            class_spec = SemanticClassSpec.load(
+                Path(self.GaussianTrainer.args.semantic_data_root)
+                / "semantic"
+                / "class_spec.json"
+            )
+            colors = tuple(item.color for item in class_spec.classes)
+            palette_path = self.GaussianTrainer.args.semantic_tdom_palette_path
+            if not palette_path:
+                candidate = (
+                    Path(self.GaussianTrainer.args.semantic_data_root)
+                    / "semantic"
+                    / "tdom_palette.json"
+                )
+                if candidate.is_file():
+                    palette_path = str(candidate)
+            if palette_path:
+                colors = load_semantic_tdom_palette(
+                    palette_path, class_spec
+                )
+            self.DataSaver.LegendEntries = [
+                {
+                    "id": item.class_id,
+                    "name": item.name,
+                    "color": list(colors[index]),
+                }
+                for index, item in enumerate(class_spec.classes)
+            ]
         self.DataSaver.GTImageRootPath = self.GaussianTrainer.args.Source_Path_Dir
         self.DataSaver.StartFromImageNo = self.GaussianTrainer.args.StartFromImageNo
 
@@ -3065,10 +3406,32 @@ class On_the_Fly_GS:
             "metrics": "metrics",
             "logs": "logs",
         }
-        if self.layout.qa.is_dir():
-            records["qa"] = "qa"
-        if self.layout.visualizations.is_dir():
-            records["visualizations"] = "visualizations"
+        camera_renders = self.layout.renders / "cameras"
+        if self.GaussianTrainer.args.render_all_cameras:
+            rendered_cameras = sorted(camera_renders.glob("*.jpg"))
+            if not rendered_cameras:
+                raise RuntimeError(
+                    "requested per-camera renders were not published"
+                )
+            records["renders"] = {
+                "cameras": {
+                    "path": camera_renders,
+                    "count": len(rendered_cameras),
+                }
+            }
+        progress_video = self.layout.videos / "training_progress.mp4"
+        if self.GaussianTrainer.args.render_training_progress:
+            if not progress_video.is_file():
+                raise RuntimeError(
+                    "requested training progress video was not published"
+                )
+            records["videos"] = {
+                "training_progress": {
+                    "path": progress_video,
+                    "size_bytes": progress_video.stat().st_size,
+                    "sha256": sha256_file(progress_video),
+                }
+            }
         if self.GaussianTrainer.args.enable_semantics:
             records["semantic_model"] = archive_semantic_state(self.layout)
             schema_source = (

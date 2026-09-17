@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Migrate one validated legacy progressive run into output schema v1."""
+"""Migrate one validated legacy progressive run into output schema v2."""
 
 from __future__ import annotations
 
@@ -14,7 +14,11 @@ import re
 import shutil
 import sys
 
-from semantic_atdom.utils.run_output import sha256_file, write_json_atomic
+from semantic_atdom.utils.run_output import (
+    RUN_OUTPUT_SCHEMA_VERSION,
+    sha256_file,
+    write_json_atomic,
+)
 
 
 def _inventory(root: Path, excluded: Path):
@@ -113,7 +117,7 @@ def _legacy_camera_renders(root: Path, staging: Path):
     source = root / "OutputImages"
     if not source.is_dir():
         return 0
-    destination = staging / "qa" / "camera_renders"
+    destination = staging / "renders" / "cameras"
     destination.mkdir(parents=True)
     rows = []
     for camera in sorted(path for path in source.iterdir() if path.is_dir()):
@@ -135,7 +139,7 @@ def _legacy_camera_renders(root: Path, staging: Path):
                 "iteration": int(match.group(1)),
                 "psnr": float(match.group(2)),
                 "visible_gaussians_legacy_tensor_length": int(match.group(3)),
-                "render": "qa/camera_renders/{}.jpg".format(camera.name),
+                "render": "renders/cameras/{}.jpg".format(camera.name),
             }
         )
     with (staging / "metrics" / "per_camera.csv").open(
@@ -303,7 +307,7 @@ def migrate(root: Path, final_stage: int, apply: bool) -> None:
         write_json_atomic(
             staging / "manifest.json",
             {
-                "schema_version": 1,
+                "schema_version": RUN_OUTPUT_SCHEMA_VERSION,
                 "run_id": root.name,
                 "status": "succeeded",
                 "started_at": None,
@@ -318,7 +322,16 @@ def migrate(root: Path, final_stage: int, apply: bool) -> None:
                     "metrics": "metrics",
                     "logs": "logs",
                     "provenance": "provenance",
-                    "qa": "qa" if camera_count else None,
+                    "renders": (
+                        {
+                            "cameras": {
+                                "path": "renders/cameras",
+                                "count": camera_count,
+                            }
+                        }
+                        if camera_count
+                        else None
+                    ),
                 },
                 "failure": None,
             },

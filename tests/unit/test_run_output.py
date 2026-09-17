@@ -7,6 +7,7 @@ from tempfile import TemporaryDirectory
 import unittest
 
 from semantic_atdom.utils.run_output import (
+    RUN_OUTPUT_SCHEMA_VERSION,
     RunLayout,
     allocate_run_root,
     archive_semantic_state,
@@ -44,8 +45,14 @@ class RunOutputTests(unittest.TestCase):
                 source_dataset=Path(directory) / "dataset",
                 repository_root=Path(__file__).parents[2],
                 command=["train"],
-                options={"progress_video": "none"},
+                options={"render_training_progress": False},
             )
+            self.assertEqual(
+                layout.read_manifest()["schema_version"],
+                RUN_OUTPUT_SCHEMA_VERSION,
+            )
+            self.assertEqual(layout.renders, layout.root / "renders")
+            self.assertEqual(layout.videos, layout.root / "videos")
             self.assertEqual(layout.read_manifest()["status"], "running")
             self.assertFalse((output_root / "latest").exists())
 

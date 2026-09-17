@@ -46,9 +46,12 @@ published run.
   recovery checkpoint.  A user may explicitly enable a single atomically
   replaced checkpoint with `--recovery_checkpoint_every_stages N`; zero means
   disabled.  It is retained after interruption and removed after success.
-- A successful run keeps one final RGB training state and one final Gaussian
-  point cloud under `model/`.  Numeric stage directories are not part of the
-  published interface.
+- A successful run always keeps the final Gaussian point cloud under `model/`.
+  The completed optimizer/training state is disabled by default because it is
+  large and a `run_complete` state is intentionally not resumable.  Users who
+  need it for debugging may explicitly request
+  `--save_final_training_state`, which publishes `model/training_state.pt`.
+  Numeric stage directories are not part of the published interface.
 - Semantic recovery continues to use two alternating slots while a run is
   mutable.  After successful final publication, the active verified state is
   archived once under `model/semantic/`; the stale rollback slot is discarded.

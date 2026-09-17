@@ -314,21 +314,29 @@ def move_file_verified(source: Path, destination: Path) -> Dict[str, Any]:
     return {"path": destination, "size_bytes": size, "sha256": digest}
 
 
-def finalize_stage_model(layout: RunLayout, final_stage: int) -> Dict[str, Any]:
+def finalize_stage_model(
+    layout: RunLayout,
+    final_stage: int,
+    *,
+    include_training_state: bool = False,
+) -> Dict[str, Any]:
     stage_root = layout.stage(final_stage)
     if not stage_root.is_dir():
         raise RuntimeError("final stage output is missing: {}".format(stage_root))
     point_cloud = stage_root / "point_cloud" / "iteration_{}".format(final_stage) / "point_cloud.ply"
-    checkpoint = stage_root / "chkpnt{}.pth".format(final_stage)
     records = {
         "gaussians": move_file_verified(point_cloud, layout.model / "gaussians.ply"),
-        "training_state": move_file_verified(checkpoint, layout.model / "training_state.pt"),
     }
+    checkpoint = stage_root / "chkpnt{}.pth".format(final_stage)
     checkpoint_metadata = checkpoint.with_suffix(checkpoint.suffix + ".json")
-    if checkpoint_metadata.is_file():
-        records["training_state_metadata"] = move_file_verified(
-            checkpoint_metadata, layout.model / "training_state.json"
+    if include_training_state:
+        records["training_state"] = move_file_verified(
+            checkpoint, layout.model / "training_state.pt"
         )
+        if checkpoint_metadata.is_file():
+            records["training_state_metadata"] = move_file_verified(
+                checkpoint_metadata, layout.model / "training_state.json"
+            )
     optional = {
         "cameras": (stage_root / "cameras.json", layout.model / "cameras.json"),
         "config_compatibility": (stage_root / "cfg_args", layout.model / "cfg_args"),

@@ -75,8 +75,9 @@
   mask/reason、pixel evidence support 和 entropy。camera 与 TDOM 渐进视频均为
   50 帧、4 fps，编码尺寸分别为 1292×1080 和 1920×1080。
 - run 总体积约 2.1 GiB；成功后不存在 `.work`、数字 stage 目录或过程恢复点。
-  最终 `training_state.pt` 和 `model/semantic/state.pt` 是模型归档，不是周期性过程
-  checkpoint。
+  该历史运行中的 `training_state.pt` 和 `model/semantic/state.pt` 是模型归档，不是
+  周期性过程 checkpoint；后续 schema v2 运行默认不再保存不可恢复的
+  `run_complete` training state。
 - manifest 中 24 个带哈希产物、地图 pair manifest 的全部 product files、active
   semantic state/geometry 哈希均已重新计算验证；通用 `tools/render.py` 成功从
   新目录加载 stage 487。
@@ -134,8 +135,9 @@ AMtown01 的 stage 18 会暂时省略两个已经出现过的 identity，stage 1
 `persistent_union` 明确声明这些临时省略不代表删除；未提供该参数时预检采用
 `strict_cumulative` 并拒绝这一数据。训练输入的 RADIAL/主点偏移会在读取时统一
 转换为同尺寸中心主点 pinhole，RGB、语义标签、稀疏关键点和有效区域共享同一
-rectification。正式运行默认不保存过程恢复点；成功后只发布一次最终 RGB 训练状态、
-点云和最终语义模型。若确有中断恢复需求，可显式设置
+rectification。正式运行默认不保存过程恢复点或完成态 optimizer state；成功后发布
+最终点云和最终语义模型。若确需保留完成态调试数据，可显式设置
+`--save_final_training_state`；若确有中断恢复需求，可显式设置
 `--recovery_checkpoint_every_stages N`，它只原子替换 `.work/recovery/latest.pt`，
 不会累积每个 stage 的完整模型；成功发布后该工作区会被删除。
 

@@ -237,6 +237,36 @@ class DatasetPreflightTests(unittest.TestCase):
             self.assertEqual(result.final_image_ids, ("000001", "000003"))
             self.assertEqual(report["identity_policy"], "persistent_union")
 
+    def test_cold_start_requires_complete_initial_camera_snapshot(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            dataset, semantic_data = self._fixture(root)
+            sparse = dataset / "2" / "sparse" / "0"
+            _write_images_binary(sparse / "images.bin", ("000003.jpg",))
+
+            with self.assertRaisesRegex(
+                SemanticSchemaError, "cold-start snapshot"
+            ):
+                run_dataset_preflight(
+                    dataset_root=dataset,
+                    semantic_data_root=semantic_data,
+                    output_root=root / "output",
+                    start_stage=2,
+                    end_stage=2,
+                    identity_policy="persistent_union",
+                )
+
+            result = run_dataset_preflight(
+                dataset_root=dataset,
+                semantic_data_root=semantic_data,
+                output_root=root / "resume-output",
+                start_stage=2,
+                end_stage=2,
+                identity_policy="persistent_union",
+                require_complete_initial_snapshot=False,
+            )
+            self.assertEqual(result.final_image_ids, ("000001", "000003"))
+
 
 if __name__ == "__main__":
     unittest.main()

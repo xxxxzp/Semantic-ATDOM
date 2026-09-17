@@ -445,6 +445,90 @@ class ProgressiveSemanticHookTests(unittest.TestCase):
         self.assertEqual(payload["schema_version"], 2)
         self.assertEqual(payload["semantic_method_version"], "g1-evidence-v2")
 
+    def test_late_identity_is_ingested_online_without_full_history_rebuild(self):
+        class Dataset:
+            def __init__(self, root):
+                self.semantic_root = root / "semantic"
+                self.class_spec = CLASS_SPEC
+
+            def load_observation(self, image_id):
+                return observation(image_id)
+
+        class Projector:
+            def project(self, *_args):
+                return projection([1.0, 0.0], 1.0)
+
+        class Camera:
+            def __init__(self, image_name):
+                self.image_name = image_name
+
+        class Gaussians:
+            get_xyz = torch.zeros((1, 3))
+
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            semantic = root / "semantic"
+            (semantic / "labels").mkdir(parents=True)
+            (semantic / "metadata").mkdir()
+            for image_id in ("000001", "000002"):
+                (semantic / "labels" / (image_id + ".png")).touch()
+                (semantic / "metadata" / (image_id + ".json")).touch()
+            for stage, image_ids in (
+                (1, ("000002",)),
+                (2, ("000001", "000002")),
+            ):
+                sparse = root / str(stage) / "sparse" / "0"
+                sparse.mkdir(parents=True)
+                (sparse / "imagesNames.txt").write_text(
+                    ",".join(item + ".jpg" for item in image_ids),
+                    encoding="utf-8",
+                )
+                np.savetxt(
+                    sparse / "imageMatchMatrix.txt",
+                    np.eye(len(image_ids), dtype=np.int64) * 100,
+                    fmt="%d",
+                    delimiter=",",
+                )
+
+            dataset = Dataset(root)
+            runner = OnlineSemanticOrchestrator(
+                SemanticGaussianState.initialize(1, 2),
+                dataset.class_spec,
+                OnlineSemanticConfig(),
+            )
+            hook = ProgressiveSemanticHook(
+                dataset,
+                runner,
+                Projector(),
+                root / "state",
+                publication_policy=MapPublicationPolicy(
+                    checkpoint_stage_interval=0
+                ),
+            )
+            hook.synchronize(
+                1, [Camera("000002")], Gaussians(), root / "1"
+            )
+
+            with patch(
+                "semantic_atdom.semantics.orchestrator."
+                "FinalSemanticRebuilder.rebuild",
+                side_effect=AssertionError(
+                    "online late arrival must not replay all history"
+                ),
+            ) as rebuild:
+                result = hook.synchronize(
+                    2,
+                    [Camera("000001"), Camera("000002")],
+                    Gaussians(),
+                    root / "2",
+                )
+
+            rebuild.assert_not_called()
+            self.assertEqual(result.processed_image_ids, ("000001",))
+            self.assertEqual(result.semantic_through_image, "000002")
+            self.assertEqual(result.status, "stale_online")
+            self.assertTrue(result.historical_evidence_stale)
+
     def test_semantic_snapshot_omits_appearance_but_pair_snapshot_can_render_rgb(self):
         class Gaussians:
             active_sh_degree = 2
@@ -1355,6 +1439,34 @@ class ProgressiveSemanticHookTests(unittest.TestCase):
         )
 
         self.assertEqual(result.status, "exact_final")
+
+    def test_async_current_status_preserves_committed_exact_final_state(self):
+        class Core:
+            def __init__(self):
+                class Runner:
+                    state = SemanticGaussianState.initialize(1, 2)
+
+                self.orchestrator = Runner()
+
+        hook = AsyncProgressiveSemanticHook(Core())
+        hook._stage_boundaries = ["000001"]
+        hook._last_result = SemanticSyncResult(
+            1,
+            "000001",
+            (),
+            (),
+            0,
+            True,
+            (),
+            "exact_final",
+            False,
+        )
+
+        status = hook.current_status(1)
+
+        self.assertEqual(status.status, "exact_final")
+        self.assertEqual(status.lag_batches, 0)
+        hook.close()
 
     def test_async_hook_applies_topology_only_through_each_frozen_snapshot(self):
         started = threading.Event()

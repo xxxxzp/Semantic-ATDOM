@@ -117,11 +117,29 @@ class RunOutputTests(unittest.TestCase):
             records = finalize_stage_model(layout, 487)
 
             self.assertEqual((layout.model / "gaussians.ply").read_bytes(), b"ply")
+            self.assertFalse((layout.model / "training_state.pt").exists())
+            self.assertNotIn("training_state", records)
+            self.assertFalse(stage.exists())
+            self.assertEqual(records["gaussians"]["size_bytes"], 3)
+
+    def test_final_training_state_is_retained_only_when_requested(self):
+        with TemporaryDirectory() as directory:
+            layout = RunLayout.from_root(Path(directory) / "run")
+            layout.root.mkdir()
+            stage = layout.stage(487)
+            cloud = stage / "point_cloud" / "iteration_487" / "point_cloud.ply"
+            cloud.parent.mkdir(parents=True)
+            cloud.write_bytes(b"ply")
+            (stage / "chkpnt487.pth").write_bytes(b"state")
+
+            records = finalize_stage_model(
+                layout, 487, include_training_state=True
+            )
+
             self.assertEqual(
                 (layout.model / "training_state.pt").read_bytes(), b"state"
             )
-            self.assertFalse(stage.exists())
-            self.assertEqual(records["gaussians"]["size_bytes"], 3)
+            self.assertIn("training_state", records)
 
     def test_only_active_verified_semantic_slot_is_archived(self):
         with TemporaryDirectory() as directory:

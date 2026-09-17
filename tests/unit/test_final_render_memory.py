@@ -59,10 +59,12 @@ class FinalRenderMemoryTests(unittest.TestCase):
         _BoundedRenderImage.peak = 0
 
     def test_full_render_does_not_retain_previous_cuda_frames(self):
+        camera_mask = object()
         cameras = [
             SimpleNamespace(
                 image_name=f"image_{index}",
                 original_image=SimpleNamespace(cuda=lambda: object()),
+                Tri_Mask=camera_mask,
             )
             for index in range(8)
         ]
@@ -74,19 +76,32 @@ class FinalRenderMemoryTests(unittest.TestCase):
         trainer.bg = object()
         trainer.AlreadyTrainingIterations = 100800
 
-        def fake_render(*_args, **_kwargs):
+        render_masks = []
+        metric_masks = []
+
+        def fake_render(*_args, **kwargs):
+            render_masks.append(kwargs["Render_Mask"])
             return {
                 "render": _BoundedRenderImage(),
-                "visibility_filter": SimpleNamespace(
-                    numel=lambda: 1
-                ),
+                "visibility_filter": torch.tensor([True, False, True]),
             }
+
+        def fake_psnr(*args):
+            metric_masks.append(args[2] if len(args) > 2 else None)
+            return torch.tensor([3.0])
+
+        class _LegacyAllOnesMask:
+            def cuda(self):
+                return self
 
         with tempfile.TemporaryDirectory() as root, mock.patch(
             "tools.train_progressive.render", new=fake_render
         ), mock.patch(
             "tools.train_progressive.psnr",
-            new=lambda *_args: torch.tensor([3.0]),
+            new=fake_psnr,
+        ), mock.patch(
+            "tools.train_progressive.torch.ones",
+            return_value=_LegacyAllOnesMask(),
         ), mock.patch(
             "tools.train_progressive.tqdm",
             new=lambda *_args, **_kwargs: SimpleNamespace(
@@ -108,7 +123,10 @@ class FinalRenderMemoryTests(unittest.TestCase):
             self.assertTrue(render_path.is_file())
             metrics = (Path(root) / "metrics" / "per_camera.csv").read_text()
             self.assertIn("renders/cameras/image_0.jpg", metrics)
-            self.assertIn(",1,", metrics)
+            self.assertIn(",2,", metrics)
+
+        self.assertEqual(render_masks, [camera_mask] * len(cameras))
+        self.assertEqual(metric_masks, [camera_mask] * len(cameras))
 
         self.assertLessEqual(_BoundedRenderImage.peak, 2)
 

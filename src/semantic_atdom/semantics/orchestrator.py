@@ -1268,7 +1268,6 @@ class ProgressiveSemanticHook:
                     )
                 )
                 deferred.extend(missing_cameras)
-        reordered_rebuild = False
         newly_ready = tuple(
             image_id
             for image_id in ordered
@@ -1301,59 +1300,14 @@ class ProgressiveSemanticHook:
             and min(_acquisition_key(item) for item in newly_ready)
             < max(_acquisition_key(item) for item in ledger_images)
         ):
-            # An incremental accumulator cannot insert an observation before
-            # already-closed acquisition groups.  Replaying every currently
-            # ready observation is the only order-independent correction.
-            replay_ids = tuple(
-                image_id
-                for image_id in ordered
-                if image_id in camera_by_id
-                and (
-                    self.dataset.semantic_root
-                    / "labels"
-                    / (image_id + ".png")
-                ).is_file()
-                and (
-                    self.dataset.semantic_root
-                    / "metadata"
-                    / (image_id + ".json")
-                ).is_file()
-            )
-            try:
-                rebuilt = FinalSemanticRebuilder(
-                    self.dataset,
-                    self.projector,
-                    self.orchestrator.config,
-                ).rebuild(
-                    replay_ids,
-                    camera_by_id,
-                    gaussians,
-                    overlap,
-                    online_state=self.orchestrator.state,
-                )
-                replacement = OnlineSemanticOrchestrator(
-                    rebuilt.state,
-                    self.dataset.class_spec,
-                    self.orchestrator.config,
-                    ledger=rebuilt.ledger,
-                    label_provenance=rebuilt.label_provenance,
-                )
-                replacement.current_geometry_stage = geometry_stage
-                self.orchestrator = replacement
-                ledger_images = {
-                    entry.image_id for entry in rebuilt.ledger.entries
-                }
-                processed.extend(
-                    image_id for image_id in newly_ready if image_id in ledger_images
-                )
-                reordered_rebuild = True
-            except Exception as error:
-                errors.append(
-                    "out-of-order online rebuild: {}".format(error)
-                )
-                online_usable = False
+            # Online semantics is explicitly approximate.  A late identity
+            # must not trigger an O(history) exact replay at every streaming
+            # boundary.  Ingest it into the current online group, mark the
+            # historical ordering stale, and let the mandatory final rebuild
+            # restore the authoritative acquisition order once.
+            self.orchestrator.state.mark_historical_evidence_stale()
 
-        if online_usable and not reordered_rebuild:
+        if online_usable:
             try:
                 self._refresh_active_window(camera_by_id, gaussians)
             except Exception as error:
@@ -2337,10 +2291,27 @@ class AsyncProgressiveSemanticHook:
         historical_stale = self.orchestrator.state.historical_evidence_stale
         if not self.is_valid:
             status = "failed"
+        elif (
+            self._last_result is not None
+            and self._last_result.geometry_stage == int(geometry_stage)
+            and self._last_result.status
+            in {"exact_final", "exact_partial", "online_fallback"}
+        ):
+            status = self._last_result.status
         elif historical_stale or errors or lag > 1:
             status = "stale_online"
         else:
             status = "approx_online"
+        publication_status = (
+            "not_requested"
+            if self._last_result is None
+            else self._last_result.publication_status
+        )
+        published_product_key = (
+            None
+            if self._last_result is None
+            else self._last_result.published_product_key
+        )
         return SemanticSyncResult(
             int(geometry_stage),
             through,
@@ -2351,4 +2322,6 @@ class AsyncProgressiveSemanticHook:
             errors,
             status,
             historical_stale,
+            publication_status,
+            published_product_key,
         )

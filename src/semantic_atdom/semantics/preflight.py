@@ -134,6 +134,7 @@ def run_dataset_preflight(
     end_stage: int,
     image_folder_path: Optional[Path] = None,
     identity_policy: str = "strict_cumulative",
+    require_complete_initial_snapshot: bool = True,
 ) -> DatasetPreflightResult:
     """Validate selected stages and semantic observations without writing inputs."""
     if semantic_data_root is None or not str(semantic_data_root).strip():
@@ -203,6 +204,18 @@ def run_dataset_preflight(
         overlap = AcquisitionOverlap.load(stage_root)
         image_ids = overlap.image_ids
         current_ids = set(image_ids)
+        if (
+            stage == selected[0]
+            and require_complete_initial_snapshot
+            and snapshot_ids != current_ids
+        ):
+            raise SemanticSchemaError(
+                "stage {} cold-start snapshot omits {} identities required "
+                "by its cumulative overlap set; start from a complete anchor "
+                "stage or provide a compatible recovery checkpoint".format(
+                    stage, len(current_ids - snapshot_ids)
+                )
+            )
         identity_set_is_cumulative = previous_ids.issubset(current_ids)
         if not identity_set_is_cumulative and identity_policy == "strict_cumulative":
             raise SemanticSchemaError(
@@ -316,6 +329,9 @@ def run_dataset_preflight(
         "semantic_data_root": str(semantic_data_root),
         "selected_stages": list(selected),
         "identity_policy": identity_policy,
+        "require_complete_initial_snapshot": bool(
+            require_complete_initial_snapshot
+        ),
         "stage_records": stage_records,
         "final_image_ids": [item[0] for item in sorted(final_names)],
         "labels_complete": len(labels) == len(final_names),

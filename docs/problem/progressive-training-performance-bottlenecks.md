@@ -186,3 +186,45 @@ but the byte budget or CUDA capacity after headroom is 23068672 bytes
 ## 8. 后续训练策略
 
 从本记录起，代码或参数变化后的训练验证先使用小范围阶段子集；默认使用阶段 13–17，并包含 initialization、至少一个 progressive 边界、final refinement、最终语义发布和视频编码。只有小范围测试、完整单元测试和相关 CUDA 集成测试均通过，且用户另行确认后，才启动 13–487 全量训练。
+
+## 9. 2026-09-17 Phantom3 全量复核后的确定问题与首轮修复
+
+Phantom3 stage 14–414 的完整运行暴露了四类与模型质量无关的输出和性能问题：
+
+- `time_per_stage_seconds` 错把最终 stage 编号当作阶段数作除数；该字段已删除，统一使用按真实新增影像数计算的 `geometry_seconds_per_image` 和 `online_seconds_per_image`。
+- 视频最后一帧的像素来自 exact-final 状态，但异步 hook 的状态查询会把它重新标为 `approx_online`；状态查询现在保留同一几何阶段已经提交的终态。
+- 最终评估与逐相机导出重复渲染全部相机，且逐相机 PSNR 未使用有效区域 mask，可见高斯数误写成布尔张量长度；现在最终评估在同一次 masked render 中计算聚合指标、导出 JPEG 和写入逐相机 CSV。
+- 默认输出的 `model/training_state.pt` 约 592 MB，phase 为 `run_complete`，加载器明确拒绝把它作为恢复点；现在默认只发布 `gaussians.ply`，仅在显式使用 `--save_final_training_state` 时保留该调试状态。
+
+同时，数据预处理和训练进程的空闲等待已从 `Queue.empty()` 忙轮询改为阻塞读取；需要检测训练子进程健康状态的位置使用带超时的 `Queue.get()`。这不改变训练数据或数值路径。
+
+为避免再次用总耗时猜测根因，`metrics/timing.json` 的每阶段记录现已拆分：地图准备、语义排队、语义追平等待、RGB TDOM、Semantic TDOM、checkpoint、下一影像渲染等待，以及 CUDA allocated/reserved/peak。Phantom3 stage 14–18 真实小范围验证显示：
+
+- 4 个渐进阶段平均 geometry 2.245 秒/影像，online 2.900 秒/影像；
+- 被采样的视频阶段 RGB TDOM 为 0.014–0.026 秒，Semantic TDOM 为 0.027–0.225 秒，主要额外时间是语义追平等待 0.559–0.859 秒；
+- 最终视频末帧正确记录 `exact_final`、lag 0；
+- 18 个逐相机 masked PSNR 的均值与最终聚合 PSNR 误差小于 `4e-15`；
+- 默认 `model/` 不含 `training_state.pt`，成功后 `.work/` 完全清理。
+
+这组小范围数据说明早期阶段的 RGB/Semantic TDOM 光栅化本身不是瓶颈；此前完整运行中两个百秒长尾仍需在包含对应阶段的诊断运行中，用新增拆分计时确认是否来自语义积压、异常 Gaussian–tile 相交或二者叠加。
+
+## 10. 连续 stage 14–146 归因与修复
+
+为保持与正式流程相同的历史，诊断从完整冷启动锚点 stage 14 连续运行到 146，并让每个 stage 都生成视频帧。修复前结果明确排除了地图 raster：
+
+- stage 134–138 的 `semantic_wait_seconds` 分别为 57.475、57.730、57.836、57.943、56.759 秒；
+- 同期 RGB TDOM 每帧仅 0.051–0.100 秒，Semantic TDOM 每帧仅 0.073–0.116 秒；
+- 这 5 个 stage 首次出现的 ID 依次是 `000111..000115`，此前 ledger 已处理到 `000138`；
+- 旧逻辑按数值 ID 判断“乱序”，因此连续 5 次从全部历史标签重建在线 state。
+
+第一性原理上的边界是：在线 state 本来就是有界近似，不能为了让近似状态暂时满足精确顺序而反复支付 O(history) 成本；唯一权威结果是冻结最终几何上的 exact rebuild。因此晚到观测现在直接融合到当前在线组，同时把 `historical_evidence_stale` 保持为真；最终边界仍按权威顺序从全部有效标签重建一次。
+
+同一 stage 14–146、相同训练和逐阶段视频参数的修复后复跑结果：
+
+- stage 134–138 的语义等待降为 0.610、0.574、0.863、0.596、0.804 秒；
+- 132 个渐进阶段的 `ProgressiveEndToEnd` 从 741.564 秒降至 458.729 秒，减少 282.835 秒（38.14%）；
+- 几何训练时间基本不变：347.960 秒对 345.632 秒；
+- 这些在线帧均为 `stale_online`、lag 0，状态没有被美化；
+- final refinement 仍为 `exact_final`、publication complete、lag 0、errors 为空。
+
+另一次错误的 stage 120 冷启动还暴露了输入边界：该阶段 overlap 累计集合有 120 个身份，但本地 COLMAP snapshot 只有 23 台相机，缺失前序 persistent-union 历史，随后会在 CUDA 中异步越界。preflight 现在要求无恢复点的首阶段 snapshot 覆盖其完整累计身份集合；否则在训练前明确拒绝，并提示从完整锚点开始或提供兼容 recovery checkpoint。stage 120 现会报告缺少 97 个身份，而不是进入训练后崩溃。

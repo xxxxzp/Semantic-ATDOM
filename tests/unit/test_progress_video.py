@@ -143,7 +143,7 @@ class ProgressVideoTests(unittest.TestCase):
         ) as full_frame_rgb, mock.patch(
             "tools.train_progressive.torch.cuda.empty_cache"
         ) as empty_cache:
-            trainer._capture_training_progress_tdom("On_The_Fly")
+            timing = trainer._capture_training_progress_tdom("On_The_Fly")
 
         striped_rgb.assert_called_once_with(
             trainer.gaussians,
@@ -155,6 +155,10 @@ class ProgressVideoTests(unittest.TestCase):
         semantic_render.assert_called_once_with(camera)
         self.assertEqual(empty_cache.call_count, 2)
         trainer.DataSaver_queue.put.assert_called_once()
+        self.assertTrue(timing["requested"])
+        self.assertGreaterEqual(timing["semantic_wait_seconds"], 0.0)
+        self.assertGreaterEqual(timing["rgb_tdom_seconds"], 0.0)
+        self.assertGreaterEqual(timing["semantic_tdom_seconds"], 0.0)
 
     def test_rgb_and_semantic_maps_encode_one_auditable_h264_video(self):
         with TemporaryDirectory() as directory:

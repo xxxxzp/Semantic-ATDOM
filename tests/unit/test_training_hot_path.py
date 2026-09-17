@@ -1,7 +1,11 @@
+import json
+from pathlib import Path
+from tempfile import TemporaryDirectory
 import unittest
 from types import SimpleNamespace
 
 from tools.train_progressive import (
+    DataSaver,
     StageTrainingInputCache,
     TrainingProgressReporter,
     release_camera_sampling_buffers,
@@ -157,6 +161,37 @@ class TrainingHotPathTests(unittest.TestCase):
         self.assertEqual(summary["progressive_image_count"], 3)
         self.assertEqual(summary["geometry_seconds_per_image"], 2.0)
         self.assertAlmostEqual(summary["online_seconds_per_image"], 11.0 / 3.0)
+
+    def test_saved_timing_has_no_stage_number_based_average(self):
+        with TemporaryDirectory() as directory:
+            saver = DataSaver()
+            saver.MetricsRootPath = directory
+            stage_records = [
+                {
+                    "new_image_count": 1,
+                    "geometry_seconds": 2.0,
+                    "online_seconds": 3.0,
+                },
+                {
+                    "new_image_count": 2,
+                    "geometry_seconds": 4.0,
+                    "online_seconds": 8.0,
+                },
+            ]
+
+            saver.SaveTimeCost(
+                {"ProgressiveTrain": 6.0},
+                imagenum=100,
+                stage_records=stage_records,
+            )
+
+            payload = json.loads(
+                (Path(directory) / "timing.json").read_text()
+            )
+            self.assertNotIn("time_per_stage_seconds", payload)
+            self.assertEqual(payload["progressive_stage_count"], 2)
+            self.assertEqual(payload["progressive_image_count"], 3)
+            self.assertEqual(payload["geometry_seconds_per_image"], 2.0)
 
 
 if __name__ == "__main__":

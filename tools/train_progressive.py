@@ -1973,6 +1973,12 @@ class GaussianTrainer(mp.Process):
                 ),
             ),
             "semantic_through_image": semantic_through,
+            "semantic_status": committed_status.status,
+            "semantic_lag_batches": int(committed_status.lag_batches),
+            "semantic_historical_evidence_stale": bool(
+                committed_status.historical_evidence_stale
+            ),
+            "semantic_errors": list(committed_status.errors),
             "window": self.TDOM_alignment["window"],
             "grid": grid,
             "map_downsample": TRAINING_PROGRESS_MAP_DOWNSAMPLE,
@@ -3046,7 +3052,7 @@ class DataSaver(mp.Process):
         title = (
             "Stage {stage}/{end_stage}  |  Cameras {observed_cameras}  |  "
             "Iteration {iteration:,}  |  {progress:.1%}  |  {phase_label}  |  "
-            "Frame {frame}/{total}"
+            "Semantic {semantic_status}  |  Frame {frame}/{total}"
         ).format(
             frame=int(record["frame_index"]) + 1,
             total=total_frames,

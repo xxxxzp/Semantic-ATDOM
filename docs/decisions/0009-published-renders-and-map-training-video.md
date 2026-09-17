@@ -62,16 +62,19 @@ through the final progressive stage.  Defaults are:
 
 The first initialized state, final progressive state, and post-refinement
 state are mandatory.  Before a frame is rendered, the semantic worker must be
-idle and its accepted image boundary must reach the RGB geometry stage.
-Failure to produce this exact pair fails an explicitly requested video rather
-than silently mixing states.
+idle and its accepted image boundary must reach the RGB geometry stage.  This
+guarantees zero boundary lag, but it does not relabel an approximate or
+historically stale online semantic state as exact.  Those states are part of
+the real streaming workflow and remain visible in the frame overlay and the
+timeline metadata.  Failure to reach the same accepted image boundary fails an
+explicitly requested video rather than silently mixing stages.
 
 Temporary RGB JPEG, semantic PNG, and frame metadata live below
 `.work/video_frames/` and are deleted only after ffmpeg produces a verified
 H.264 stream with the requested frame count and dimensions.  The auditable
 timeline is retained as `metrics/training_progress.json`; it records the stage,
-phase, optimizer iteration, observed-camera count, semantic boundary, and map
-window for every encoded frame.
+phase, optimizer iteration, observed-camera count, semantic boundary, semantic
+status/lag/stale-evidence flag/errors, and map window for every encoded frame.
 
 ## Command-line contract
 

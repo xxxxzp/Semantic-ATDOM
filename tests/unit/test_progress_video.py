@@ -42,6 +42,10 @@ class ProgressVideoTests(unittest.TestCase):
             "end_stage": 2,
             "progress": float(stage - 1),
             "semantic_through_image": stage,
+            "semantic_status": "exact_final" if phase == "final_refinement" else "approx_online",
+            "semantic_lag_batches": 0,
+            "semantic_historical_evidence_stale": False,
+            "semantic_errors": [],
             "window": {
                 "grid_id": "grid-a",
                 "tile_indices": {
@@ -124,6 +128,9 @@ class ProgressVideoTests(unittest.TestCase):
             self.assertEqual(metrics["codec"], "h264")
             self.assertEqual(metrics["frame_count"], 2)
             self.assertEqual(metrics["frames"][-1]["phase"], "final_refinement")
+            self.assertEqual(
+                metrics["frames"][0]["semantic_status"], "approx_online"
+            )
             self.assertNotIn("trajectory_pixels", metrics["frames"][0])
 
 

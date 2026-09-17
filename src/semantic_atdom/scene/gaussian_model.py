@@ -829,6 +829,12 @@ class GaussianModel:
         return optimizable_tensors
 
     def prune_points(self, mask, emit_topology=True):
+        mask = mask.reshape(-1)
+        if mask.numel() != self.get_xyz.shape[0]:
+            raise ValueError("prune mask must contain one entry per Gaussian")
+        if not bool(torch.any(mask).item()):
+            return
+
         valid_points_mask = ~mask
         topology_delta = None
         if self._topology_observer is not None and emit_topology:

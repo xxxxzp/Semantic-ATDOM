@@ -78,6 +78,7 @@ from semantic_atdom.semantics.preflight import run_dataset_preflight
 from semantic_atdom.semantics.tdom import (
     SemanticTdomConfig,
     load_semantic_tdom_palette,
+    rasterize_rgb_tdom_striped,
     rasterize_semantic_tdom,
 )
 from semantic_atdom.training_checkpoint import (
@@ -102,6 +103,102 @@ WARNED = False
 TRAINING_PROGRESS_WIDTH = 3840
 TRAINING_PROGRESS_HEIGHT = 1080
 TRAINING_PROGRESS_MAP_DOWNSAMPLE = 8
+TRAINING_PROGRESS_UPDATE_INTERVAL = 10
+
+
+class StageTrainingInputCache:
+    """Keep repeatedly sampled stage inputs on the training device."""
+
+    def __init__(self, cameras, device):
+        self.device = device
+        self._images = {
+            id(camera): camera.original_image.to(device) for camera in cameras
+        }
+        self._masks = {
+            id(camera): camera.Tri_Mask.to(device) for camera in cameras
+        }
+
+    def get(self, camera):
+        cached = self._images.get(id(camera))
+        if cached is not None:
+            return cached
+        return camera.original_image.to(self.device)
+
+    def get_mask(self, camera):
+        cached = self._masks.get(id(camera))
+        if cached is not None:
+            return cached
+        return camera.Tri_Mask.to(self.device)
+
+    def clear(self):
+        self._images.clear()
+        self._masks.clear()
+
+
+class TrainingProgressReporter:
+    """Rate-limit host synchronization while keeping tqdm progress exact."""
+
+    def __init__(self, progress_bar, interval=10, initial_ema_loss=0.0):
+        if interval <= 0:
+            raise ValueError("progress interval must be positive")
+        self.progress_bar = progress_bar
+        self.interval = int(interval)
+        self.ema_loss = float(initial_ema_loss)
+        self._reported_steps = 0
+
+    def maybe_update(self, loss, step, total_steps):
+        if step % self.interval != 0 and step != total_steps:
+            return False
+
+        self.ema_loss = 0.4 * loss.item() + 0.6 * self.ema_loss
+        self.progress_bar.update(step - self._reported_steps)
+        self.progress_bar.set_postfix({"Loss": f"{self.ema_loss:.7f}"})
+        self._reported_steps = step
+        if step == total_steps:
+            self.progress_bar.close()
+        return True
+
+
+def release_camera_sampling_buffers(cameras):
+    """Release LoG sampling data after sparse-point generation consumes it."""
+    for camera in cameras:
+        camera.GradLog = None
+        camera.MaxGradLog = -1
+        camera.LogMask = None
+
+
+def should_retain_visibility(training_type, no_sampling, reset_pending=False):
+    """Return whether a later opacity reset can consume per-view visibility."""
+    return (
+        training_type == "Initialization"
+        or bool(no_sampling)
+        or bool(reset_pending)
+    )
+
+
+def summarize_progressive_stage_timings(stage_records):
+    """Summarize progressive latency using actual newly introduced images."""
+    image_count = sum(int(item["new_image_count"]) for item in stage_records)
+    if image_count <= 0:
+        return {
+            "progressive_stage_count": len(stage_records),
+            "progressive_image_count": 0,
+            "geometry_seconds_per_image": None,
+            "online_seconds_per_image": None,
+        }
+
+    geometry_seconds = sum(
+        float(item["geometry_seconds"]) for item in stage_records
+    )
+    online_seconds = sum(
+        float(item["online_seconds"]) for item in stage_records
+    )
+    return {
+        "progressive_stage_count": len(stage_records),
+        "progressive_image_count": image_count,
+        "geometry_seconds_per_image": geometry_seconds / image_count,
+        "online_seconds_per_image": online_seconds / image_count,
+    }
 
 
 def select_training_progress_stages(start_stage, end_stage, target_frames):
@@ -876,6 +973,10 @@ class DataPreProccesser(mp.Process):
                                                                  "points3D.ply",
                                                              ))
 
+        # Single_Image2 has consumed these buffers while sampling the new sparse
+        # points. They are not inputs to rendering or gradient computation.
+        release_camera_sampling_buffers(NewCams)
+
         time1 = time.time()
         if scene_info.ply_path is not None:
             with open(scene_info.ply_path, 'rb') as src_file, open(
@@ -1305,7 +1406,13 @@ class GaussianTrainer(mp.Process):
         self.TDOM_pipeline = None
         self.TDOM_grid = None
 
-        self.TimeCost = {"GaussianInitial": 0.0, "ProgressiveTrain": 0.0, "FinalRefinement": 0.0}
+        self.TimeCost = {
+            "GaussianInitial": 0.0,
+            "ProgressiveTrain": 0.0,
+            "ProgressiveEndToEnd": 0.0,
+            "FinalRefinement": 0.0,
+        }
+        self.ProgressiveStageTimings = []
 
         self.EvaluateDiary = None
 
@@ -1624,9 +1731,6 @@ class GaussianTrainer(mp.Process):
             self.imagenum = int(checkpoint["stage"])
             restore_rng_state(checkpoint["rng_state"])
 
-        # 为当前已经读入的影像全部创建一个梯度图
-        self.GetGradLogForCams()
-
         # 进行初始模型的训练
         time1 = time.time()
         if (not self.args.skip_FirstSceneTraining) and self.args.start_checkpoint is None:
@@ -1812,17 +1916,21 @@ class GaussianTrainer(mp.Process):
                 "height_world": window.height_world,
             },
             "crs": grid.crs,
-            "dataset_preflight": {
-                "scope": "run_root",
-                "path": os.path.relpath(
-                    self.args.dataset_preflight_path,
-                    self.args.Model_Path_Dir,
-                ),
-                "sha256": self.args.dataset_preflight_sha256,
-                "authoritative_exact_complete": (
-                    self.args.semantic_authoritative_exact_complete
-                ),
-            },
+            "dataset_preflight": (
+                {
+                    "scope": "run_root",
+                    "path": os.path.relpath(
+                        self.args.dataset_preflight_path,
+                        self.args.Model_Path_Dir,
+                    ),
+                    "sha256": self.args.dataset_preflight_sha256,
+                    "authoritative_exact_complete": (
+                        self.args.semantic_authoritative_exact_complete
+                    ),
+                }
+                if self.args.enable_semantics
+                else None
+            ),
         }
 
     def _prepare_semantic_map_safely(self, training_type):
@@ -1922,16 +2030,21 @@ class GaussianTrainer(mp.Process):
             )
 
         camera = self._training_progress_camera()
-        rendered = render(
-            camera,
+        rendered = rasterize_rgb_tdom_striped(
             self.gaussians,
-            self.TDOM_pipeline,
+            camera,
             self.background,
-            Render_Mask=torch.ones(1, dtype=torch.bool).cuda(),
-            TDOM=True,
-        )["render"]
+            self.semantic_tdom_config,
+        )
         rgb_output = tdom_to_uint8(rendered)
+        # The striped renderer has already copied the completed RGB map to the
+        # host.  Drop its CUDA working set before semantic TDOM sizes its own
+        # fixed buffers; otherwise the allocator cache can make reclaimable
+        # RGB binning memory look unavailable and fail a valid frame.
+        del rendered
+        torch.cuda.empty_cache()
         semantic_output = self._semantic_progress_frame(camera)
+        torch.cuda.empty_cache()
 
         cameras = sorted(
             self.scene.getTrainCameras(), key=self._camera_order_key
@@ -1989,7 +2102,7 @@ class GaussianTrainer(mp.Process):
         self.DataSaver_queue.put(
             ["SaveTrainingProgress", rgb_output, semantic_output, metadata]
         )
-        del rendered, rgb_output, semantic_output, camera
+        del rgb_output, semantic_output, camera
 
     def _semantic_progress_frame(self, camera):
         if self.semantic_hook is None:
@@ -2036,6 +2149,20 @@ class GaussianTrainer(mp.Process):
         EvaluateRender = False
         progress_bar = tqdm(range(0, Start_From_Its + iteration), desc=f"{Training_Type} Training progress",
                             initial=Start_From_Its)
+        progress_reporter = TrainingProgressReporter(
+            progress_bar,
+            interval=TRAINING_PROGRESS_UPDATE_INTERVAL,
+            initial_ema_loss=self.ema_loss_for_log,
+        )
+        stage_input_cache = StageTrainingInputCache(
+            self.NewCams if Training_Type == "On_The_Fly" else (),
+            device=self.bg.device,
+        )
+        retain_visibility = should_retain_visibility(
+            Training_Type,
+            self.args.No_Sampling,
+            reset_pending=self.ResetOpacityTime >= 1,
+        )
 
         sub_iteration = 1
         while sub_iteration <= iteration:
@@ -2095,7 +2222,7 @@ class GaussianTrainer(mp.Process):
             if viewpoint_cam.Tri_Mask.shape[0] == 2:
                 self.AlreadyTrainingIterations -= 1
                 continue
-            render_mask = viewpoint_cam.Tri_Mask.to(device=self.bg.device)
+            render_mask = stage_input_cache.get_mask(viewpoint_cam)
 
             # 学习率下降
             if Training_Type == "Initialization" or self.args.No_Adaptive:
@@ -2131,14 +2258,15 @@ class GaussianTrainer(mp.Process):
                     render_pkg["load_distribution"]
                 )
 
-                self.Image_Visibility[viewpoint_cam.image_name] = visibility_filter
+                if retain_visibility:
+                    self.Image_Visibility[viewpoint_cam.image_name] = visibility_filter
 
                 # 计算损失
                 if self.args.Use_Tri_Mask:
                     image = image * render_mask
                     load_distribution = load_distribution[render_mask.squeeze(0)]
 
-                gt_image = viewpoint_cam.original_image.cuda()
+                gt_image = stage_input_cache.get(viewpoint_cam)
                 Ll1 = l1_loss(image, gt_image)
                 ssim_value = fused_ssim(image.unsqueeze(0), gt_image.unsqueeze(0))
                 loss = (1.0 - self.args.lambda_dssim) * Ll1 + self.args.lambda_dssim * (1.0 - ssim_value)
@@ -2162,14 +2290,15 @@ class GaussianTrainer(mp.Process):
                     render_pkg["load_distribution"]
                 )
 
-                self.Image_Visibility[viewpoint_cam.image_name] = visibility_filter
+                if retain_visibility:
+                    self.Image_Visibility[viewpoint_cam.image_name] = visibility_filter
 
                 # 计算损失
                 if self.args.Use_Tri_Mask:
                     image = image * render_mask
                     load_distribution = load_distribution[render_mask.squeeze(0)]
 
-                gt_image = viewpoint_cam.original_image.cuda()
+                gt_image = stage_input_cache.get(viewpoint_cam)
                 Ll1 = l1_loss(image, gt_image)
                 ssim_value = fused_ssim(image.unsqueeze(0), gt_image.unsqueeze(0))
                 loss = (1.0 - self.args.lambda_dssim) * Ll1 + self.args.lambda_dssim * (1.0 - ssim_value)
@@ -2191,14 +2320,16 @@ class GaussianTrainer(mp.Process):
             loss.backward()
 
             with torch.no_grad():
-                # 计算log损失累计
-                self.ema_loss_for_log = 0.4 * loss.item() + 0.6 * self.ema_loss_for_log
-
-                progress_bar.update(1)
-                progress_bar.set_postfix({"Loss": f"{self.ema_loss_for_log:.{7}f}"})
+                # Loss logging is telemetry only. Sampling it avoids forcing a
+                # device-wide synchronization after every optimizer iteration.
+                progress_reporter.maybe_update(
+                    loss,
+                    step=sub_iteration,
+                    total_steps=iteration,
+                )
+                self.ema_loss_for_log = progress_reporter.ema_loss
                 if sub_iteration == iteration:
                     EvaluateRender = True
-                    progress_bar.close()
 
                 GaussianPruned = False
 
@@ -2286,6 +2417,9 @@ class GaussianTrainer(mp.Process):
             del radii, load_distribution, gt_image, Ll1, ssim_value, loss
             del render_mask
             torch.cuda.empty_cache()
+
+        stage_input_cache.clear()
+        del stage_input_cache, progress_reporter
 
         # 在完成这一张影像的训练之后
         if Training_Type == "On_The_Fly" and not self.args.No_Sampling:
@@ -2597,7 +2731,7 @@ class GaussianTrainer(mp.Process):
                     with torch.no_grad():
                         self.TDOM_Cam = None
                         self.TDOM_alignment = None
-                        time1 = time.time()
+                        stage_started = time.perf_counter()
                         print("GaussianTrainer: Get Information from DataPreProccesser...")
 
                         self.scene.scene_info_traincam = Commond_from_DataPreProccesser[1]
@@ -2681,8 +2815,8 @@ class GaussianTrainer(mp.Process):
                             "On_The_Fly",
                         )
 
-                    time2 = time.time()
-                    self.TimeCost["ProgressiveTrain"] += time2 - time1
+                    geometry_seconds = time.perf_counter() - stage_started
+                    self.TimeCost["ProgressiveTrain"] += geometry_seconds
 
                     # WP3 synchronization point: one progressive RGB batch ended.
                     if self.args.render_TDOM and self.TDOM_Cam is None:
@@ -2730,6 +2864,17 @@ class GaussianTrainer(mp.Process):
                                 self.commond = None
 
                     # 向前端传递信息，表示这一张影像已经完成训练，可以将下一张影像的相关信息传输到后端
+                    online_seconds = time.perf_counter() - stage_started
+                    self.TimeCost["ProgressiveEndToEnd"] += online_seconds
+                    self.ProgressiveStageTimings.append(
+                        {
+                            "stage": int(self.imagenum),
+                            "new_image_count": int(NewImagesNum),
+                            "geometry_seconds": float(geometry_seconds),
+                            "online_seconds": float(online_seconds),
+                        }
+                    )
+
                     msg = ["Progressive_finish"]
                     self.DataPreProccesser_queue.put(msg)
                     self.RenderNewDone = False
@@ -2772,7 +2917,12 @@ class GaussianTrainer(mp.Process):
 
                     self.Finish = True
 
-                    msg = ["SaveTimeCost", self.TimeCost, self.imagenum]
+                    msg = [
+                        "SaveTimeCost",
+                        self.TimeCost,
+                        self.imagenum,
+                        self.ProgressiveStageTimings,
+                    ]
                     self.DataSaver_queue.put(msg)
 
                     with torch.no_grad():
@@ -3204,13 +3354,17 @@ class DataSaver(mp.Process):
         if self.TrainingProgressFrameNumber:
             self._encode_training_progress()
 
-    def SaveTimeCost(self, TimeCost, imagenum):
+    def SaveTimeCost(self, TimeCost, imagenum, stage_records):
         print("########################################################")
         payload = {key: float(value) for key, value in TimeCost.items()}
         payload["time_per_stage_seconds"] = float(
             TimeCost["ProgressiveTrain"] / imagenum
         )
+        payload.update(summarize_progressive_stage_timings(stage_records))
+        payload["stage_records"] = list(stage_records)
         for key, value in payload.items():
+            if key == "stage_records":
+                continue
             print("{}: {}s".format(key, value))
         write_json_atomic(
             Path(self.MetricsRootPath) / "timing.json",
@@ -3229,7 +3383,7 @@ class DataSaver(mp.Process):
             elif command[0] == "GetDemo":
                 self.GetDemo()
             elif command[0] == "SaveTimeCost":
-                self.SaveTimeCost(command[1], command[2])
+                self.SaveTimeCost(command[1], command[2], command[3])
             elif command[0] == "stop":
                 break
 

@@ -196,6 +196,52 @@ class GaussianTopologyIntegrationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "positive"):
             model.prune_to_max_count(0)
 
+    def test_empty_prune_preserves_parameters_optimizer_and_topology(self):
+        model = self._make_model()
+        events = []
+
+        class RecordingObserver:
+            num_gaussians = 3
+            is_valid = True
+
+            def __call__(self, delta):
+                events.append(delta)
+
+            def invalidate(self, _reason):
+                pass
+
+        model.set_topology_observer(RecordingObserver())
+        parameter_ids = [
+            id(group["params"][0]) for group in model.optimizer.param_groups
+        ]
+        state_ids = {
+            group["name"]: (
+                id(model.optimizer.state[group["params"][0]]["exp_avg"]),
+                id(model.optimizer.state[group["params"][0]]["exp_avg_sq"]),
+            )
+            for group in model.optimizer.param_groups
+            if group["params"][0] in model.optimizer.state
+        }
+
+        model.prune_points(torch.zeros(3, dtype=torch.bool, device="cuda"))
+
+        self.assertEqual(
+            [id(group["params"][0]) for group in model.optimizer.param_groups],
+            parameter_ids,
+        )
+        self.assertEqual(
+            {
+                group["name"]: (
+                    id(model.optimizer.state[group["params"][0]]["exp_avg"]),
+                    id(model.optimizer.state[group["params"][0]]["exp_avg_sq"]),
+                )
+                for group in model.optimizer.param_groups
+                if group["params"][0] in model.optimizer.state
+            },
+            state_ids,
+        )
+        self.assertEqual(events, [])
+
     def test_hard_budget_slack_batches_compaction(self):
         model = self._make_model()
         self.assertEqual(model.prune_to_max_count(2, slack_fraction=0.5), 0)

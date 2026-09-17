@@ -839,6 +839,9 @@ def rasterize_semantic_tdom(
         int(config.finalize_tile_rows) * image_width,
     )
     with torch.cuda.device(means3d.device):
+        # Capacity must be measured after releasing allocator cache left by a
+        # completed paired RGB render. Live model/state tensors are unaffected.
+        torch.cuda.empty_cache()
         free_cuda_bytes, total_cuda_bytes = torch.cuda.mem_get_info()
         allocated_before = torch.cuda.memory_allocated()
     capacity_bytes = min(

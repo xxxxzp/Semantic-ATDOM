@@ -8,6 +8,7 @@ from semantic_atdom.scene.progressive_layout import (
     select_progressive_stages,
 )
 from semantic_atdom.scene.dataset_readers import _image_identity
+from semantic_atdom.utils.image_identity import normalize_image_identity
 
 
 class ProgressiveDatasetLayoutTests(unittest.TestCase):
@@ -23,6 +24,10 @@ class ProgressiveDatasetLayoutTests(unittest.TestCase):
         )
         self.assertEqual(
             _image_identity("1658137107.639350179"),
+            "1658137107.639350179",
+        )
+        self.assertEqual(
+            normalize_image_identity("nested/1658137107.639350179.JPG"),
             "1658137107.639350179",
         )
 

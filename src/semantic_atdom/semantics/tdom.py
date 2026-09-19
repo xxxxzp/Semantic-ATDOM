@@ -19,6 +19,9 @@ from semantic_atdom.semantics.provenance import SEMANTIC_METHOD_VERSION
 from semantic_atdom.semantics.reference import evidence_conditioned_belief
 
 
+MAX_SEMANTIC_TDOM_CLASSES = 15
+
+
 class UnknownReason(IntFlag):
     """Independent reasons why a pixel is withheld from the hard class map."""
 
@@ -829,8 +832,12 @@ def rasterize_semantic_tdom(
     # K class numerators plus support, two mixture/group numerators, a local
     # group-validity denominator and the squared-weight variance feature.
     feature_channels = class_spec.num_classes + 5
-    if feature_channels > 20:
-        raise ValueError("Semantic TDOM currently supports at most 15 classes")
+    if feature_channels > MAX_SEMANTIC_TDOM_CLASSES + 5:
+        raise ValueError(
+            "Semantic TDOM currently supports at most {} classes".format(
+                MAX_SEMANTIC_TDOM_CLASSES
+            )
+        )
     image_height = int(camera.image_height)
     image_width = int(camera.image_width)
     pixel_count = image_height * image_width

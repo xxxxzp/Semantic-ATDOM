@@ -157,13 +157,16 @@ def migrate(root: Path, final_stage: int, apply: bool) -> None:
     legacy_maps = root / "Map_Products"
     legacy_semantic = root / "semantic"
     if (root / "manifest.json").exists():
-        raise FileExistsError("run already has a v1 manifest")
+        raise FileExistsError("run already has a published manifest")
     for required in (stage, legacy_maps, legacy_semantic):
         if not required.exists():
             raise FileNotFoundError(required)
-    staging = root / ".migration-output-v1"
+    staging = root.with_name(root.name + ".migration-output-v2")
+    backup = root.with_name(root.name + ".migration-backup")
     if staging.exists():
         raise FileExistsError("stale migration staging directory: {}".format(staging))
+    if backup.exists():
+        raise FileExistsError("stale migration backup directory: {}".format(backup))
 
     inventory = _inventory(root, staging)
     print(
@@ -274,6 +277,10 @@ def migrate(root: Path, final_stage: int, apply: bool) -> None:
         write_json_atomic(semantic_model / "manifest.json", semantic_manifest)
 
         final_evaluation, timing = _legacy_metrics(root, staging)
+        if final_evaluation is None:
+            raise RuntimeError(
+                "legacy run has no complete final evaluation metadata"
+            )
         camera_count = _legacy_camera_renders(root, staging)
         logs = staging / "logs"
         logs.mkdir()
@@ -304,6 +311,20 @@ def migrate(root: Path, final_stage: int, apply: bool) -> None:
             "migrated": True,
         }
         write_json_atomic(staging / "metrics" / "summary.json", summary)
+        artifacts = {
+            "model": "model",
+            "maps": "products/maps",
+            "metrics": "metrics",
+            "logs": "logs",
+            "provenance": "provenance",
+        }
+        if camera_count:
+            artifacts["renders"] = {
+                "cameras": {
+                    "path": "renders/cameras",
+                    "count": camera_count,
+                }
+            }
         write_json_atomic(
             staging / "manifest.json",
             {
@@ -316,59 +337,37 @@ def migrate(root: Path, final_stage: int, apply: bool) -> None:
                 "git": {"commit": None, "branch": None, "dirty": None},
                 "command": None,
                 "options": {"migrated": True, "legacy_output": True},
-                "artifacts": {
-                    "model": "model",
-                    "maps": "products/maps",
-                    "metrics": "metrics",
-                    "logs": "logs",
-                    "provenance": "provenance",
-                    "renders": (
-                        {
-                            "cameras": {
-                                "path": "renders/cameras",
-                                "count": camera_count,
-                            }
-                        }
-                        if camera_count
-                        else None
-                    ),
-                },
+                "final_stage": int(final_stage),
+                "optimizer_iteration": int(final_evaluation["iteration"]),
+                "artifacts": artifacts,
                 "failure": None,
             },
         )
 
-        for name in ("model", "products", "metrics", "logs", "provenance", "qa"):
-            source = staging / name
-            if source.exists():
-                os.replace(source, root / name)
-        # The manifest is the commit point: no consumer sees a successful v1
-        # run until every linked destination has been verified and installed.
-        os.replace(staging / "manifest.json", root / "manifest.json")
-
-        for legacy in (
-            stage,
-            legacy_maps,
-            legacy_semantic,
-            root / "OutputImages",
-            root / "Intermediate_Results",
-        ):
-            if legacy.exists():
-                shutil.rmtree(legacy)
-        for legacy_file in (
-            "Diary.txt",
-            "EvaluateDiary.txt",
-            "GaussianDiary.txt",
-            "environment_fingerprint.json",
-            "final_environment_fingerprint.json",
-        ):
-            candidate = root / legacy_file
-            if candidate.exists():
-                candidate.unlink()
-        staging.rmdir()
+        # Commit the complete schema-v2 tree with one directory exchange.  A
+        # failure before the second rename restores the untouched legacy run;
+        # consumers therefore never observe a partially installed layout.
+        os.replace(root, backup)
+        try:
+            os.replace(staging, root)
+        except Exception:
+            os.replace(backup, root)
+            raise
+        try:
+            shutil.rmtree(backup)
+        except OSError as error:
+            print(
+                "Migration committed; legacy backup cleanup is incomplete: {}".format(
+                    error
+                ),
+                file=sys.stderr,
+            )
         print("Migration complete: {}".format(root))
     except Exception:
         if staging.exists():
             shutil.rmtree(staging)
+        if backup.exists() and not root.exists():
+            os.replace(backup, root)
         raise
 
 

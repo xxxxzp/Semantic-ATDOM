@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import csv
 import hashlib
 import json
 import os
@@ -201,7 +202,6 @@ class RunLayout:
             self.metrics,
             self.logs,
             self.provenance,
-            self.map_releases,
             self.stages,
             self.cache,
         ):
@@ -235,6 +235,8 @@ class RunLayout:
                 "git": git_revision(repository_root),
                 "command": list(command),
                 "options": dict(options),
+                "final_stage": None,
+                "optimizer_iteration": None,
                 "artifacts": {},
                 "failure": None,
             },
@@ -246,12 +248,33 @@ class RunLayout:
         *,
         artifacts: Optional[Mapping[str, Any]] = None,
         failure: Optional[Mapping[str, Any]] = None,
+        final_stage: Optional[int] = None,
+        optimizer_iteration: Optional[int] = None,
     ) -> None:
         if status not in {"running", "succeeded", "failed", "interrupted"}:
             raise ValueError("unsupported run status: {}".format(status))
         payload = self.read_manifest()
+        previous_status = payload.get("status")
+        if previous_status != "running":
+            raise RuntimeError(
+                "run status is already terminal: {}".format(previous_status)
+            )
+        if status == "succeeded":
+            for name, value in (
+                ("final_stage", final_stage),
+                ("optimizer_iteration", optimizer_iteration),
+            ):
+                if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                    raise ValueError(
+                        "successful run requires a non-negative {}".format(name)
+                    )
+        elif final_stage is not None or optimizer_iteration is not None:
+            raise ValueError("completion metadata is valid only for a successful run")
         payload["status"] = status
         payload["finished_at"] = None if status == "running" else _utc_now()
+        if status == "succeeded":
+            payload["final_stage"] = final_stage
+            payload["optimizer_iteration"] = optimizer_iteration
         if artifacts is not None:
             payload["artifacts"] = dict(artifacts)
         payload["failure"] = None if failure is None else dict(failure)
@@ -287,6 +310,9 @@ class RunLayout:
         return path
 
     def publish_latest(self) -> Path:
+        manifest = self.read_manifest()
+        if manifest.get("status") != "succeeded":
+            raise RuntimeError("outputs/latest may reference only a succeeded run")
         outputs_root = self.root.parent.parent if self.root.parent.name == "runs" else self.root.parent
         latest = outputs_root / "latest"
         temporary = outputs_root / ".latest.tmp"
@@ -294,11 +320,143 @@ class RunLayout:
         if temporary.exists() or temporary.is_symlink():
             temporary.unlink()
         temporary.symlink_to(target, target_is_directory=True)
-        os.replace(temporary, latest)
+        try:
+            os.replace(temporary, latest)
+        except Exception:
+            temporary.unlink(missing_ok=True)
+            raise
         return latest
 
 
-def move_file_verified(source: Path, destination: Path) -> Dict[str, Any]:
+def validate_final_semantic_outputs(
+    layout: RunLayout,
+    *,
+    final_stage: int,
+    require_map: bool,
+) -> Dict[str, Any]:
+    """Validate authoritative semantic outputs before a run is committed."""
+
+    status_path = layout.semantic_work / "sync_status.json"
+    if not status_path.is_file():
+        raise RuntimeError("final semantic sync status is missing: {}".format(status_path))
+    with status_path.open("r", encoding="utf-8") as stream:
+        status = json.load(stream)
+    failures = []
+    if status.get("status") != "exact_final":
+        failures.append("status={!r}".format(status.get("status")))
+    if status.get("geometry_stage") != int(final_stage):
+        failures.append("geometry_stage={!r}".format(status.get("geometry_stage")))
+    if status.get("lag_batches") != 0:
+        failures.append("lag_batches={!r}".format(status.get("lag_batches")))
+    if status.get("errors"):
+        failures.append("errors={!r}".format(status.get("errors")))
+    if status.get("deferred_image_ids"):
+        failures.append(
+            "deferred_image_ids={!r}".format(status.get("deferred_image_ids"))
+        )
+    if status.get("historical_evidence_stale"):
+        failures.append("historical_evidence_stale=true")
+    if failures:
+        raise RuntimeError(
+            "final semantic output is not authoritative: {}".format(
+                ", ".join(failures)
+            )
+        )
+
+    if not require_map:
+        return status
+    if status.get("publication_status") != "complete":
+        raise RuntimeError(
+            "final semantic map publication is not complete: {!r}".format(
+                status.get("publication_status")
+            )
+        )
+    latest_path = layout.maps / "latest.json"
+    if not latest_path.is_file():
+        raise RuntimeError("final map pointer is missing: {}".format(latest_path))
+    with latest_path.open("r", encoding="utf-8") as stream:
+        latest = json.load(stream)
+    reference = latest.get("pair_manifest")
+    if not isinstance(reference, str) or not reference:
+        raise RuntimeError("final map pointer has no pair_manifest")
+    pair_path = (layout.maps / reference).resolve()
+    try:
+        pair_path.relative_to(layout.maps.resolve())
+    except ValueError as error:
+        raise RuntimeError("final map pointer escapes the run directory") from error
+    if not pair_path.is_file():
+        raise RuntimeError("final pair manifest is missing: {}".format(pair_path))
+    if sha256_file(pair_path) != latest.get("pair_manifest_sha256"):
+        raise RuntimeError("final map pointer hash does not match release")
+    with pair_path.open("r", encoding="utf-8") as stream:
+        pair = json.load(stream)
+    pair_failures = []
+    if pair.get("publication_status") != "complete":
+        pair_failures.append(
+            "publication_status={!r}".format(pair.get("publication_status"))
+        )
+    if pair.get("semantic_status") != "exact_final":
+        pair_failures.append(
+            "semantic_status={!r}".format(pair.get("semantic_status"))
+        )
+    if pair.get("geometry_stage") != int(final_stage):
+        pair_failures.append("geometry_stage={!r}".format(pair.get("geometry_stage")))
+    if pair_failures:
+        raise RuntimeError(
+            "final map pair is not authoritative: {}".format(
+                ", ".join(pair_failures)
+            )
+        )
+    return status
+
+
+def validate_camera_render_outputs(layout: RunLayout) -> int:
+    cameras_path = layout.model / "cameras.json"
+    metrics_path = layout.metrics / "per_camera.csv"
+    renders_root = layout.renders / "cameras"
+    if not cameras_path.is_file():
+        raise RuntimeError("final camera inventory is missing: {}".format(cameras_path))
+    with cameras_path.open("r", encoding="utf-8") as stream:
+        cameras = json.load(stream)
+    if not isinstance(cameras, list):
+        raise RuntimeError("final camera inventory must be a JSON array")
+    expected = {
+        Path(str(camera["img_name"])).name
+        for camera in cameras
+        if isinstance(camera, Mapping) and camera.get("img_name")
+    }
+    if len(expected) != len(cameras):
+        raise RuntimeError("final camera inventory has missing or duplicate identities")
+    actual = {
+        path.name[: -len(".jpg")]
+        for path in renders_root.glob("*.jpg")
+        if path.is_file()
+    }
+    if actual != expected:
+        raise RuntimeError(
+            "requested per-camera renders differ from final camera inventory; "
+            "missing={}, unexpected={}".format(
+                sorted(expected - actual), sorted(actual - expected)
+            )
+        )
+    if not metrics_path.is_file():
+        raise RuntimeError("per-camera metrics are missing: {}".format(metrics_path))
+    with metrics_path.open("r", encoding="utf-8", newline="") as stream:
+        metric_rows = list(csv.DictReader(stream))
+    metric_ids = {
+        row.get("camera_id") for row in metric_rows if row.get("camera_id")
+    }
+    if metric_ids != expected or len(metric_rows) != len(expected):
+        raise RuntimeError(
+            "per-camera metrics differ from final camera inventory; "
+            "missing={}, unexpected={}".format(
+                sorted(expected - metric_ids), sorted(metric_ids - expected)
+            )
+        )
+    return len(expected)
+
+
+def copy_file_verified(source: Path, destination: Path) -> Dict[str, Any]:
     source = Path(source)
     destination = Path(destination)
     if not source.is_file():
@@ -308,9 +466,24 @@ def move_file_verified(source: Path, destination: Path) -> Dict[str, Any]:
     size = source.stat().st_size
     digest = sha256_file(source)
     destination.parent.mkdir(parents=True, exist_ok=True)
-    os.replace(source, destination)
-    if destination.stat().st_size != size or sha256_file(destination) != digest:
-        raise RuntimeError("moved artifact failed verification: {}".format(destination))
+    temporary = destination.with_name(destination.name + ".publishing")
+    if temporary.exists():
+        temporary.unlink()
+    try:
+        try:
+            os.link(source, temporary)
+        except OSError:
+            shutil.copy2(source, temporary)
+        if temporary.stat().st_size != size or sha256_file(temporary) != digest:
+            raise RuntimeError(
+                "copied artifact failed verification: {}".format(destination)
+            )
+        with temporary.open("rb") as stream:
+            os.fsync(stream.fileno())
+        os.replace(temporary, destination)
+    except Exception:
+        temporary.unlink(missing_ok=True)
+        raise
     return {"path": destination, "size_bytes": size, "sha256": digest}
 
 
@@ -325,16 +498,16 @@ def finalize_stage_model(
         raise RuntimeError("final stage output is missing: {}".format(stage_root))
     point_cloud = stage_root / "point_cloud" / "iteration_{}".format(final_stage) / "point_cloud.ply"
     records = {
-        "gaussians": move_file_verified(point_cloud, layout.model / "gaussians.ply"),
+        "gaussians": copy_file_verified(point_cloud, layout.model / "gaussians.ply"),
     }
     checkpoint = stage_root / "chkpnt{}.pth".format(final_stage)
     checkpoint_metadata = checkpoint.with_suffix(checkpoint.suffix + ".json")
     if include_training_state:
-        records["training_state"] = move_file_verified(
+        records["training_state"] = copy_file_verified(
             checkpoint, layout.model / "training_state.pt"
         )
         if checkpoint_metadata.is_file():
-            records["training_state_metadata"] = move_file_verified(
+            records["training_state_metadata"] = copy_file_verified(
                 checkpoint_metadata, layout.model / "training_state.json"
             )
     optional = {
@@ -344,12 +517,11 @@ def finalize_stage_model(
     }
     for name, (source, destination) in optional.items():
         if source.is_file():
-            records[name] = move_file_verified(source, destination)
+            records[name] = copy_file_verified(source, destination)
     for event in stage_root.glob("events.out.tfevents.*"):
         records.setdefault("tensorboard", []).append(
-            move_file_verified(event, layout.logs / "tensorboard" / event.name)
+            copy_file_verified(event, layout.logs / "tensorboard" / event.name)
         )
-    shutil.rmtree(stage_root)
     return records
 
 
@@ -368,19 +540,34 @@ def archive_semantic_state(layout: RunLayout) -> Dict[str, Any]:
         raise RuntimeError("active semantic state hash does not match latest pointer")
     if sha256_file(geometry_source) != latest["geometry_checkpoint_sha256"]:
         raise RuntimeError("active semantic geometry hash does not match latest pointer")
+    with context_source.open("r", encoding="utf-8") as stream:
+        recovery_context = json.load(stream)
+    context_hash = hashlib.sha256(
+        json.dumps(
+            recovery_context,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    ).hexdigest()
+    if context_hash != latest.get("recovery_context_sha256"):
+        raise RuntimeError(
+            "active semantic recovery context hash does not match latest pointer"
+        )
     records = {
-        "state": move_file_verified(state_source, layout.semantic_model / "state.pt"),
-        "recovery_context": move_file_verified(
+        "state": copy_file_verified(state_source, layout.semantic_model / "state.pt"),
+        "recovery_context": copy_file_verified(
             context_source, layout.semantic_model / "recovery_context.json"
         ),
-        "geometry": move_file_verified(
+        "geometry": copy_file_verified(
             geometry_source, layout.semantic_model / "geometry.pt"
         ),
     }
     for name in ("ledger.json", "sync_status.json", "final_rebuild_metrics.json"):
         candidate = source / name
         if candidate.is_file():
-            records[name.removesuffix(".json")] = move_file_verified(
+            records[name.removesuffix(".json")] = copy_file_verified(
                 candidate, layout.semantic_model / name
             )
     archive = dict(latest)
@@ -391,6 +578,7 @@ def archive_semantic_state(layout: RunLayout) -> Dict[str, Any]:
             "state": "state.pt",
             "state_sha256": records["state"]["sha256"],
             "recovery_context": "recovery_context.json",
+            "recovery_context_sha256": context_hash,
             "geometry": "geometry.pt",
             "geometry_sha256": records["geometry"]["sha256"],
         }

@@ -29,6 +29,8 @@ from semantic_atdom.utils.run_output import (
     finalize_stage_model,
     relative_artifact_records,
     sha256_file,
+    validate_camera_render_outputs,
+    validate_final_semantic_outputs,
     write_json_atomic,
 )
 from argparse import ArgumentParser, Namespace
@@ -77,6 +79,7 @@ from semantic_atdom.semantics.publication import (
 from semantic_atdom.semantics.schema import SemanticClassSpec
 from semantic_atdom.semantics.preflight import run_dataset_preflight
 from semantic_atdom.semantics.tdom import (
+    MAX_SEMANTIC_TDOM_CLASSES,
     SemanticTdomConfig,
     load_semantic_tdom_palette,
     rasterize_rgb_tdom_striped,
@@ -108,6 +111,30 @@ TRAINING_PROGRESS_MIN_WIDTH = 1280
 TRAINING_PROGRESS_HEIGHT = 1080
 TRAINING_PROGRESS_MAP_DOWNSAMPLE = 8
 TRAINING_PROGRESS_UPDATE_INTERVAL = 10
+
+
+def camera_image_mapping_changed(camera_info, previous):
+    """Return whether a retained RGB tensor needs the new rectification map."""
+
+    return not (
+        math.isclose(
+            camera_info.FovX,
+            previous["FoVx"],
+            rel_tol=0.0,
+            abs_tol=1e-12,
+        )
+        and math.isclose(
+            camera_info.FovY,
+            previous["FoVy"],
+            rel_tol=0.0,
+            abs_tol=1e-12,
+        )
+        and camera_info.calibration == previous.get("calibration")
+    )
+
+
+def trainable_cameras(cameras):
+    return [camera for camera in cameras if camera.Tri_Mask.shape[0] != 2]
 
 
 class StageTrainingInputCache:
@@ -231,6 +258,29 @@ def SemanticWarning(message):
         warnings.warn(message, RuntimeWarning)
     except Exception:
         pass
+
+
+def resolve_semantic_render_palette(semantic_data_root, explicit_path=None):
+    semantic_root = Path(semantic_data_root) / "semantic"
+    class_spec = SemanticClassSpec.load(semantic_root / "class_spec.json")
+    colors = tuple(item.color for item in class_spec.classes)
+    palette_path = explicit_path
+    if not palette_path:
+        candidate = semantic_root / "tdom_palette.json"
+        if candidate.is_file():
+            palette_path = str(candidate)
+    palette_source = None
+    if palette_path:
+        try:
+            colors = load_semantic_tdom_palette(palette_path, class_spec)
+            palette_source = str(palette_path)
+        except Exception as error:
+            SemanticWarning(
+                "Semantic TDOM palette ignored; using class_spec colors: {}".format(
+                    error
+                )
+            )
+    return class_spec, colors, palette_source
 
 def Get_lpips(rgbs: torch.Tensor, target_rgbs: torch.Tensor, lpips_vgg):
     return {'vgg': lpips_distance(target_rgbs, rgbs, lpips_vgg)}
@@ -461,6 +511,9 @@ def TrainingPreparation(args):
             identity_policy=args.progressive_identity_policy,
             require_complete_initial_snapshot=(
                 args.start_checkpoint is None
+            ),
+            max_semantic_tdom_classes=(
+                MAX_SEMANTIC_TDOM_CLASSES if args.render_TDOM else None
             ),
         )
         provenance_preflight = Path(args.provenance_dir) / "dataset_preflight.json"
@@ -1073,9 +1126,8 @@ class DataPreProccesser(mp.Process):
                     camera_center = world_view_transform.inverse()[3, :3]
 
                     replacement = None
-                    intrinsics_changed = not (
-                        math.isclose(cam.FovX, TrainCameras[cam.image_name]["FoVx"], rel_tol=0.0, abs_tol=1e-12)
-                        and math.isclose(cam.FovY, TrainCameras[cam.image_name]["FoVy"], rel_tol=0.0, abs_tol=1e-12)
+                    intrinsics_changed = camera_image_mapping_changed(
+                        cam, TrainCameras[cam.image_name]
                     )
                     if intrinsics_changed:
                         image = load_rectified_image(cam.image_path, cam.calibration)
@@ -1471,30 +1523,12 @@ class GaussianTrainer(mp.Process):
             return
         try:
             semantic_dataset_root = self.args.semantic_data_root
-            semantic_root = os.path.join(semantic_dataset_root, "semantic")
-            palette_path = self.args.semantic_tdom_palette_path
-            if not palette_path:
-                candidate = os.path.join(semantic_root, "tdom_palette.json")
-                if os.path.isfile(candidate):
-                    palette_path = candidate
-            render_palette = None
-            render_palette_source = None
-            if palette_path:
-                try:
-                    class_spec = SemanticClassSpec.load(
-                        os.path.join(semantic_root, "class_spec.json")
-                    )
-                    render_palette = load_semantic_tdom_palette(
-                        palette_path, class_spec
-                    )
-                    render_palette_source = palette_path
-                except Exception as error:
-                    SemanticWarning(
-                        "Semantic TDOM palette ignored; using class_spec "
-                        "colors so semantic fusion can continue: {}".format(
-                            error
-                        )
-                    )
+            _, render_palette, render_palette_source = (
+                resolve_semantic_render_palette(
+                    semantic_dataset_root,
+                    self.args.semantic_tdom_palette_path,
+                )
+            )
             config = OnlineSemanticConfig(
                 overlap_threshold=self.args.semantic_overlap_threshold,
                 max_group_size=self.args.semantic_max_group_size,
@@ -1782,6 +1816,7 @@ class GaussianTrainer(mp.Process):
                                              "zfar": cam.zfar,
                                              "FoVx": cam.FoVx,
                                              "FoVy": cam.FoVy,
+                                             "calibration": cam.calibration,
                                              "uid": cam.uid,
                                              "image_width": cam.image_width,
                                              "image_height": cam.image_height}
@@ -2170,7 +2205,7 @@ class GaussianTrainer(mp.Process):
             initial_ema_loss=self.ema_loss_for_log,
         )
         stage_input_cache = StageTrainingInputCache(
-            self.NewCams if Training_Type == "On_The_Fly" else (),
+            trainable_cameras(self.NewCams) if Training_Type == "On_The_Fly" else (),
             device=self.bg.device,
         )
         retain_visibility = should_retain_visibility(
@@ -2230,13 +2265,14 @@ class GaussianTrainer(mp.Process):
                     # 在渐进式训练过程中，将根据特殊规则选取用于训练的影像
                     viewpoint_stack = self.GetTraining_Viewpoints_SingleImage(single=self.args.Single)
 
+                viewpoint_stack = trainable_cameras(viewpoint_stack)
+                if not viewpoint_stack:
+                    raise RuntimeError(
+                        "training stage has no camera with a valid sparse support region"
+                    )
+
             # 随机从摄影机视点栈堆中任意取出一个影像以及其视点信息
             viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack) - 1))
-
-            # 如果当前影像异常，应当跳过并返回一次训练次数
-            if viewpoint_cam.Tri_Mask.shape[0] == 2:
-                self.AlreadyTrainingIterations -= 1
-                continue
             render_mask = stage_input_cache.get_mask(viewpoint_cam)
 
             # 学习率下降
@@ -2517,73 +2553,63 @@ class GaussianTrainer(mp.Process):
                     PSNRs = []
                     ErrorImageNum = 0
                     for idx, viewpoint in enumerate(config['cameras']):
-                        if viewpoint.Tri_Mask.shape[0] != 2:
-                            render_pkg = renderFunc(
-                                viewpoint,
-                                self.gaussians,
-                                *renderArgs,
-                                Render_Mask=viewpoint.Tri_Mask,
+                        evaluation_mask = viewpoint.Tri_Mask
+                        if evaluation_mask.shape[0] == 2:
+                            evaluation_mask = torch.ones(
+                                1,
+                                dtype=torch.bool,
+                                device=evaluation_mask.device,
                             )
-                            image = torch.clamp(render_pkg["render"], 0.0, 1.0)
-                            gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
-                            l1_test += l1_loss(image, gt_image).mean().double()
+                        render_pkg = renderFunc(
+                            viewpoint,
+                            self.gaussians,
+                            *renderArgs,
+                            Render_Mask=evaluation_mask,
+                        )
+                        image = torch.clamp(render_pkg["render"], 0.0, 1.0)
+                        gt_image = torch.clamp(
+                            viewpoint.original_image.to("cuda"), 0.0, 1.0
+                        )
+                        l1_test += l1_loss(image, gt_image).mean().double()
 
-                            PSNR = psnr(image, gt_image, viewpoint.Tri_Mask).mean().double()
-                            psnr_test += PSNR
-                            PSNRs.append(PSNR)
+                        PSNR = psnr(image, gt_image, evaluation_mask).mean().double()
+                        psnr_test += PSNR
+                        PSNRs.append(PSNR)
 
-                            if self.Finish:
-                                lpips_test += Get_lpips(image, gt_image, lpips_vgg)['vgg']
+                        if self.Finish:
+                            lpips_test += Get_lpips(image, gt_image, lpips_vgg)['vgg']
+                            ssim_test += ssim_chw(gt_image, image)
 
-                                ssim_test += ssim_chw(gt_image, image)
+                            if (
+                                config["name"] == "train"
+                                and getattr(self.args, "render_all_cameras", False)
+                            ):
+                                image_id = Path(str(viewpoint.image_name)).name
+                                output_dir = Path(self.args.renders_dir) / "cameras"
+                                output_dir.mkdir(parents=True, exist_ok=True)
+                                Image.fromarray(tdom_to_uint8(image)).save(
+                                    output_dir / (image_id + ".jpg")
+                                )
+                                visibility = render_pkg["visibility_filter"]
+                                camera_rows.append(
+                                    {
+                                        "camera_id": image_id,
+                                        "iteration": int(
+                                            self.AlreadyTrainingIterations
+                                        ),
+                                        "psnr": float(PSNR),
+                                        "visible_gaussians": int(
+                                            torch.count_nonzero(visibility).item()
+                                        ),
+                                        "render": (
+                                            "renders/cameras/{}.jpg".format(image_id)
+                                        ),
+                                    }
+                                )
 
-                                if (
-                                    config["name"] == "train"
-                                    and getattr(
-                                        self.args, "render_all_cameras", False
-                                    )
-                                ):
-                                    image_id = Path(
-                                        str(viewpoint.image_name)
-                                    ).name
-                                    output_dir = (
-                                        Path(self.args.renders_dir) / "cameras"
-                                    )
-                                    output_dir.mkdir(
-                                        parents=True, exist_ok=True
-                                    )
-                                    Image.fromarray(
-                                        tdom_to_uint8(image)
-                                    ).save(output_dir / (image_id + ".jpg"))
-                                    visibility = render_pkg[
-                                        "visibility_filter"
-                                    ]
-                                    camera_rows.append(
-                                        {
-                                            "camera_id": image_id,
-                                            "iteration": int(
-                                                self.AlreadyTrainingIterations
-                                            ),
-                                            "psnr": float(PSNR),
-                                            "visible_gaussians": int(
-                                                torch.count_nonzero(
-                                                    visibility
-                                                ).item()
-                                            ),
-                                            "render": (
-                                                "renders/cameras/{}.jpg".format(
-                                                    image_id
-                                                )
-                                            ),
-                                        }
-                                    )
+                            progress_bar.update(1)
 
-                                progress_bar.update(1)
-
-                            del render_pkg, image, gt_image
-
-                        else:
-                            ErrorImageNum = ErrorImageNum + 1
+                        del render_pkg, image, gt_image
 
                     if self.Finish:
                         progress_bar.close()
@@ -2641,17 +2667,21 @@ class GaussianTrainer(mp.Process):
     # 仅训练当前新传入的影像
     def GetTraining_Viewpoints_SingleImage(self, single=False):
         viewpoint_stack = []
+        new_cameras = trainable_cameras(self.NewCams)
         if single:
             for _ in range(self.args.IterationPerMergeScene):
-                if self.NewCams:
-                    viewpoint_stack.append(self.NewCams[0])
+                if new_cameras:
+                    viewpoint_stack.append(new_cameras[0])
         else:
             for _ in range(self.args.IterationPerMergeScene):
-                for j in range(len(self.NewCams)):
-                    viewpoint_stack.append(self.NewCams[j])
+                viewpoint_stack.extend(new_cameras)
 
-        all_viewpoints = self.scene.getTrainCameras().copy()
+        all_viewpoints = trainable_cameras(self.scene.getTrainCameras())
         remaining = self.CurrentGlobalOptimizationIterations
+        if remaining > 0 and not all_viewpoints:
+            raise RuntimeError(
+                "global optimization has no camera with a valid sparse support region"
+            )
         while remaining > 0:
             take = min(remaining, len(all_viewpoints))
             viewpoint_stack.extend(random.sample(all_viewpoints, take))
@@ -3654,25 +3684,10 @@ class On_the_Fly_GS:
             self.GaussianTrainer.args.training_progress_fps
         )
         if self.DataSaver.RenderTrainingProgress:
-            class_spec = SemanticClassSpec.load(
-                Path(self.GaussianTrainer.args.semantic_data_root)
-                / "semantic"
-                / "class_spec.json"
+            class_spec, colors, _ = resolve_semantic_render_palette(
+                self.GaussianTrainer.args.semantic_data_root,
+                self.GaussianTrainer.args.semantic_tdom_palette_path,
             )
-            colors = tuple(item.color for item in class_spec.classes)
-            palette_path = self.GaussianTrainer.args.semantic_tdom_palette_path
-            if not palette_path:
-                candidate = (
-                    Path(self.GaussianTrainer.args.semantic_data_root)
-                    / "semantic"
-                    / "tdom_palette.json"
-                )
-                if candidate.is_file():
-                    palette_path = str(candidate)
-            if palette_path:
-                colors = load_semantic_tdom_palette(
-                    palette_path, class_spec
-                )
             self.DataSaver.LegendEntries = [
                 {
                     "id": item.class_id,
@@ -3735,7 +3750,7 @@ class On_the_Fly_GS:
                     self.DataSaver_Thread.exitcode
                 )
             )
-        artifacts = self._finalize_success()
+        artifacts, final_stage, optimizer_iteration = self._finalize_success()
         subprocess.run(
             [
                 sys.executable,
@@ -3749,9 +3764,53 @@ class On_the_Fly_GS:
             cwd=str(Path(__file__).resolve().parent.parent),
         )
         artifacts["provenance"] = "provenance"
-        self.layout.set_status("succeeded", artifacts=artifacts)
-        self.layout.publish_latest()
+        self.layout.set_status(
+            "succeeded",
+            artifacts=artifacts,
+            final_stage=final_stage,
+            optimizer_iteration=optimizer_iteration,
+        )
+        try:
+            self.layout.publish_latest()
+        except Exception as error:
+            latest_error = self.layout.logs / "latest_publish_error.txt"
+            try:
+                latest_error.write_text(str(error) + "\n", encoding="utf-8")
+            except OSError:
+                pass
+            SemanticWarning(
+                "run succeeded but outputs/latest was not updated: {}".format(
+                    error
+                )
+            )
+        self._cleanup_success_work()
         print("\nAll Done!!!")
+
+    def _cleanup_success_work(self):
+        try:
+            for candidate in (
+                self.layout.recovery,
+                self.layout.semantic_work,
+                self.layout.stages,
+                self.layout.cache,
+            ):
+                if candidate.exists():
+                    shutil.rmtree(candidate)
+            if self.layout.video_frames.exists():
+                shutil.rmtree(self.layout.video_frames)
+            if self.layout.work.exists() and not any(self.layout.work.iterdir()):
+                self.layout.work.rmdir()
+        except Exception as error:
+            cleanup_error = self.layout.logs / "cleanup_error.txt"
+            try:
+                cleanup_error.write_text(str(error) + "\n", encoding="utf-8")
+            except OSError:
+                pass
+            SemanticWarning(
+                "run succeeded but temporary work cleanup was incomplete: {}".format(
+                    error
+                )
+            )
 
     def _finalize_success(self):
         final_stage = int(self.DataPreProccesser.IM[-1])
@@ -3777,21 +3836,20 @@ class On_the_Fly_GS:
                     self.GaussianTrainer.args.save_final_training_state
                 ),
             ),
-            "maps": "products/maps",
             "metrics": "metrics",
             "logs": "logs",
         }
+        if self.GaussianTrainer.args.render_TDOM:
+            if not (self.layout.maps / "latest.json").is_file():
+                raise RuntimeError("requested final TDOM map was not published")
+            records["maps"] = "products/maps"
         camera_renders = self.layout.renders / "cameras"
         if self.GaussianTrainer.args.render_all_cameras:
-            rendered_cameras = sorted(camera_renders.glob("*.jpg"))
-            if not rendered_cameras:
-                raise RuntimeError(
-                    "requested per-camera renders were not published"
-                )
+            rendered_camera_count = validate_camera_render_outputs(self.layout)
             records["renders"] = {
                 "cameras": {
                     "path": camera_renders,
-                    "count": len(rendered_cameras),
+                    "count": rendered_camera_count,
                 }
             }
         progress_video = self.layout.videos / "training_progress.mp4"
@@ -3808,6 +3866,11 @@ class On_the_Fly_GS:
                 }
             }
         if self.GaussianTrainer.args.enable_semantics:
+            validate_final_semantic_outputs(
+                self.layout,
+                final_stage=final_stage,
+                require_map=bool(self.GaussianTrainer.args.render_TDOM),
+            )
             records["semantic_model"] = archive_semantic_state(self.layout)
             schema_source = (
                 Path(self.GaussianTrainer.args.semantic_data_root)
@@ -3822,22 +3885,22 @@ class On_the_Fly_GS:
                     "size_bytes": schema_destination.stat().st_size,
                     "sha256": sha256_file(schema_destination),
                 }
-        self._write_summary(final_stage)
-        for candidate in (
-            self.layout.recovery,
-            self.layout.semantic_work,
-            self.layout.stages,
-            self.layout.cache,
+        summary = self._write_summary(final_stage)
+        evaluation = summary.get("evaluation")
+        if not isinstance(evaluation, dict):
+            raise RuntimeError("final evaluation metadata is missing")
+        optimizer_iteration = evaluation.get("iteration")
+        if (
+            isinstance(optimizer_iteration, bool)
+            or not isinstance(optimizer_iteration, int)
+            or optimizer_iteration < 0
         ):
-            if candidate.exists():
-                shutil.rmtree(candidate)
-        if self.layout.video_frames.exists() and not any(
-            self.layout.video_frames.iterdir()
-        ):
-            self.layout.video_frames.rmdir()
-        if self.layout.work.exists() and not any(self.layout.work.iterdir()):
-            self.layout.work.rmdir()
-        return relative_artifact_records(self.layout, records)
+            raise RuntimeError("final optimizer iteration is invalid")
+        return (
+            relative_artifact_records(self.layout, records),
+            final_stage,
+            optimizer_iteration,
+        )
 
     def _write_summary(self, final_stage):
         summary = {"schema_version": 1, "final_stage": int(final_stage)}
@@ -3863,6 +3926,7 @@ class On_the_Fly_GS:
             with pair_path.open("r", encoding="utf-8") as stream:
                 summary["map"] = json.load(stream)
         write_json_atomic(self.layout.metrics / "summary.json", summary)
+        return summary
 
 if __name__ == "__main__":
     mp.set_start_method("spawn")
@@ -3873,17 +3937,20 @@ if __name__ == "__main__":
         Run = On_the_Fly_GS(parsed_args, parsed_lp, parsed_op, parsed_pp)
     except BaseException as error:
         if active_layout is not None and active_layout.manifest.is_file():
-            status = "interrupted" if isinstance(error, KeyboardInterrupt) else "failed"
-            failure_path = active_layout.logs / "failure.txt"
-            failure_path.parent.mkdir(parents=True, exist_ok=True)
-            with failure_path.open("w", encoding="utf-8") as stream:
-                stream.write(traceback.format_exc())
-            active_layout.set_status(
-                status,
-                failure={
-                    "type": type(error).__name__,
-                    "message": str(error),
-                    "traceback": "logs/failure.txt",
-                },
-            )
+            if active_layout.read_manifest().get("status") == "running":
+                status = (
+                    "interrupted" if isinstance(error, KeyboardInterrupt) else "failed"
+                )
+                failure_path = active_layout.logs / "failure.txt"
+                failure_path.parent.mkdir(parents=True, exist_ok=True)
+                with failure_path.open("w", encoding="utf-8") as stream:
+                    stream.write(traceback.format_exc())
+                active_layout.set_status(
+                    status,
+                    failure={
+                        "type": type(error).__name__,
+                        "message": str(error),
+                        "traceback": "logs/failure.txt",
+                    },
+                )
         raise

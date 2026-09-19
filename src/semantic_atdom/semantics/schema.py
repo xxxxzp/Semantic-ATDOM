@@ -10,6 +10,8 @@ from typing import Dict, Iterable, Mapping, Optional, Sequence, Tuple
 import numpy as np
 from PIL import Image
 
+from semantic_atdom.utils.image_identity import normalize_image_identity
+
 
 class SemanticSchemaError(ValueError):
     """Raised when semantic inputs violate the data contract."""
@@ -189,17 +191,12 @@ class ObservationKey:
     label_version: str
 
 
-_IMAGE_SUFFIXES = frozenset({".jpg", ".jpeg", ".png", ".tif", ".tiff"})
-
-
 def normalize_image_id(value: object) -> str:
     """Return an image identity while preserving decimal timestamp suffixes."""
-    text = str(value)
-    path = Path(text)
-    result = path.stem if path.suffix.lower() in _IMAGE_SUFFIXES else path.name
-    if not result:
-        raise SemanticSchemaError("image_id must not be empty")
-    return result
+    try:
+        return normalize_image_identity(value)
+    except ValueError as error:
+        raise SemanticSchemaError("image_id must not be empty") from error
 
 
 @dataclass(frozen=True)

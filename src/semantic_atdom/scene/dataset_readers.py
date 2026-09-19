@@ -29,18 +29,17 @@ from semantic_atdom.utils.camera_calibration import (
     rectification_valid_mask,
     rectified_pinhole_from_colmap,
 )
+from semantic_atdom.utils.image_identity import normalize_image_identity
 from semantic_atdom.scene.gaussian_model import BasicPointCloud
 import time
-from scipy.spatial import Delaunay
+from scipy.spatial import Delaunay, QhullError
 import cv2
 
 
-_IMAGE_SUFFIXES = frozenset({".jpg", ".jpeg", ".png", ".tif", ".tiff"})
-
-
 def _image_identity(value):
-    path = Path(str(value))
-    return path.stem if path.suffix.lower() in _IMAGE_SUFFIXES else path.name
+    if str(value) == "":
+        return ""
+    return normalize_image_identity(value)
 
 
 def _with_image_suffix(value, suffix):
@@ -547,14 +546,23 @@ def Get_Tri_Mask(extr, width, height, Get3D_ID=False, device='cuda', Silence=Fal
         xys[i][0] = extr.xys[IDs[i]][0]
         xys[i][1] = extr.xys[IDs[i]][1]'''
 
-    valid_mask = extr.point3D_ids != -1
+    valid_mask = (
+        (extr.point3D_ids != -1)
+        & np.isfinite(extr.xys).all(axis=1)
+        & (extr.xys[:, 0] >= 0)
+        & (extr.xys[:, 0] < width)
+        & (extr.xys[:, 1] >= 0)
+        & (extr.xys[:, 1] < height)
+    )
     xys = extr.xys[valid_mask]
     point3D_ids = extr.point3D_ids[valid_mask]
 
-    # 如果当前影像没有3维点（异常），则直接返回None
-    if xys.shape[0] <= 0:
+    # Fewer than three non-collinear points cannot define a sparse support
+    # region.  Preserve the historical sentinel but fail later at the stage
+    # boundary if every camera is unusable.
+    if xys.shape[0] < 3:
         if not Get3D_ID:
-            return torch.ones(2, dtype=torch.bool).cuda()
+            return torch.ones(2, dtype=torch.bool, device=device)
         else:
             # 后续可用 GPU 加速的数据（以 torch.Tensor 返回）
             # point3D_ids_tensor = torch.from_numpy(point3D_ids).to(device)
@@ -563,10 +571,21 @@ def Get_Tri_Mask(extr, width, height, Get3D_ID=False, device='cuda', Silence=Fal
             # xys_tensor = torch.tensor(xys, device=device)
 
             # return downsampled_mask.unsqueeze(0), point3D_ids_tensor, xys_tensor, tri
-            return torch.ones(2, dtype=torch.bool).cuda(), None, xys, None
+            return (
+                torch.ones(2, dtype=torch.bool, device=device),
+                point3D_ids,
+                xys,
+                None,
+            )
 
     # 构建 Delaunay 三角剖分
-    tri = Delaunay(xys)
+    try:
+        tri = Delaunay(xys)
+    except QhullError:
+        sentinel = torch.ones(2, dtype=torch.bool, device=device)
+        if not Get3D_ID:
+            return sentinel
+        return sentinel, point3D_ids, xys, None
 
     if not No_Key_Region:
         mask = np.zeros((height, width), dtype=np.uint8)
@@ -599,20 +618,31 @@ def Get_Tri_Mask(extr, width, height, Get3D_ID=False, device='cuda', Silence=Fal
         # return downsampled_mask.unsqueeze(0), point3D_ids_tensor, xys_tensor, tri
         return downsampled_mask.unsqueeze(0), point3D_ids, xys, tri
 
-def PointsFilter(sampled_points, mask, H_orig, W_orig, H_down, W_down, Tri_IDs=[], point3D_ids=None):
-    x_down = (sampled_points[:, 0] * W_down / W_orig).astype(int)
-    y_down = (sampled_points[:, 1] * H_down / H_orig).astype(int)
-
-    downsampled_pixel_indices = y_down * W_down + x_down
+def PointsFilter(sampled_points, mask, H_orig, W_orig, H_down, W_down, Tri_IDs=None, point3D_ids=None):
+    sampled_points = np.asarray(sampled_points)
+    x_scaled = sampled_points[:, 0] * W_down / W_orig
+    y_scaled = sampled_points[:, 1] * H_down / H_orig
+    in_bounds = (
+        np.isfinite(sampled_points).all(axis=1)
+        & (x_scaled >= 0)
+        & (x_scaled < W_down)
+        & (y_scaled >= 0)
+        & (y_scaled < H_down)
+    )
+    x_down = x_scaled[in_bounds].astype(int)
+    y_down = y_scaled[in_bounds].astype(int)
+    bounded_indices = y_down * W_down + x_down
 
     mask_flat = mask.flatten()
-
-    valid_mask = mask_flat[downsampled_pixel_indices]
+    selected_mask = np.asarray(mask_flat[bounded_indices], dtype=bool)
+    valid_mask = np.zeros(sampled_points.shape[0], dtype=bool)
+    valid_mask[np.flatnonzero(in_bounds)] = selected_mask
 
     # 筛选原始二维点
     selected_points = sampled_points[valid_mask]
 
-    if Tri_IDs != []:
+    has_tri_ids = Tri_IDs is not None and len(Tri_IDs) > 0
+    if has_tri_ids:
         Tri_IDs = np.array(Tri_IDs)
         Tri_IDs = Tri_IDs[valid_mask]
         Tri_IDs = list(Tri_IDs)
@@ -620,7 +650,7 @@ def PointsFilter(sampled_points, mask, H_orig, W_orig, H_down, W_down, Tri_IDs=[
     if point3D_ids is not None:
         point3D_ids = point3D_ids[valid_mask]
 
-    if Tri_IDs != []:
+    if has_tri_ids:
         return selected_points, Tri_IDs
     else:
         return selected_points, point3D_ids
@@ -770,7 +800,27 @@ def SingleImage_readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder,
             )
             if calibration.requires_rectification:
                 xys = rectify_points(xys, calibration)
-                tri = Delaunay(xys)
+                valid_rectified = (
+                    np.isfinite(xys).all(axis=1)
+                    & (xys[:, 0] >= 0)
+                    & (xys[:, 0] < width)
+                    & (xys[:, 1] >= 0)
+                    & (xys[:, 1] < height)
+                )
+                xys = xys[valid_rectified]
+                if point3D_ids is not None:
+                    point3D_ids = point3D_ids[valid_rectified]
+                if xys.shape[0] < 3:
+                    tri = None
+                else:
+                    try:
+                        tri = Delaunay(xys)
+                    except QhullError:
+                        tri = None
+                if tri is None:
+                    sampling_mask = torch.ones(
+                        2, dtype=torch.bool, device=sampling_mask.device
+                    )
             point3D_ids_list[image_name] = point3D_ids
             xys_list[image_name] = xys
             tri_list[image_name] = tri
@@ -995,6 +1045,21 @@ def SingleImage_readColmapSceneInfo_Part2(path, train_cam_infos, test_cam_infos,
         Diary.write(f"read_points3D_ID_binary: {time2 - time1}s\n")
 
         for key in list(point3D_ids_list.keys()):
+            # A camera with fewer than three valid, non-collinear sparse
+            # observations has no triangulation.  It remains part of the
+            # scene for full-image evaluation, but cannot seed new Gaussians.
+            if tri_list.get(key) is None:
+                if not Silence:
+                    print(
+                        f"Skip sparse Gaussian initialization for {key}: "
+                        "no usable triangulation"
+                    )
+                Diary.write(
+                    f"Skip sparse Gaussian initialization for {key}: "
+                    "no usable triangulation\n"
+                )
+                continue
+
             # 依据三角网进行采样
             time1 = time.time()
             sampled_points, Tri_IDs = SamplePointsFromTri(xys_list[key], tri_list[key], points_per_triangle)

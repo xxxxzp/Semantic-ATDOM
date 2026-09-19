@@ -1,9 +1,9 @@
 # 渐进式训练性能与显存瓶颈记录
 
-状态：已观测；首个显存失败已修复并通过小范围验收  
-记录日期：2026-09-17  
-观测分支：`feature/uavscenes-interval5-amtown01`  
-观测提交：`ac275d00a158afba535fac52c67bc317ffcb536b`  
+状态：已观测；首个显存失败已修复并通过小范围验收
+记录日期：2026-09-17
+观测分支：`feature/uavscenes-interval5-amtown01`
+观测提交：`ac275d00a158afba535fac52c67bc317ffcb536b`
 
 ## 1. 问题边界
 

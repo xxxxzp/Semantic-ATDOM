@@ -56,6 +56,7 @@ class DatasetPreflightTests(unittest.TestCase):
         stage_names = {
             1: ("000001.jpg",),
             2: ("000001.jpg", "000003.jpg"),
+            3: ("000001.jpg", "000003.jpg"),
         }
         for stage, names in stage_names.items():
             sparse = dataset / str(stage) / "sparse" / "0"
@@ -225,12 +226,24 @@ class DatasetPreflightTests(unittest.TestCase):
                     end_stage=2,
                 )
 
+            with self.assertRaisesRegex(
+                SemanticSchemaError, "final overlap snapshot"
+            ):
+                run_dataset_preflight(
+                    dataset_root=dataset,
+                    semantic_data_root=semantic_data,
+                    output_root=root / "incomplete-union-output",
+                    start_stage=1,
+                    end_stage=2,
+                    identity_policy="persistent_union",
+                )
+
             result = run_dataset_preflight(
                 dataset_root=dataset,
                 semantic_data_root=semantic_data,
                 output_root=root / "union-output",
                 start_stage=1,
-                end_stage=2,
+                end_stage=3,
                 identity_policy="persistent_union",
             )
             report = json.loads(result.report_path.read_text(encoding="utf-8"))
@@ -266,6 +279,34 @@ class DatasetPreflightTests(unittest.TestCase):
                 require_complete_initial_snapshot=False,
             )
             self.assertEqual(result.final_image_ids, ("000001", "000003"))
+
+    def test_tdom_class_limit_fails_before_training(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            dataset, semantic_data = self._fixture(root)
+            class_spec_path = semantic_data / "semantic" / "class_spec.json"
+            payload = json.loads(class_spec_path.read_text(encoding="utf-8"))
+            payload["classes"] = [
+                {
+                    "id": class_id,
+                    "name": "class-{}".format(class_id),
+                    "color": [class_id, class_id, class_id],
+                }
+                for class_id in range(16)
+            ]
+            class_spec_path.write_text(json.dumps(payload), encoding="utf-8")
+
+            with self.assertRaisesRegex(
+                SemanticSchemaError, "supports at most 15 classes"
+            ):
+                run_dataset_preflight(
+                    dataset_root=dataset,
+                    semantic_data_root=semantic_data,
+                    output_root=root / "output",
+                    start_stage=1,
+                    end_stage=2,
+                    max_semantic_tdom_classes=15,
+                )
 
 
 if __name__ == "__main__":

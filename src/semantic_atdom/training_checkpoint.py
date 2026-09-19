@@ -19,21 +19,28 @@ from semantic_atdom.utils.general_utils import PILtoTorch
 CHECKPOINT_SCHEMA_VERSION = 2
 
 
-def checkpoint_stage_from_path(path: Path) -> int:
+def checkpoint_stage_from_path(path: Path, payload=None) -> int:
     path = Path(path)
     candidates = (path.parent.name, path.stem)
     for candidate in candidates:
         match = re.fullmatch(r"(?:chkpnt)?(\d+)", candidate)
         if match is not None:
             return int(match.group(1))
-    metadata_path = path.with_suffix(path.suffix + ".json")
-    if metadata_path.is_file():
+    # A rolling checkpoint's torch payload is the atomic authority.  Its JSON
+    # sidecar is informational and may legitimately lag if power is lost after
+    # replacing the payload but before replacing the sidecar.
+    if payload is None and path.is_file():
         try:
-            with metadata_path.open("r", encoding="utf-8") as stream:
-                payload = json.load(stream)
-            if payload.get("schema_version") == CHECKPOINT_SCHEMA_VERSION:
-                return int(payload["stage"])
-        except (OSError, ValueError, KeyError, TypeError):
+            payload = torch.load(path, map_location="cpu", weights_only=False)
+        except (OSError, RuntimeError, ValueError, TypeError):
+            payload = None
+    if (
+        isinstance(payload, dict)
+        and payload.get("schema_version") == CHECKPOINT_SCHEMA_VERSION
+    ):
+        try:
+            return int(payload["stage"])
+        except (ValueError, KeyError, TypeError):
             pass
     raise ValueError("cannot infer progressive stage from checkpoint path {}".format(path))
 
@@ -165,11 +172,17 @@ def save_training_checkpoint(path: Path, payload) -> None:
         stream.write("\n")
         stream.flush()
         os.fsync(stream.fileno())
-    os.replace(metadata_temporary, metadata_path)
+    try:
+        os.replace(metadata_temporary, metadata_path)
+    except Exception:
+        metadata_temporary.unlink(missing_ok=True)
+        raise
 
 
 def load_training_checkpoint(path: Path, *, map_location="cpu"):
-    payload = torch.load(Path(path), map_location=map_location)
+    payload = torch.load(
+        Path(path), map_location=map_location, weights_only=False
+    )
     if not isinstance(payload, dict) or payload.get("schema_version") != CHECKPOINT_SCHEMA_VERSION:
         raise ValueError(
             "checkpoint is not a resumable Semantic A-TDOM v{} checkpoint".format(
@@ -190,7 +203,7 @@ def load_training_checkpoint(path: Path, *, map_location="cpu"):
     missing = sorted(required - set(payload))
     if missing:
         raise ValueError("checkpoint is missing fields: {}".format(missing))
-    inferred = checkpoint_stage_from_path(path)
+    inferred = checkpoint_stage_from_path(path, payload=payload)
     if int(payload["stage"]) != inferred:
         raise ValueError("checkpoint stage does not match its path")
     return payload

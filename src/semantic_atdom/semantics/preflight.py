@@ -14,6 +14,7 @@ from PIL import Image
 
 from semantic_atdom.semantics.orchestrator import AcquisitionOverlap
 from semantic_atdom.semantics.schema import SemanticDataset, SemanticSchemaError, sha256_file
+from semantic_atdom.utils.image_identity import normalize_image_identity
 
 
 _IMAGE_ID = re.compile(r"^[^/\\\x00]+$")
@@ -65,7 +66,7 @@ def _read_colmap_image_names(path: Path) -> Tuple[str, ...]:
                     raise ValueError("truncated points2D count")
                 point_count = struct.unpack("<Q", points_raw)[0]
                 stream.seek(24 * point_count, os.SEEK_CUR)
-                image_id = Path(name).stem
+                image_id = normalize_image_identity(name)
                 if _IMAGE_ID.fullmatch(image_id) is None:
                     raise ValueError("image name has an invalid stem: {}".format(name))
                 names.append((image_id, name))
@@ -135,6 +136,7 @@ def run_dataset_preflight(
     image_folder_path: Optional[Path] = None,
     identity_policy: str = "strict_cumulative",
     require_complete_initial_snapshot: bool = True,
+    max_semantic_tdom_classes: Optional[int] = None,
 ) -> DatasetPreflightResult:
     """Validate selected stages and semantic observations without writing inputs."""
     if semantic_data_root is None or not str(semantic_data_root).strip():
@@ -272,9 +274,30 @@ def run_dataset_preflight(
         else:
             persistent_names = current_names
 
+    if identity_policy == "persistent_union" and previous_ids != seen_ids:
+        missing = sorted(seen_ids - previous_ids)
+        raise SemanticSchemaError(
+            "final overlap snapshot omits persistent identities {}; an exact "
+            "final rebuild requires the final overlap graph to contain every "
+            "identity observed in the selected stage range".format(missing)
+        )
+
     final_names = tuple(persistent_names.items())
 
     semantic_dataset = SemanticDataset(semantic_data_root)
+    if (
+        max_semantic_tdom_classes is not None
+        and semantic_dataset.class_spec.num_classes
+        > int(max_semantic_tdom_classes)
+    ):
+        raise SemanticSchemaError(
+            "semantic TDOM supports at most {} classes, but the selected "
+            "class_spec defines {}; disable TDOM outputs for fusion-only "
+            "training or provide a supported class mapping".format(
+                int(max_semantic_tdom_classes),
+                semantic_dataset.class_spec.num_classes,
+            )
+        )
     class_counts = np.zeros(semantic_dataset.class_spec.num_classes, dtype=np.int64)
     ignore_count = 0
     source_verified = []

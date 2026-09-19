@@ -101,7 +101,10 @@ except ImportError:
 
 WARNED = False
 
+# Maximum encoded width.  Portrait map footprints use a narrower, content-fit
+# canvas so the paired maps are not separated by empty half-panel padding.
 TRAINING_PROGRESS_WIDTH = 3840
+TRAINING_PROGRESS_MIN_WIDTH = 1280
 TRAINING_PROGRESS_HEIGHT = 1080
 TRAINING_PROGRESS_MAP_DOWNSAMPLE = 8
 TRAINING_PROGRESS_UPDATE_INTERVAL = 10
@@ -3142,54 +3145,139 @@ class DataSaver(mp.Process):
             int(value.get("max_y", value.get("tile_max_y"))),
         )
 
-    def _draw_legend(self, canvas, panel_x, map_top):
+    def _draw_legend(self, canvas, panel_x, map_top, map_height):
         if not self.LegendEntries:
             return
-        row_height = 23
         width = 310
-        height = 18 + row_height * len(self.LegendEntries)
+        box_x = panel_x + 12
+        box_top = int(map_top)
+        box_bottom = min(canvas.shape[0] - 23, box_top + int(map_height))
+        if box_bottom <= box_top:
+            return
         overlay = canvas.copy()
         cv2.rectangle(
             overlay,
-            (panel_x + 12, map_top + 12),
-            (panel_x + 12 + width, map_top + 12 + height),
+            (box_x, box_top),
+            (box_x + width, box_bottom),
             (0, 0, 0),
             -1,
         )
         cv2.addWeighted(overlay, 0.72, canvas, 0.28, 0, canvas)
+        cv2.rectangle(
+            canvas,
+            (box_x, box_top),
+            (box_x + width, box_bottom),
+            (72, 72, 72),
+            1,
+        )
+        cv2.putText(
+            canvas,
+            "Land-cover classes",
+            (box_x + 16, box_top + 34),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.58,
+            (235, 235, 235),
+            1,
+            cv2.LINE_AA,
+        )
+        content_top = box_top + 62
+        content_bottom = box_bottom - 28
+        count = len(self.LegendEntries)
+        if count == 1:
+            row_step = 0
+            first_y = (content_top + content_bottom) // 2
+        else:
+            row_step = min(
+                72,
+                max(36, (content_bottom - content_top) // (count - 1)),
+            )
+            used_height = row_step * (count - 1)
+            first_y = content_top + (
+                content_bottom - content_top - used_height
+            ) // 2
         for index, item in enumerate(self.LegendEntries):
-            y = map_top + 33 + index * row_height
+            y = first_y + index * row_step
             color = tuple(reversed(tuple(int(v) for v in item["color"])))
             cv2.rectangle(
                 canvas,
-                (panel_x + 24, y - 12),
-                (panel_x + 40, y + 4),
+                (box_x + 16, y - 12),
+                (box_x + 40, y + 12),
                 color,
                 -1,
             )
             cv2.putText(
                 canvas,
                 "{}  {}".format(item["id"], item["name"]),
-                (panel_x + 50, y + 2),
+                (box_x + 52, y + 6),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                0.48,
+                0.55,
                 (235, 235, 235),
                 1,
                 cv2.LINE_AA,
             )
 
-    def _compose_training_progress_frame(
-        self, record, global_window, total_frames
-    ):
-        width = TRAINING_PROGRESS_WIDTH
-        height = TRAINING_PROGRESS_HEIGHT
+    def _training_progress_layout(self, record, global_window):
+        """Fit two aligned maps and an optional legend into a compact canvas."""
         margin = 24
         gutter = 24
         header_height = 78
         footer_height = 22
-        panel_width = (width - 2 * margin - gutter) // 2
-        map_height = height - header_height - footer_height
-        right_panel_x = margin + panel_width + gutter
+        legend_width = 334 if self.LegendEntries else 0
+        map_height = TRAINING_PROGRESS_HEIGHT - header_height - footer_height
+
+        grid = record["grid"]
+        factor = int(record["map_downsample"])
+        tile_width = int(grid["tile_shape"][0]) // factor
+        tile_height = int(grid["tile_shape"][1]) // factor
+        global_min_x, global_max_x, global_min_y, global_max_y = global_window
+        global_width = (global_max_x - global_min_x + 1) * tile_width
+        global_height = (global_max_y - global_min_y + 1) * tile_height
+        if global_width <= 0 or global_height <= 0:
+            raise ValueError("training progress global map extent must be positive")
+
+        max_map_width = (
+            TRAINING_PROGRESS_WIDTH
+            - 2 * margin
+            - gutter
+            - legend_width
+        ) // 2
+        scale = min(max_map_width / global_width, map_height / global_height)
+        global_display_width = max(1, int(round(global_width * scale)))
+        global_display_height = max(1, int(round(global_height * scale)))
+
+        content_width = (
+            2 * global_display_width + gutter + legend_width
+        )
+        width = max(TRAINING_PROGRESS_MIN_WIDTH, content_width + 2 * margin)
+        width = min(TRAINING_PROGRESS_WIDTH, width)
+        if width % 2:
+            width += 1
+        content_x = (width - content_width) // 2
+        rgb_global_x = content_x
+        semantic_global_x = rgb_global_x + global_display_width + gutter
+        global_y = header_height + (map_height - global_display_height) // 2
+        return {
+            "width": width,
+            "height": TRAINING_PROGRESS_HEIGHT,
+            "scale": scale,
+            "header_height": header_height,
+            "map_height": map_height,
+            "rgb_global_x": rgb_global_x,
+            "semantic_global_x": semantic_global_x,
+            "legend_x": semantic_global_x + global_display_width,
+            "global_y": global_y,
+            "global_display_width": global_display_width,
+            "global_display_height": global_display_height,
+            "tile_width": tile_width,
+            "tile_height": tile_height,
+        }
+
+    def _compose_training_progress_frame(
+        self, record, global_window, total_frames, layout
+    ):
+        width = int(layout["width"])
+        height = int(layout["height"])
+        header_height = int(layout["header_height"])
         canvas = np.zeros((height, width, 3), dtype=np.uint8)
         root = Path(record["_root"])
         rgb = cv2.imread(str(root / record["rgb_frame"]), cv2.IMREAD_COLOR)
@@ -3201,18 +3289,16 @@ class DataSaver(mp.Process):
                 "training progress source frames are missing or misaligned"
             )
 
-        grid = record["grid"]
         window = record["window"]
+        grid = record["grid"]
         factor = int(record["map_downsample"])
-        tile_width = int(grid["tile_shape"][0]) // factor
-        tile_height = int(grid["tile_shape"][1]) // factor
+        tile_width = int(layout["tile_width"])
+        tile_height = int(layout["tile_height"])
         global_min_x, global_max_x, global_min_y, global_max_y = global_window
         window_min_x, window_max_x, window_min_y, window_max_y = (
             self._tile_indices(window)
         )
-        global_width = (global_max_x - global_min_x + 1) * tile_width
-        global_height = (global_max_y - global_min_y + 1) * tile_height
-        scale = min(panel_width / global_width, map_height / global_height)
+        scale = float(layout["scale"])
         display_width = max(1, int(round(rgb.shape[1] * scale)))
         display_height = max(1, int(round(rgb.shape[0] * scale)))
         interpolation = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_NEAREST
@@ -3222,10 +3308,8 @@ class DataSaver(mp.Process):
             (display_width, display_height),
             interpolation=cv2.INTER_NEAREST,
         )
-        global_display_width = int(round(global_width * scale))
-        global_display_height = int(round(global_height * scale))
-        base_x = margin + (panel_width - global_display_width) // 2
-        base_y = header_height + (map_height - global_display_height) // 2
+        base_x = int(layout["rgb_global_x"])
+        base_y = int(layout["global_y"])
         if int(record["column_plane_direction"]) > 0:
             offset_x = (window_min_x - global_min_x) * tile_width
         else:
@@ -3237,7 +3321,7 @@ class DataSaver(mp.Process):
         offset_x = int(round(offset_x * scale))
         offset_y = int(round(offset_y * scale))
         rgb_x, rgb_y = base_x + offset_x, base_y + offset_y
-        sem_x = right_panel_x + (panel_width - global_display_width) // 2 + offset_x
+        sem_x = int(layout["semantic_global_x"]) + offset_x
         canvas[rgb_y:rgb_y + display_height, rgb_x:rgb_x + display_width] = rgb
         canvas[rgb_y:rgb_y + display_height, sem_x:sem_x + display_width] = semantic
         for x in (rgb_x, sem_x):
@@ -3275,7 +3359,7 @@ class DataSaver(mp.Process):
         pixels_per_unit = scale / gsd_x
         scale_units = self._nice_scale_length(160.0 / pixels_per_unit)
         scale_pixels = max(1, int(round(scale_units * pixels_per_unit)))
-        bar_x = margin + 24
+        bar_x = int(layout["rgb_global_x"]) + 24
         bar_y = height - 38
         cv2.line(canvas, (bar_x, bar_y), (bar_x + scale_pixels, bar_y), (255, 255, 255), 3)
         cv2.putText(
@@ -3288,7 +3372,11 @@ class DataSaver(mp.Process):
             1,
             cv2.LINE_AA,
         )
-        arrow_x = margin + panel_width - 46
+        arrow_x = (
+            int(layout["rgb_global_x"])
+            + int(layout["global_display_width"])
+            - 46
+        )
         arrow_y = height - 38
         arrow_delta = 30 if int(record["row_plane_direction"]) > 0 else -30
         cv2.arrowedLine(
@@ -3325,7 +3413,7 @@ class DataSaver(mp.Process):
         cv2.putText(
             canvas,
             title,
-            (margin, 31),
+            (24, 31),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.63,
             (235, 235, 235),
@@ -3335,7 +3423,7 @@ class DataSaver(mp.Process):
         cv2.putText(
             canvas,
             "RGB TDOM + flight trajectory",
-            (margin, 64),
+            (int(layout["rgb_global_x"]), 64),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.70,
             (255, 255, 255),
@@ -3345,14 +3433,19 @@ class DataSaver(mp.Process):
         cv2.putText(
             canvas,
             "Semantic TDOM",
-            (right_panel_x, 64),
+            (int(layout["semantic_global_x"]), 64),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.70,
             (255, 255, 255),
             2,
             cv2.LINE_AA,
         )
-        self._draw_legend(canvas, right_panel_x, header_height)
+        self._draw_legend(
+            canvas,
+            int(layout["legend_x"]),
+            int(layout["global_y"]),
+            int(layout["global_display_height"]),
+        )
         progress_width = int(round(width * float(record["progress"])))
         cv2.rectangle(canvas, (0, height - 6), (progress_width, height - 1), (0, 180, 255), -1)
         return canvas
@@ -3380,6 +3473,9 @@ class DataSaver(mp.Process):
             min(item[2] for item in tile_windows),
             max(item[3] for item in tile_windows),
         )
+        layout = self._training_progress_layout(records[-1], global_window)
+        video_width = int(layout["width"])
+        video_height = int(layout["height"])
         output_root = Path(self.VideoRootPath)
         output_root.mkdir(parents=True, exist_ok=True)
         output_path = output_root / "training_progress.mp4"
@@ -3387,7 +3483,7 @@ class DataSaver(mp.Process):
         command = [
             "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
             "-f", "rawvideo", "-pix_fmt", "bgr24",
-            "-s", "{}x{}".format(TRAINING_PROGRESS_WIDTH, TRAINING_PROGRESS_HEIGHT),
+            "-s", "{}x{}".format(video_width, video_height),
             "-r", str(float(self.TrainingProgressFPS)), "-i", "-",
             "-an", "-c:v", "libx264", "-preset", "medium", "-crf", "18",
             "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(temporary),
@@ -3396,7 +3492,7 @@ class DataSaver(mp.Process):
         try:
             for record in records:
                 frame = self._compose_training_progress_frame(
-                    record, global_window, len(records)
+                    record, global_window, len(records), layout
                 )
                 process.stdin.write(frame.tobytes())
             process.stdin.close()
@@ -3425,8 +3521,8 @@ class DataSaver(mp.Process):
         )["streams"][0]
         if (
             probe.get("codec_name") != "h264"
-            or int(probe.get("width", 0)) != TRAINING_PROGRESS_WIDTH
-            or int(probe.get("height", 0)) != TRAINING_PROGRESS_HEIGHT
+            or int(probe.get("width", 0)) != video_width
+            or int(probe.get("height", 0)) != video_height
             or int(probe.get("nb_frames", 0)) != len(records)
         ):
             temporary.unlink(missing_ok=True)
@@ -3447,8 +3543,8 @@ class DataSaver(mp.Process):
                 "schema_version": 1,
                 "video": "videos/training_progress.mp4",
                 "codec": "h264",
-                "width": TRAINING_PROGRESS_WIDTH,
-                "height": TRAINING_PROGRESS_HEIGHT,
+                "width": video_width,
+                "height": video_height,
                 "fps": float(self.TrainingProgressFPS),
                 "frame_count": len(records),
                 "global_tile_window": {

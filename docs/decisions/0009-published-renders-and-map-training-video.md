@@ -44,12 +44,16 @@ re-centered independently per frame.
 The renderer uses a video-only TDOM camera with a constant eight-times coarser
 ground sampling distance than the publication map.  This bounds render and
 IPC cost without changing the spatial relationship between frames.  The
-published H.264 video is 3840x1080 at 4 FPS by default.  Its left panel contains
-the RGB TDOM, accumulated flight trajectory, current position, scale bar, and
-local `+Y` direction.  The right panel contains the unobscured hard-class
-Semantic TDOM and the active run-schema legend.  Unknown and unobserved pixels
-are black.  A local-axis label is used instead of claiming geographic north
-when the grid has no CRS.
+published H.264 video is 1080 pixels high, up to 3840 pixels wide, and 4 FPS by
+default.  Its width is fitted once from the final global map aspect ratio and
+remains fixed for the complete video.  The two maps share one scale and have a
+24-pixel gutter instead of being centered independently in two fixed-width
+half canvases.  Its left panel contains the RGB TDOM, accumulated flight
+trajectory, current position, scale bar, and local `+Y` direction.  The right
+panel contains the unobscured hard-class Semantic TDOM.  A separate legend
+column beside it spans the map height and distributes the active run-schema
+classes vertically.  Unknown and unobserved pixels are black.  A local-axis
+label is used instead of claiming geographic north when the grid has no CRS.
 
 Frame selection reserves one frame for final refinement and distributes the
 remaining target frame count uniformly from the initialization boundary

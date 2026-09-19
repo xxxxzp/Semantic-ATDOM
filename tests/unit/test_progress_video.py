@@ -35,7 +35,16 @@ class ProgressVideoTests(unittest.TestCase):
         return saver
 
     @staticmethod
-    def _metadata(stage, phase, min_x, max_x, frame_width):
+    def _metadata(
+        stage,
+        phase,
+        min_x,
+        max_x,
+        frame_width,
+        min_y=0,
+        max_y=0,
+        frame_height=64,
+    ):
         return {
             "schema_version": 1,
             "stage": stage,
@@ -55,12 +64,17 @@ class ProgressVideoTests(unittest.TestCase):
                 "tile_indices": {
                     "min_x": min_x,
                     "max_x": max_x,
-                    "min_y": 0,
-                    "max_y": 0,
+                    "min_y": min_y,
+                    "max_y": max_y,
                 },
                 "width_pixels": frame_width * 8,
-                "height_pixels": 512,
-                "plane_bounds": [float(min_x), float(max_x + 1), 0.0, 1.0],
+                "height_pixels": frame_height * 8,
+                "plane_bounds": [
+                    float(min_x),
+                    float(max_x + 1),
+                    float(min_y),
+                    float(max_y + 1),
+                ],
             },
             "grid": {
                 "grid_id": "grid-a",
@@ -87,6 +101,28 @@ class ProgressVideoTests(unittest.TestCase):
 
             self.assertFalse(Path(saver.SaveDirRootPath).exists())
             self.assertFalse((Path(directory) / "videos").exists())
+
+    def test_class_legend_uses_the_available_map_height(self):
+        with TemporaryDirectory() as directory:
+            saver = self._saver(directory)
+            saver.LegendEntries = [
+                {
+                    "id": index,
+                    "name": "class-{}".format(index),
+                    "color": [255, 32 + index * 8, 16],
+                }
+                for index in range(8)
+            ]
+            canvas = np.zeros((1080, 360, 3), dtype=np.uint8)
+
+            saver._draw_legend(canvas, 0, 78, 980)
+
+            colored_rows = np.where(canvas[:, :, 2] > 200)[0]
+            self.assertGreater(colored_rows.size, 0)
+            self.assertGreater(
+                int(colored_rows.max()) - int(colored_rows.min()),
+                450,
+            )
 
     def test_progress_frame_uses_striped_rgb_and_releases_before_semantics(self):
         trainer = object.__new__(GaussianTrainer)
@@ -165,8 +201,8 @@ class ProgressVideoTests(unittest.TestCase):
             saver = self._saver(directory)
             first_rgb = np.full((64, 64, 3), [30, 60, 90], dtype=np.uint8)
             first_semantic = np.full((64, 64, 3), [119, 11, 32], dtype=np.uint8)
-            second_rgb = np.full((64, 128, 3), [90, 120, 150], dtype=np.uint8)
-            second_semantic = np.full((64, 128, 3), [0, 80, 100], dtype=np.uint8)
+            second_rgb = np.full((128, 64, 3), [90, 120, 150], dtype=np.uint8)
+            second_semantic = np.full((128, 64, 3), [0, 80, 100], dtype=np.uint8)
             saver.SaveTrainingProgress(
                 first_rgb,
                 first_semantic,
@@ -175,7 +211,16 @@ class ProgressVideoTests(unittest.TestCase):
             saver.SaveTrainingProgress(
                 second_rgb,
                 second_semantic,
-                self._metadata(2, "final_refinement", 0, 1, 128),
+                self._metadata(
+                    2,
+                    "final_refinement",
+                    0,
+                    0,
+                    64,
+                    min_y=0,
+                    max_y=1,
+                    frame_height=128,
+                ),
             )
 
             saver.GetDemo()
@@ -184,24 +229,41 @@ class ProgressVideoTests(unittest.TestCase):
             capture = cv2.VideoCapture(str(video))
             self.assertTrue(capture.isOpened())
             self.assertEqual(int(capture.get(cv2.CAP_PROP_FRAME_COUNT)), 2)
-            self.assertEqual(
-                int(capture.get(cv2.CAP_PROP_FRAME_WIDTH)),
-                TRAINING_PROGRESS_WIDTH,
-            )
+            video_width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
+            self.assertLess(video_width, TRAINING_PROGRESS_WIDTH)
             self.assertEqual(
                 int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT)),
                 TRAINING_PROGRESS_HEIGHT,
             )
             ok, first = capture.read()
+            ok_final, final = capture.read()
             capture.release()
             self.assertTrue(ok)
+            self.assertTrue(ok_final)
             self.assertGreater(float(first.mean()), 1.0)
+            rgb_mask = (
+                (final[:, :, 0] > 130)
+                & (final[:, :, 1] > 100)
+                & (final[:, :, 2] > 70)
+            )
+            semantic_mask = (
+                (final[:, :, 0] > 80)
+                & (final[:, :, 1] > 60)
+                & (final[:, :, 2] < 30)
+            )
+            rgb_x = np.where(rgb_mask)[1]
+            semantic_x = np.where(semantic_mask)[1]
+            self.assertGreater(rgb_x.size, 1000)
+            self.assertGreater(semantic_x.size, 1000)
+            map_gap = int(semantic_x.min()) - int(rgb_x.max()) - 1
+            self.assertLessEqual(map_gap, 32)
             self.assertFalse(Path(saver.TrainingProgressFramePath).exists())
 
             metrics = json.loads(
                 (Path(directory) / "metrics" / "training_progress.json").read_text()
             )
             self.assertEqual(metrics["codec"], "h264")
+            self.assertEqual(metrics["width"], video_width)
             self.assertEqual(metrics["frame_count"], 2)
             self.assertEqual(metrics["frames"][-1]["phase"], "final_refinement")
             self.assertEqual(

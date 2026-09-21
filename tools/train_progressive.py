@@ -1543,16 +1543,6 @@ class GaussianTrainer(mp.Process):
                     self.args.semantic_tdom_min_absolute_support
                 ),
                 min_support_ratio=self.args.semantic_tdom_min_support_ratio,
-                min_margin=self.args.semantic_tdom_min_margin,
-                min_top1_probability=(
-                    self.args.semantic_tdom_min_top1_probability
-                ),
-                max_normalized_entropy=(
-                    self.args.semantic_tdom_max_normalized_entropy
-                ),
-                max_group_disagreement=(
-                    self.args.semantic_tdom_max_group_disagreement
-                ),
                 render_tile_rows=(
                     self.args.semantic_tdom_render_tile_rows
                 ),
@@ -1587,6 +1577,12 @@ class GaussianTrainer(mp.Process):
                 resume=not force_fresh,
                 final_authoritative_complete=(
                     self.args.semantic_authoritative_exact_complete
+                ),
+                preflight_report_path=getattr(
+                    self.args, "dataset_preflight_path", None
+                ),
+                preflight_report_sha256=getattr(
+                    self.args, "dataset_preflight_sha256", None
                 ),
             )
             self.gaussians.set_topology_observer(

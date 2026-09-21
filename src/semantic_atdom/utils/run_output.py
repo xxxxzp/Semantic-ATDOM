@@ -14,6 +14,10 @@ import shutil
 import subprocess
 from typing import Any, Dict, Mapping, Optional
 
+from semantic_atdom.utils.atomic_io import (
+    write_json_atomic as _write_json_atomic,
+)
+
 
 RUN_OUTPUT_SCHEMA_VERSION = 2
 
@@ -35,21 +39,7 @@ def _json_value(value: Any) -> Any:
 
 
 def write_json_atomic(path: Path, payload: Mapping[str, Any]) -> None:
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(path.name + ".tmp")
-    with temporary.open("w", encoding="utf-8") as stream:
-        json.dump(
-            _json_value(payload),
-            stream,
-            ensure_ascii=False,
-            indent=2,
-            sort_keys=True,
-        )
-        stream.write("\n")
-        stream.flush()
-        os.fsync(stream.fileno())
-    os.replace(temporary, path)
+    _write_json_atomic(path, _json_value(payload))
 
 
 def sha256_file(path: Path) -> str:

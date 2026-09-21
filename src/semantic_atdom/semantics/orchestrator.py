@@ -2,8 +2,6 @@
 
 from dataclasses import dataclass, replace
 from concurrent.futures import ThreadPoolExecutor
-from decimal import Decimal, InvalidOperation
-import io
 import json
 import math
 import os
@@ -21,6 +19,15 @@ from semantic_atdom.semantics.cuda_observation import (
 )
 from semantic_atdom.semantics.reference import aggregate_observation_group
 from semantic_atdom.semantics.rebuild import FinalSemanticRebuilder
+from semantic_atdom.semantics.input_binding import (
+    FinalPreflightBinding,
+    validate_final_preflight_binding,
+)
+from semantic_atdom.semantics.inputs import (
+    AcquisitionOverlap,
+    acquisition_key as _acquisition_key,
+    image_id as _image_id,
+)
 from semantic_atdom.semantics.schema import (
     LedgerEntry,
     SemanticClassSpec,
@@ -28,7 +35,6 @@ from semantic_atdom.semantics.schema import (
     SemanticLedger,
     SemanticObservation,
     SemanticSchemaError,
-    normalize_image_id,
     sha256_file,
 )
 from semantic_atdom.semantics.state import SemanticGaussianState
@@ -51,43 +57,7 @@ from semantic_atdom.semantics.tdom import (
 )
 from semantic_atdom.utils.image_utils import tdom_to_uint8
 from semantic_atdom.utils.camera_calibration import rectify_array
-
-
-def _image_id(value: object) -> str:
-    return normalize_image_id(value)
-
-
-def _acquisition_key(image_id: str):
-    try:
-        return (0, Decimal(image_id), image_id)
-    except InvalidOperation:
-        match = re.search(r"(\d+)$", image_id)
-        if match is None:
-            return (2, image_id)
-        return (1, image_id[: match.start()], int(match.group(1)), image_id)
-
-
-_INLINE_RECORD_SEPARATOR = re.compile(r"0000[1-9A-Fa-f][0-9A-Fa-f]{11}")
-
-
-def _read_exported_text(path: Path) -> str:
-    """Read vendor text exports that may contain an inline record marker.
-
-    The exporter repeats one pointer-shaped marker between records and after
-    the final record.  Discover that exact marker from the file tail before
-    replacing it.  A global regex substitution is ambiguous for zero-padded
-    image ids such as ``000014`` because the id plus the start of the marker
-    also looks like a hexadecimal pointer.
-    """
-    content = path.read_text(encoding="utf-8")
-    content_without_trailing_whitespace = content.rstrip()
-    marker_length = 16
-    if len(content_without_trailing_whitespace) < marker_length:
-        return content
-    marker = content_without_trailing_whitespace[-marker_length:]
-    if _INLINE_RECORD_SEPARATOR.fullmatch(marker) is None:
-        return content
-    return content.replace(marker, "\n")
+from semantic_atdom.utils.atomic_io import write_json_atomic
 
 
 _GEOMETRY_ATTRIBUTE_NAMES = RGB_MODEL_ATTRIBUTE_NAMES
@@ -144,6 +114,35 @@ def _estimated_pair_output_bytes(
     return pixels * bytes_per_pixel + 1024**2
 
 
+def _fit_publication_output_budget(
+    request: "MapPublicationRequest",
+    *,
+    num_classes: int,
+    max_output_bytes: int,
+) -> Tuple[Optional["MapPublicationRequest"], Optional[str]]:
+    """Apply the one deterministic output-budget policy used at both stages."""
+
+    candidate = request
+    estimated = _estimated_pair_output_bytes(candidate, num_classes)
+    config = candidate.semantic_config
+    if estimated > max_output_bytes and (
+        config.save_diagnostics or config.save_probabilities
+    ):
+        candidate = replace(
+            candidate,
+            semantic_config=replace(
+                config,
+                save_diagnostics=False,
+                save_probabilities=False,
+            ),
+            diagnostics_degraded=True,
+        )
+        estimated = _estimated_pair_output_bytes(candidate, num_classes)
+    if estimated > max_output_bytes:
+        return None, "skipped_output_budget"
+    return candidate, None
+
+
 def _tdom_alignment(camera, supplied: Optional[Mapping[str, object]] = None):
     """Return JSON-safe camera data shared by RGB and semantic TDOM products."""
     alignment = dict(supplied or {})
@@ -164,98 +163,6 @@ def _tdom_alignment(camera, supplied: Optional[Mapping[str, object]] = None):
         }
     )
     return alignment
-
-
-@dataclass(frozen=True)
-class AcquisitionOverlap:
-    """COLMAP match counts addressed by image id, never by time-order row."""
-
-    image_ids: Tuple[str, ...]
-    matrix: np.ndarray
-
-    @staticmethod
-    def input_paths(snapshot_root: Path) -> Tuple[Path, Path]:
-        snapshot_root = Path(snapshot_root)
-        legacy_root = snapshot_root / "sparse" / "0"
-        candidates = (
-            (
-                legacy_root / "imagesNames.txt",
-                legacy_root / "imageMatchMatrix.txt",
-            ),
-            (
-                snapshot_root / "match_matrix_image_name.txt",
-                snapshot_root / "match_matrix_value.txt",
-            ),
-        )
-        for names_path, matrix_path in candidates:
-            if names_path.is_file() and matrix_path.is_file():
-                return names_path, matrix_path
-        raise SemanticSchemaError(
-            "stage is missing overlap inputs; expected either {} and {}, or {} and {}".format(
-                *[str(path) for pair in candidates for path in pair]
-            )
-        )
-
-    @classmethod
-    def load(cls, snapshot_root: Path) -> "AcquisitionOverlap":
-        try:
-            names_path, matrix_path = cls.input_paths(snapshot_root)
-            raw_names = _read_exported_text(names_path)
-            names = tuple(
-                _image_id(item)
-                for item in re.split(r"[,\s]+", raw_names.strip())
-                if item
-            )
-            matrix = np.loadtxt(
-                io.StringIO(_read_exported_text(matrix_path)),
-                delimiter=",",
-                dtype=np.float64,
-            )
-        except (OSError, ValueError) as error:
-            raise SemanticSchemaError(
-                "unable to load COLMAP overlap inputs from {}: {}".format(
-                    snapshot_root, error
-                )
-            )
-        if len(names) == 0 or len(names) != len(set(names)):
-            raise SemanticSchemaError(
-                "overlap names must contain unique image ids"
-            )
-        if matrix.ndim == 0 and len(names) == 1:
-            matrix = matrix.reshape(1, 1)
-        elif matrix.ndim == 1 and len(names) == 1:
-            matrix = matrix.reshape(1, 1)
-        if matrix.shape != (len(names), len(names)):
-            raise SemanticSchemaError(
-                "overlap matrix shape {} does not match {} names".format(
-                    matrix.shape, len(names)
-                )
-            )
-        if not bool(np.isfinite(matrix).all()) or bool((matrix < 0).any()):
-            raise SemanticSchemaError(
-                "overlap matrix must contain finite non-negative counts"
-            )
-        return cls(names, matrix)
-
-    @property
-    def acquisition_order(self) -> Tuple[str, ...]:
-        return tuple(sorted(self.image_ids, key=_acquisition_key))
-
-    def normalized(self, first: str, second: str) -> float:
-        positions = {name: index for index, name in enumerate(self.image_ids)}
-        first = _image_id(first)
-        second = _image_id(second)
-        try:
-            i = positions[first]
-            j = positions[second]
-        except KeyError as error:
-            raise SemanticSchemaError(
-                "image {} is absent from overlap names".format(error.args[0])
-            )
-        denominator = min(float(self.matrix[i, i]), float(self.matrix[j, j]))
-        if denominator <= 0:
-            return 0.0
-        return min(1.0, max(0.0, float(self.matrix[i, j]) / denominator))
 
 
 @dataclass(frozen=True)
@@ -362,8 +269,25 @@ class MapPublicationRequest:
 
 @dataclass(frozen=True)
 class _PendingStageRequest:
-    args: Tuple[object, ...]
+    geometry_stage: int
+    cameras: Tuple[object, ...]
+    snapshot: object
+    snapshot_root: Path
+    final: bool
+    stage_boundaries: Tuple[str, ...]
+    publication_request: Optional[MapPublicationRequest]
     publication_status_override: Optional[str] = None
+
+    def core_args(self) -> Tuple[object, ...]:
+        return (
+            self.geometry_stage,
+            self.cameras,
+            self.snapshot,
+            self.snapshot_root,
+            self.final,
+            self.stage_boundaries,
+            self.publication_request,
+        )
 
 
 class SemanticCheckpoint(NamedTuple):
@@ -516,6 +440,11 @@ class FrozenCameraSnapshot:
 
     def __init__(self, camera):
         self.image_name = getattr(camera, "image_name", "semantic_tdom")
+        self.image_path = getattr(camera, "image_path", None)
+        # Rectification is part of the camera's pixel-domain contract.  The
+        # calibration object is immutable, so retaining it is safe while the
+        # tensor fields below must be cloned away from mutable training state.
+        self.calibration = getattr(camera, "calibration", None)
         self.image_height = camera.image_height
         self.image_width = camera.image_width
         self.FoVx = camera.FoVx
@@ -765,9 +694,11 @@ class OnlineSemanticOrchestrator:
             semantic_supports = projection.semantic_support.detach().unsqueeze(0)
         else:
             next_members = list(members) + [image_id]
-            representatives = [next_members[0]]
-            if next_members[-1] != next_members[0]:
-                representatives.append(next_members[-1])
+            # Every accepted observation contributes to the correlated-group
+            # sufficient statistics.  The bounded group size (<= 4) keeps the
+            # active cache finite and also lets topology refresh reproject the
+            # exact same evidence instead of silently collapsing to first/last.
+            representatives = list(next_members)
             next_open_group = {
                 "schema_version": 1,
                 "anchor_image_id": next_members[0],
@@ -777,43 +708,27 @@ class OnlineSemanticOrchestrator:
                 "projection_topology_version": self.state.topology_version,
                 "projection_geometry_stage": self.current_geometry_stage,
             }
-            # Retain only the anchor and newest keyframe.  Keeping an older
-            # middle view would mix geometry versions after a later refresh.
-            if self.state.open_distributions.shape[0] == 1:
-                distributions = torch.cat(
-                    (
-                        self.state.open_distributions,
-                        projection.distribution.unsqueeze(0),
-                    ),
-                    dim=0,
-                )
-                supports = torch.cat(
-                    (self.state.open_supports, projection.support.unsqueeze(0)),
-                    dim=0,
-                )
-                semantic_supports = torch.cat(
-                    (
-                        self.state.open_semantic_supports,
-                        projection.semantic_support.unsqueeze(0),
-                    ),
-                    dim=0,
-                )
-            else:
-                distributions = torch.stack(
-                    (
-                        self.state.open_distributions[0],
-                        projection.distribution,
-                    )
-                )
-                supports = torch.stack(
-                    (self.state.open_supports[0], projection.support)
-                )
-                semantic_supports = torch.stack(
-                    (
-                        self.state.open_semantic_supports[0],
-                        projection.semantic_support,
-                    )
-                )
+            distributions = torch.cat(
+                (
+                    self.state.open_distributions,
+                    projection.distribution.detach().unsqueeze(0),
+                ),
+                dim=0,
+            )
+            supports = torch.cat(
+                (
+                    self.state.open_supports,
+                    projection.support.detach().unsqueeze(0),
+                ),
+                dim=0,
+            )
+            semantic_supports = torch.cat(
+                (
+                    self.state.open_semantic_supports,
+                    projection.semantic_support.detach().unsqueeze(0),
+                ),
+                dim=0,
+            )
 
         group = aggregate_observation_group(
             distributions, supports, eps=self.config.eps
@@ -995,7 +910,9 @@ class ProgressiveSemanticHook:
         projector,
         output_root: Path,
         publication_policy: Optional[MapPublicationPolicy] = None,
-        final_authoritative_complete: bool = True,
+        final_authoritative_complete: bool = False,
+        preflight_report_path: Optional[Path] = None,
+        preflight_report_sha256: Optional[str] = None,
     ):
         self.dataset = dataset
         self.orchestrator = orchestrator
@@ -1003,6 +920,15 @@ class ProgressiveSemanticHook:
         self.output_root = Path(output_root)
         self.publication_policy = publication_policy or MapPublicationPolicy()
         self.final_authoritative_complete = bool(final_authoritative_complete)
+        if (preflight_report_path is None) != (preflight_report_sha256 is None):
+            raise ValueError(
+                "preflight report path and SHA-256 must be supplied together"
+            )
+        self.preflight_report_path = (
+            None if preflight_report_path is None else Path(preflight_report_path)
+        )
+        self.preflight_report_sha256 = preflight_report_sha256
+        self.final_input_binding: Optional[FinalPreflightBinding] = None
         self._stage_boundaries = []
         self._verified_recorded_files = {}
         self._last_publication_seconds = 0.0
@@ -1018,7 +944,9 @@ class ProgressiveSemanticHook:
         semantic_dataset_root: Optional[Path] = None,
         publication_policy: Optional[MapPublicationPolicy] = None,
         resume: bool = True,
-        final_authoritative_complete: bool = True,
+        final_authoritative_complete: bool = False,
+        preflight_report_path: Optional[Path] = None,
+        preflight_report_sha256: Optional[str] = None,
     ) -> "ProgressiveSemanticHook":
         config = config or OnlineSemanticConfig()
         dataset = SemanticDataset(semantic_dataset_root or dataset_root)
@@ -1071,7 +999,7 @@ class ProgressiveSemanticHook:
                 )
             try:
                 geometry_payload = torch.load(
-                    str(geometry_path), map_location="cpu"
+                    str(geometry_path), map_location="cpu", weights_only=True
                 )
                 attributes = geometry_payload["attributes"]
                 checkpoint_projection_hash = semantic_projection_sha256(
@@ -1163,6 +1091,8 @@ class ProgressiveSemanticHook:
             output_root,
             publication_policy=publication_policy,
             final_authoritative_complete=final_authoritative_complete,
+            preflight_report_path=preflight_report_path,
+            preflight_report_sha256=preflight_report_sha256,
         )
         status_path = output_root / "sync_status.json"
         if resume and status_path.is_file():
@@ -1246,6 +1176,7 @@ class ProgressiveSemanticHook:
         processed = []
         errors = []
         deferred = []
+        input_binding_error = False
         ledger_images = {
             entry.image_id for entry in self.orchestrator.ledger.entries
         }
@@ -1268,6 +1199,25 @@ class ProgressiveSemanticHook:
                     )
                 )
                 deferred.extend(missing_cameras)
+            self.final_input_binding = None
+            if (
+                not missing_cameras
+                and self.final_authoritative_complete
+                and self.preflight_report_path is not None
+            ):
+                try:
+                    self.final_input_binding = validate_final_preflight_binding(
+                        report_path=self.preflight_report_path,
+                        expected_report_sha256=self.preflight_report_sha256,
+                        semantic_dataset=self.dataset,
+                        image_ids=all_ordered,
+                        camera_by_id=camera_by_id,
+                        snapshot_root=snapshot_root,
+                        geometry_stage=geometry_stage,
+                    )
+                except Exception as error:
+                    input_binding_error = True
+                    errors.append("final input binding: {}".format(error))
         newly_ready = tuple(
             image_id
             for image_id in ordered
@@ -1365,7 +1315,7 @@ class ProgressiveSemanticHook:
                 else:
                     final_missing.append(image_id)
             deferred = list(dict.fromkeys(deferred + final_missing))
-            if final_ready:
+            if final_ready and not input_binding_error:
                 try:
                     rebuilt = FinalSemanticRebuilder(
                         self.dataset,
@@ -1378,12 +1328,24 @@ class ProgressiveSemanticHook:
                         overlap,
                         online_state=self.orchestrator.state,
                     )
+                    rebuilt_provenance = dict(rebuilt.label_provenance)
+                    if self.final_input_binding is not None:
+                        rebuilt_provenance["input_binding"] = {
+                            "schema_version": 1,
+                            "preflight_report_sha256": (
+                                self.final_input_binding.report_sha256
+                            ),
+                            "binding_sha256": (
+                                self.final_input_binding.binding_sha256
+                            ),
+                            "geometry_stage": geometry_stage,
+                        }
                     replacement = OnlineSemanticOrchestrator(
                         rebuilt.state,
                         self.dataset.class_spec,
                         self.orchestrator.config,
                         ledger=rebuilt.ledger,
-                        label_provenance=rebuilt.label_provenance,
+                        label_provenance=rebuilt_provenance,
                     )
                     replacement.current_geometry_stage = geometry_stage
                     self.output_root.mkdir(parents=True, exist_ok=True)
@@ -1402,6 +1364,16 @@ class ProgressiveSemanticHook:
                                 else None
                             ),
                             "groups": [list(group) for group in rebuilt.image_groups],
+                            "input_binding": (
+                                None
+                                if self.final_input_binding is None
+                                else self.final_input_binding.to_dict()
+                            ),
+                            "input_binding_sha256": (
+                                None
+                                if self.final_input_binding is None
+                                else self.final_input_binding.binding_sha256
+                            ),
                             "metrics": rebuilt.metrics.to_dict(),
                         },
                     )
@@ -1417,7 +1389,7 @@ class ProgressiveSemanticHook:
                     )
                 except Exception as error:
                     errors.append("final exact rebuild: {}".format(error))
-            else:
+            elif not input_binding_error:
                 errors.append("final exact rebuild has no valid observations")
 
         through_index = 0
@@ -1520,6 +1492,14 @@ class ProgressiveSemanticHook:
             self._last_publication_seconds = 0.0
             return result._replace(publication_status="skipped_time_budget")
 
+        fitted_request, budget_status = _fit_publication_output_budget(
+            request,
+            num_classes=self.dataset.class_spec.num_classes,
+            max_output_bytes=policy.max_pair_output_bytes,
+        )
+        if fitted_request is None:
+            return result._replace(publication_status=budget_status)
+        request = fitted_request
         config = request.semantic_config
         free_bytes = None
         if gaussians.get_xyz.is_cuda:
@@ -1536,26 +1516,6 @@ class ProgressiveSemanticHook:
                     save_diagnostics=False,
                     save_probabilities=False,
                 )
-        estimated_output = _estimated_pair_output_bytes(
-            replace(request, semantic_config=config),
-            self.dataset.class_spec.num_classes,
-        )
-        if (
-            not final
-            and estimated_output > policy.max_pair_output_bytes
-            and (config.save_diagnostics or config.save_probabilities)
-        ):
-            config = replace(
-                config,
-                save_diagnostics=False,
-                save_probabilities=False,
-            )
-            estimated_output = _estimated_pair_output_bytes(
-                replace(request, semantic_config=config),
-                self.dataset.class_spec.num_classes,
-            )
-        if not final and estimated_output > policy.max_pair_output_bytes:
-            return result._replace(publication_status="skipped_output_budget")
         config = replace(
             config,
             max_output_bytes=min(
@@ -1637,6 +1597,9 @@ class ProgressiveSemanticHook:
                 "projection_geometry_hash": projection_hash,
                 "rgb_model_hash": rgb_hash,
                 "semantic_state_hash": state_hash,
+                "input_binding": self.orchestrator.label_provenance.get(
+                    "input_binding"
+                ),
                 "semantic_checkpoint_hash": (
                     checkpoint.state_sha256 if checkpoint is not None else None
                 ),
@@ -1878,13 +1841,7 @@ class ProgressiveSemanticHook:
 
     @staticmethod
     def _save_json_atomic(path: Path, payload: Mapping[str, object]) -> None:
-        temporary = path.with_name(path.name + ".tmp")
-        with temporary.open("w", encoding="utf-8") as stream:
-            json.dump(payload, stream, ensure_ascii=False, indent=2, sort_keys=True)
-            stream.write("\n")
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(str(temporary), str(path))
+        write_json_atomic(path, payload)
 
 
 class AsyncProgressiveSemanticHook:
@@ -2020,22 +1977,20 @@ class AsyncProgressiveSemanticHook:
                 pending_publication = (
                     None
                     if self._latest_stage_request is None
-                    else self._latest_stage_request.args[6]
+                    else self._latest_stage_request.publication_request
                 )
                 if publication_request is None and pending_publication is not None:
                     frozen_cameras = tuple(
                         FrozenCameraSnapshot(item) for item in cameras
                     )
                     request = _PendingStageRequest(
-                        (
-                            geometry_stage,
-                            frozen_cameras,
-                            FrozenSemanticSnapshot(gaussians),
-                            snapshot_root,
-                            False,
-                            tuple(self._stage_boundaries),
-                            None,
-                        )
+                        geometry_stage=geometry_stage,
+                        cameras=frozen_cameras,
+                        snapshot=FrozenSemanticSnapshot(gaussians),
+                        snapshot_root=Path(snapshot_root),
+                        final=False,
+                        stage_boundaries=tuple(self._stage_boundaries),
+                        publication_request=None,
                     )
                     token = None
                     queued_product_key = pending_publication.product_key
@@ -2066,16 +2021,16 @@ class AsyncProgressiveSemanticHook:
                         else FrozenSemanticSnapshot(gaussians)
                     )
                     request = _PendingStageRequest(
-                        (
-                            geometry_stage,
-                            frozen_cameras,
-                            snapshot,
-                            snapshot_root,
-                            False,
-                            tuple(self._stage_boundaries),
-                            frozen_publication,
+                        geometry_stage=geometry_stage,
+                        cameras=frozen_cameras,
+                        snapshot=snapshot,
+                        snapshot_root=Path(snapshot_root),
+                        final=False,
+                        stage_boundaries=tuple(self._stage_boundaries),
+                        publication_request=frozen_publication,
+                        publication_status_override=(
+                            publication_status_override
                         ),
-                        publication_status_override,
                     )
                     # Submit an ordered marker for every replaceable snapshot.
                     # Its queue position prevents crossing later topology events.
@@ -2156,29 +2111,15 @@ class AsyncProgressiveSemanticHook:
     ) -> Tuple[Optional[MapPublicationRequest], Optional[str]]:
         if request is None:
             return None, None
-        config = request.semantic_config
-        estimated_output = _estimated_pair_output_bytes(
-            request, self.core.dataset.class_spec.num_classes
+        request, budget_status = _fit_publication_output_budget(
+            request,
+            num_classes=self.core.dataset.class_spec.num_classes,
+            max_output_bytes=(
+                self.core.publication_policy.max_pair_output_bytes
+            ),
         )
-        if (
-            estimated_output > self.core.publication_policy.max_pair_output_bytes
-            and (config.save_diagnostics or config.save_probabilities)
-        ):
-            config = replace(
-                config,
-                save_diagnostics=False,
-                save_probabilities=False,
-            )
-            request = replace(
-                request,
-                semantic_config=config,
-                diagnostics_degraded=True,
-            )
-            estimated_output = _estimated_pair_output_bytes(
-                request, self.core.dataset.class_spec.num_classes
-            )
-        if estimated_output > self.core.publication_policy.max_pair_output_bytes:
-            return None, "skipped_output_budget"
+        if request is None:
+            return None, budget_status
         if gaussians.get_xyz.is_cuda:
             snapshot_bytes = _model_snapshot_nbytes(
                 gaussians, RGB_MODEL_ATTRIBUTE_NAMES
@@ -2213,7 +2154,7 @@ class AsyncProgressiveSemanticHook:
         return self._run_stage(request)
 
     def _run_stage(self, request: _PendingStageRequest):
-        result = self._execute_core(*request.args)
+        result = self._execute_core(*request.core_args())
         if request.publication_status_override is not None:
             result = result._replace(
                 publication_status=request.publication_status_override
@@ -2223,8 +2164,25 @@ class AsyncProgressiveSemanticHook:
                 status_writer(result)
         return result
 
-    def _execute_core(self, *request):
-        snapshot = request[2]
+    def _execute_core(
+        self,
+        geometry_stage,
+        cameras,
+        snapshot,
+        snapshot_root,
+        final,
+        stage_boundaries,
+        publication_request,
+    ):
+        request = (
+            geometry_stage,
+            cameras,
+            snapshot,
+            snapshot_root,
+            final,
+            stage_boundaries,
+            publication_request,
+        )
         if self._semantic_stream is None:
             snapshot.wait_ready()
             return self.core.synchronize(*request)

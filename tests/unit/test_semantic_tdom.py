@@ -36,8 +36,6 @@ class SemanticTdomTests(unittest.TestCase):
             SemanticTdomConfig(max_output_bytes=0)
         with self.assertRaisesRegex(ValueError, "min_free_cuda_bytes"):
             SemanticTdomConfig(min_free_cuda_bytes=-1)
-        with self.assertRaisesRegex(ValueError, "max_group_disagreement"):
-            SemanticTdomConfig(max_group_disagreement=2.01)
         with self.assertRaisesRegex(ValueError, "max_gaussian_scale_ratio"):
             SemanticTdomConfig(max_gaussian_scale_ratio=1.0)
 
@@ -130,7 +128,7 @@ class SemanticTdomTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "three integers"):
                 load_semantic_tdom_palette(palette_path, CLASS_SPEC)
 
-    def test_diagnostic_margin_does_not_change_three_condition_hard_map(self):
+    def test_diagnostics_do_not_add_hidden_hard_map_gates(self):
         rendered = torch.tensor(
             [
                 [[0.6, 0.2]],
@@ -143,8 +141,8 @@ class SemanticTdomTests(unittest.TestCase):
             min_coverage=0.1,
             min_absolute_support=0.1,
             min_support_ratio=0.1,
-            min_margin=0.1,
         )
+        self.assertFalse(hasattr(config, "min_margin"))
 
         result = finalize_semantic_tdom(
             rendered, coverage, CLASS_SPEC, config
@@ -172,7 +170,7 @@ class SemanticTdomTests(unittest.TestCase):
             rendered,
             coverage,
             CLASS_SPEC,
-            SemanticTdomConfig(min_margin=0.2),
+            SemanticTdomConfig(),
         )
 
         self.assertFalse(result.unknown_mask[0, 0])

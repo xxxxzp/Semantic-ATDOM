@@ -12,24 +12,14 @@ from typing import Dict, Mapping, Optional, Sequence, Tuple
 import numpy as np
 from PIL import Image
 
-from semantic_atdom.semantics.orchestrator import AcquisitionOverlap
+from semantic_atdom.semantics.inputs import AcquisitionOverlap
 from semantic_atdom.semantics.schema import SemanticDataset, SemanticSchemaError, sha256_file
 from semantic_atdom.utils.image_identity import normalize_image_identity
+from semantic_atdom.utils.atomic_io import write_json_atomic
 
 
 _IMAGE_ID = re.compile(r"^[^/\\\x00]+$")
 _IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".tif", ".tiff"}
-
-
-def _save_json_atomic(path: Path, payload: Mapping[str, object]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(path.name + ".tmp")
-    with temporary.open("w", encoding="utf-8") as stream:
-        json.dump(payload, stream, ensure_ascii=False, indent=2, sort_keys=True)
-        stream.write("\n")
-        stream.flush()
-        os.fsync(stream.fileno())
-    os.replace(str(temporary), str(path))
 
 
 def _is_within(path: Path, root: Path) -> bool:
@@ -372,9 +362,9 @@ def run_dataset_preflight(
     }
     dataset_id = hashlib.sha256(str(dataset_root).encode("utf-8")).hexdigest()[:16]
     report_path = output_root / "cache" / dataset_id / "preflight.json"
-    _save_json_atomic(report_path, report)
+    write_json_atomic(report_path, report)
     report_hash = sha256_file(report_path)
-    _save_json_atomic(
+    write_json_atomic(
         report_path.with_name("preflight.sha256.json"),
         {"schema_version": 1, "preflight_sha256": report_hash},
     )

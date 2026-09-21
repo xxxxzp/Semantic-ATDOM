@@ -13,6 +13,7 @@ import numpy as np
 from PIL import Image
 
 from semantic_atdom.semantics.provenance import SEMANTIC_METHOD_VERSION
+from semantic_atdom.utils.atomic_io import write_json_atomic
 from semantic_atdom.semantics.schema import SemanticClassSpec, sha256_file
 from semantic_atdom.semantics.tdom import (
     SemanticTdomConfig,
@@ -44,15 +45,7 @@ def _canonical_sha256(payload: Mapping[str, object]) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
-def _save_json_atomic(path: Path, payload: Mapping[str, object]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(path.name + ".tmp")
-    with temporary.open("w", encoding="utf-8") as stream:
-        json.dump(payload, stream, ensure_ascii=False, indent=2, sort_keys=True)
-        stream.write("\n")
-        stream.flush()
-        os.fsync(stream.fileno())
-    os.replace(str(temporary), str(path))
+_save_json_atomic = write_json_atomic
 
 
 @dataclass(frozen=True)

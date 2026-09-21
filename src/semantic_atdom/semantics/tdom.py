@@ -28,10 +28,8 @@ class UnknownReason(IntFlag):
     LOW_COVERAGE = 1
     LOW_ABSOLUTE_SUPPORT = 2
     LOW_SUPPORT_RATIO = 4
-    LOW_MARGIN = 8
-    LOW_TOP1_PROBABILITY = 16
-    HIGH_NORMALIZED_ENTROPY = 32
-    HIGH_GROUP_DISAGREEMENT = 64
+    # Bits 3..6 were used by superseded diagnostic gates.  Keep the remaining
+    # value stable so existing unknown_reason rasters retain their meaning.
     NO_SEMANTIC_EVIDENCE = 128
 
 
@@ -42,10 +40,6 @@ class SemanticTdomConfig:
     min_coverage: float = 0.05
     min_absolute_support: float = 0.01
     min_support_ratio: float = 0.05
-    min_margin: float = 0.05
-    min_top1_probability: float = 0.0
-    max_normalized_entropy: float = 1.0
-    max_group_disagreement: float = 2.0
     eps: float = 1e-8
     save_probabilities: bool = False
     save_diagnostics: bool = False
@@ -64,19 +58,10 @@ class SemanticTdomConfig:
             "min_coverage",
             "min_absolute_support",
             "min_support_ratio",
-            "min_margin",
-            "min_top1_probability",
-            "max_normalized_entropy",
         ):
             value = getattr(self, name)
             if not math.isfinite(value) or value < 0 or value > 1:
                 raise ValueError("{} must be in [0, 1]".format(name))
-        if (
-            not math.isfinite(self.max_group_disagreement)
-            or self.max_group_disagreement < 0
-            or self.max_group_disagreement > 2
-        ):
-            raise ValueError("max_group_disagreement must be in [0, 2]")
         if not math.isfinite(self.eps) or self.eps <= 0:
             raise ValueError("eps must be positive")
         if (
@@ -134,13 +119,6 @@ class SemanticTdomConfig:
         payload = asdict(self)
         payload.pop("render_palette")
         payload.pop("render_palette_source")
-        for name in (
-            "min_margin",
-            "min_top1_probability",
-            "max_normalized_entropy",
-            "max_group_disagreement",
-        ):
-            payload.pop(name)
         payload["semantic_method_version"] = SEMANTIC_METHOD_VERSION
         return payload
 

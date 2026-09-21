@@ -182,10 +182,6 @@ class OptimizationParams(ParamGroup):
         self.semantic_tdom_min_coverage = 0.05
         self.semantic_tdom_min_absolute_support = 0.01
         self.semantic_tdom_min_support_ratio = 0.05
-        self.semantic_tdom_min_margin = 0.05
-        self.semantic_tdom_min_top1_probability = 0.0
-        self.semantic_tdom_max_normalized_entropy = 1.0
-        self.semantic_tdom_max_group_disagreement = 2.0
         self.semantic_tdom_render_tile_rows = 0
         self.semantic_tdom_finalize_tile_rows = 256
         self.semantic_tdom_save_diagnostics = False

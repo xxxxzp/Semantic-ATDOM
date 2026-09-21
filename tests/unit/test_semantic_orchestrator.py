@@ -13,6 +13,7 @@ import torch
 from semantic_atdom.semantics.orchestrator import (
     AcquisitionOverlap,
     AsyncProgressiveSemanticHook,
+    FrozenCameraSnapshot,
     FrozenGaussianSnapshot,
     FrozenSemanticSnapshot,
     MapPublicationRequest,
@@ -181,6 +182,26 @@ class AcquisitionOverlapTests(unittest.TestCase):
 
 
 class OnlineSemanticOrchestratorTests(unittest.TestCase):
+    def test_frozen_camera_preserves_rectification_calibration(self):
+        calibration = object()
+
+        class Camera:
+            image_name = "000001"
+            image_height = 2
+            image_width = 3
+            FoVx = 1.0
+            FoVy = 0.8
+            world_view_transform = torch.eye(4)
+            full_proj_transform = torch.eye(4)
+            camera_center = torch.zeros(3)
+            Tri_Mask = torch.ones((2, 3), dtype=torch.bool)
+
+        camera = Camera()
+        camera.calibration = calibration
+        frozen = FrozenCameraSnapshot(camera)
+
+        self.assertIs(frozen.calibration, calibration)
+
     def test_open_group_update_replaces_previous_provisional_evidence(self):
         state = SemanticGaussianState.initialize(1, 2)
         runner = OnlineSemanticOrchestrator(
@@ -200,7 +221,7 @@ class OnlineSemanticOrchestratorTests(unittest.TestCase):
         self.assertEqual(state.semantic_support.item(), 1.0)
         self.assertEqual(runner.open_member_ids, ("000001", "000002"))
 
-    def test_three_view_group_retains_only_anchor_and_latest(self):
+    def test_three_view_group_preserves_every_observation(self):
         state = SemanticGaussianState.initialize(1, 2)
         runner = OnlineSemanticOrchestrator(
             state, CLASS_SPEC, OnlineSemanticConfig(max_group_size=4)
@@ -228,13 +249,39 @@ class OnlineSemanticOrchestratorTests(unittest.TestCase):
         )
         self.assertEqual(
             runner.open_group["representative_image_ids"],
-            ["000001", "000003"],
+            ["000001", "000002", "000003"],
         )
-        self.assertEqual(state.open_distributions.shape[0], 2)
+        self.assertEqual(state.open_distributions.shape[0], 3)
         torch.testing.assert_close(
             state.open_distributions[:, 0],
-            torch.tensor([[1.0, 0.0], [1.0, 0.0]]),
+            torch.tensor([[1.0, 0.0], [0.0, 1.0], [1.0, 0.0]]),
         )
+        torch.testing.assert_close(
+            state.open_raw_evidence,
+            torch.tensor([[2.0 / 3.0, 1.0 / 3.0]]),
+        )
+        context = runner.recovery_context()
+        recovery_hash = state.validated_recovery_context_sha256(
+            context, CLASS_SPEC.ontology_fingerprint, 1.0, 2
+        )
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "semantic_state.pt"
+            state.save(
+                path,
+                "a" * 64,
+                "b" * 64,
+                CLASS_SPEC.ontology_fingerprint,
+                CLASS_SPEC.palette_fingerprint,
+                context,
+            )
+            restored = SemanticGaussianState.load(
+                path,
+                expected_projection_geometry_hash="a" * 64,
+                expected_ontology_hash=CLASS_SPEC.ontology_fingerprint,
+                expected_gaussian_count=1,
+                expected_recovery_context_sha256=recovery_hash,
+            )
+        self.assertEqual(restored.open_distributions.shape[0], 3)
 
     def test_max_group_size_closes_group_and_third_group_is_soft_weighted(self):
         config = OnlineSemanticConfig(
@@ -296,6 +343,22 @@ class OnlineSemanticOrchestratorTests(unittest.TestCase):
         )
         torch.testing.assert_close(
             low_support_state.alpha_robust, low_support_state.alpha_raw
+        )
+
+    def test_online_group_disagreement_tracks_raw_group_moments(self):
+        state = SemanticGaussianState.initialize(1, 2)
+        runner = OnlineSemanticOrchestrator(
+            state, CLASS_SPEC, OnlineSemanticConfig(max_group_size=1)
+        )
+        matrix = overlap(["000001", "000002"])
+
+        runner.ingest(observation("000001"), projection([1, 0], 1), matrix)
+        self.assertFalse(state.group_disagreement_available)
+        runner.ingest(observation("000002"), projection([0, 1], 1), matrix)
+
+        self.assertTrue(state.group_disagreement_available)
+        torch.testing.assert_close(
+            state.group_variance, torch.tensor([[0.25, 0.25]])
         )
 
     def test_ledger_is_idempotent_and_rejects_changed_hash_for_same_key(self):
@@ -793,7 +856,11 @@ class ProgressiveSemanticHookTests(unittest.TestCase):
                 OnlineSemanticConfig(max_group_size=1),
             )
             hook = ProgressiveSemanticHook(
-                dataset, runner, projector, root / "output"
+                dataset,
+                runner,
+                projector,
+                root / "output",
+                final_authoritative_complete=True,
             )
 
             preview = hook.synchronize(
@@ -874,6 +941,41 @@ class ProgressiveSemanticHookTests(unittest.TestCase):
             )
             self.assertEqual(unbound_result.status, "exact_partial")
 
+            rejected_report = root / "rejected-preflight.json"
+            rejected_report.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "authoritative_exact_complete": False,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            rejected_projector = Projector()
+            rejected_hook = ProgressiveSemanticHook(
+                dataset,
+                OnlineSemanticOrchestrator(
+                    SemanticGaussianState.initialize(1, 2),
+                    dataset.class_spec,
+                    OnlineSemanticConfig(max_group_size=1),
+                ),
+                rejected_projector,
+                root / "rejected-output",
+                final_authoritative_complete=True,
+                preflight_report_path=rejected_report,
+                preflight_report_sha256=sha256_file(rejected_report),
+            )
+            rejected_result = rejected_hook.synchronize(
+                3,
+                [Camera("000001"), Camera("000002"), Camera("000003")],
+                Gaussians(),
+                root / "3",
+                final=True,
+            )
+            self.assertEqual(rejected_result.status, "online_fallback")
+            self.assertIn("final input binding", rejected_result.errors[0])
+            self.assertEqual(rejected_projector.calls, 3)
+
             failing_projector = Projector()
             failing_runner = OnlineSemanticOrchestrator(
                 SemanticGaussianState.initialize(1, 2),
@@ -920,6 +1022,7 @@ class ProgressiveSemanticHookTests(unittest.TestCase):
                 ),
                 recovery_projector,
                 root / "recovery-output",
+                final_authoritative_complete=True,
             )
             recovery_result = recovery_hook.synchronize(
                 3,
@@ -1574,7 +1677,15 @@ class ProgressiveSemanticHookTests(unittest.TestCase):
                 "Request",
                 (),
                 {
-                    "args": (1, (), snapshot, Path("unused"), False, (), None),
+                    "core_args": lambda self: (
+                        1,
+                        (),
+                        snapshot,
+                        Path("unused"),
+                        False,
+                        (),
+                        None,
+                    ),
                     "publication_status_override": None,
                 },
             )()

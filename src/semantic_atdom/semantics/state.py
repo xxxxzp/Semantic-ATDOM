@@ -327,6 +327,35 @@ class SemanticGaussianState:
                 "open-group count exceeds the stored group count"
             )
 
+        # Preserve exact streaming first/second moments of raw flight-group
+        # samples while replacing the provisional open group.  alpha_raw minus
+        # the prior is the weighted first moment; variance plus that mean lets
+        # us reconstruct the weighted second-moment sum without another N x K
+        # persistent tensor.
+        numerical_eps = torch.finfo(self.dtype).eps
+        current_first = (self.alpha_raw - self.prior()).clamp_min(0.0)
+        current_weight = current_first.sum(dim=1)
+        current_mean = current_first / (
+            current_weight.unsqueeze(1) + numerical_eps
+        )
+        current_second = current_weight.unsqueeze(1) * (
+            self.group_variance + current_mean.square()
+        )
+        previous_open_weight = self.open_raw_evidence.sum(dim=1)
+        previous_open_second = self.open_raw_evidence.square() / (
+            previous_open_weight.unsqueeze(1) + numerical_eps
+        )
+        new_open_weight = raw.sum(dim=1)
+        new_open_second = raw.square() / (
+            new_open_weight.unsqueeze(1) + numerical_eps
+        )
+        if commit_existing:
+            new_second = current_second + new_open_second
+        else:
+            new_second = (
+                current_second - previous_open_second
+            ).clamp_min(0.0) + new_open_second
+
         changed = (
             (self.open_raw_evidence != raw).any(dim=1)
             | (self.open_robust_evidence != robust).any(dim=1)
@@ -337,6 +366,13 @@ class SemanticGaussianState:
         new_alpha_raw = closed_raw + raw
         new_alpha_robust = closed_robust + robust
         new_group_count = closed_count + increment
+        new_first = (new_alpha_raw - self.prior()).clamp_min(0.0)
+        new_weight = new_first.sum(dim=1)
+        new_mean = new_first / (new_weight.unsqueeze(1) + numerical_eps)
+        new_variance = (
+            new_second / (new_weight.unsqueeze(1) + numerical_eps)
+            - new_mean.square()
+        ).clamp_min(0.0)
         new_semantic_support = self.semantic_support.clone()
         if support_increment is not None:
             new_semantic_support.add_(support_increment)
@@ -357,7 +393,11 @@ class SemanticGaussianState:
 
         self.alpha_raw = new_alpha_raw
         self.alpha_robust = new_alpha_robust
-        self.group_disagreement_available = False
+        self.group_variance = new_variance
+        self.group_disagreement_available = (
+            not self.historical_evidence_stale
+            and bool((new_group_count >= 2).any())
+        )
         self.group_count = new_group_count
         self.semantic_support = new_semantic_support
         self.open_raw_evidence = new_open_raw
@@ -686,7 +726,9 @@ class SemanticGaussianState:
         map_location: Optional[str] = "cpu",
     ) -> "SemanticGaussianState":
         try:
-            value = torch.load(str(path), map_location=map_location)
+            value = torch.load(
+                str(path), map_location=map_location, weights_only=True
+            )
         except (OSError, ValueError, RuntimeError) as error:
             raise SemanticStateError(
                 "unable to load semantic state {}: {}".format(path, error)
@@ -1176,12 +1218,12 @@ class SemanticGaussianState:
             not isinstance(representatives, Sequence)
             or isinstance(representatives, (str, bytes))
             or not representatives
-            or len(representatives) > 2
+            or len(representatives) > 4
             or any(item not in members for item in representatives)
             or len(set(representatives)) != len(representatives)
         ):
             raise SemanticStateError(
-                "open_group requires one or two representative image ids"
+                "open_group requires one to four representative image ids"
             )
         return {
             "schema_version": 1,

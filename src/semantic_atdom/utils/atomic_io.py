@@ -3,10 +3,10 @@
 import json
 import os
 from pathlib import Path
-from typing import Mapping
+from typing import Any
 
 
-def write_json_atomic(path: Path, payload: Mapping[str, object]) -> None:
+def write_json_atomic(path: Path, payload: Any) -> None:
     """Durably replace one JSON file without exposing a partial write."""
 
     path = Path(path)

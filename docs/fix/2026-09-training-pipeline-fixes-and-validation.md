@@ -167,3 +167,29 @@ stage 14–18 真实预览输出为 2366×1080，主体黑色比例约 31%，地
 - 在等价性测试约束下优化 CUDA 投影分块。
 
 这些优化必须保持最终语义 state、地图网格、支持域和发布 manifest 的一致性，不能通过减少训练量或降低模型容量伪装成等价提速。
+
+## 7. 2026-09-21：240 帧、1 FPS 全量视频验收
+
+本轮使用 Phantom3 的完整 stage 14–414 验证以下折中设置：
+
+```text
+--training_progress_target_frames 240
+--training_progress_fps 1
+```
+
+最终成功运行位于：
+
+```text
+/data3/xzp/data/Onthefly/phantom3/outputs/runs/phantom3-v2-progress240-fps1_20260921-180740_c886ce6
+```
+
+生成的视频为 H.264、1958×1080、1 FPS、240 帧，总时长 240 秒。时间采样覆盖初始化、238 个在线阶段和最终精确重建，stage 间隔主要为 1–2 张影像；它不是把视频编码帧率误当成训练采样频率。
+
+完整训练结果为 677723 个 Gaussian、86000 次累计优化迭代，RGB 指标为 L1 0.018358、PSNR 31.0578 dB、SSIM 0.890348、LPIPS 0.267047。最终语义状态为 `exact_final`，覆盖全部 414 个相机，lag 为 0，deferred 与 errors 均为空。
+
+本轮暴露并修复了两个与视频参数无关的问题：
+
+- 首次运行因公共 `/dev/shm` 已使用约 183/189 GiB，进程间队列分配触发 SIGBUS。第二次运行在私有 mount namespace 中挂载 32 GiB tmpfs 作为 `/dev/shm`，完整训练成功；这避免清理或干扰其他用户的共享内存。
+- progressive trainer 使用 `persistent_union` 训练和评估 414 个相机，但最终 stage 的局部 COLMAP 快照只有 27 个相机，旧逻辑会把这份局部 `cameras.json` 当成最终模型清单。现在最终保存前直接从 trainer 的累计相机状态原子写入完整清单，并拒绝重复相机 identity。历史局部清单保存在 `provenance/final_stage_local_cameras.json` 供审计。
+
+最终验收包括 414 个逐相机 RGB/semantic render、所有发布文件 SHA-256 一致性、视频首/中/末帧目视检查，以及完整测试集 233 项通过。运行没有保存 checkpoint 或最终训练状态，临时 `.work` 已在成功发布后清理，`outputs/latest` 已指向该结果。

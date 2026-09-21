@@ -38,7 +38,7 @@ def _json_value(value: Any) -> Any:
     return str(value)
 
 
-def write_json_atomic(path: Path, payload: Mapping[str, Any]) -> None:
+def write_json_atomic(path: Path, payload: Any) -> None:
     _write_json_atomic(path, _json_value(payload))
 
 

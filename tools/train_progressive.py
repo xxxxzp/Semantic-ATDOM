@@ -2780,6 +2780,31 @@ class GaussianTrainer(mp.Process):
         )
         self._save_training_checkpoint(checkpoint_path, phase="stage_complete")
 
+    def _write_final_camera_inventory(self):
+        """Publish the cumulative camera state used by the final model.
+
+        A progressive source stage may contain only a local overlap snapshot.
+        The trainer, however, keeps the persistent union and applies later pose
+        replacements in memory.  Publishing the final stage's source
+        ``cameras.json`` would therefore describe only that local snapshot,
+        not the cameras that actually trained and evaluated the model.
+        """
+        cameras = sorted(
+            self.scene.getTrainCameras(), key=self._camera_order_key
+        )
+        identities = [str(camera.image_name) for camera in cameras]
+        if len(set(identities)) != len(identities):
+            raise RuntimeError(
+                "final cumulative camera inventory contains duplicate identities"
+            )
+        records = [
+            camera_to_JSON(index, camera)
+            for index, camera in enumerate(cameras)
+        ]
+        write_json_atomic(
+            Path(self.scene.model_path) / "cameras.json", records
+        )
+
     def GS_Save(self, UseSecondPath=True, final=False):
         if not final:
             raise ValueError("GS_Save is reserved for the final published model")
@@ -2801,6 +2826,7 @@ class GaussianTrainer(mp.Process):
             )
 
         print("\n[Save At Image {}] Saving Gaussians".format(imagedirname))
+        self._write_final_camera_inventory()
         self.scene.save(imagedirname)
 
     # 该函数将被送入到一个线程中，用于渐进式训练中的数据读取以及预处理

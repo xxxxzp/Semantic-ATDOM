@@ -63,6 +63,7 @@ supported command interfaces.
 
 ## Semantic A-TDOM documentation
 
+- [How semantic evidence is assigned to Gaussians and why](docs/design/semantic-evidence-assignment-rationale.md)
 - [G1 V1, V1.1, and V2 design comparison](docs/design/g1-v1-v2-comparison.md)
 - [Authoritative Semantic TDOM V1 / G1 Evidence V2 contract](docs/design/semantic-tdom-v1.md)
 - [Current project context](docs/project/global-context.md)

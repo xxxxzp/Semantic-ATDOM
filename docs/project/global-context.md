@@ -162,7 +162,9 @@ RGB、SfM 和 semantic roots 是只读输入。派生 PLY、索引和转换结�
 
 - `ATDOM_XZP` 只是环境迁移来源，不是正式运行环境。
 - 已验证组合为 Python 3.10、PyTorch 2.4.0+cu121、CUDA 12.1、RTX 4090。
-- 正式环境名为 `semantic-atdom`。
+- 正式且唯一受支持的 Conda 环境名为 `semantic-atdom`；
+  `semantic-atom` 不是环境名。历史文件名和输出路径中的
+  `semantic_atom` 只是早期产物 slug，不能据此推导 Conda 环境。
 - 不能复制历史 editable package 或 CUDA 二进制；本地扩展必须从当前 `third_party/src` 构建。
 - `environment.yml` 在验证后成为可执行真源；重大依赖升级使用独立分支。
 
@@ -197,6 +199,7 @@ RGB、SfM 和 semantic roots 是只读输入。派生 PLY、索引和转换结�
 - entropy、margin、mixture/group disagreement 和 variance proxy 分开输出，不参与 V1 gate。
 - variance 是包含先验、基于独立近似的未校准 proxy，不是分类错误概率。
 - Semantic TDOM 光栅化前默认排除最大尺度超过场景中位最大尺度14倍的异常高斯；
+- 对明确配置的平面类别，最终精确发布可用有界连通域、局部平面和多观测组原始标签一致性恢复被尺度过滤误伤的内部孔洞；默认关闭，边界连通未知区永不回填，并单独发布类别来源图；
   这只是只读产品支持域清理，不是第四个 hard-map gate，也不影响 RGB 或几何训练。
 - 上述尺度过滤只是 Phantom3 上的临时回归抑制：它会使 RGB 与 Semantic 使用不同的
   高斯子集，且不能定义通用 no-data footprint；后续须另行设计与 RGB 颜色、SAM 标签

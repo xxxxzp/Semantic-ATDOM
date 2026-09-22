@@ -68,6 +68,7 @@ supported command interfaces.
 - [Authoritative Semantic TDOM V1 / G1 Evidence V2 contract](docs/design/semantic-tdom-v1.md)
 - [Current project context](docs/project/global-context.md)
 - [Validated Phantom3 V2 experiment](docs/project/phantom3-semantic-atom-v2-result.md)
+- [Bounded planar semantic fallback decision](docs/decisions/0010-bounded-planar-semantic-fallback.md)
 
 # Windows Env Setting
 

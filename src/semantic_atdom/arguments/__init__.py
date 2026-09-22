@@ -190,6 +190,18 @@ class OptimizationParams(ParamGroup):
         self.semantic_tdom_max_output_bytes = 8 * 1024**3
         self.semantic_tdom_min_free_cuda_bytes = 512 * 1024**2
         self.semantic_tdom_max_gaussian_scale_ratio = 14.0
+        # Optional final-product recovery for bounded holes in a known planar
+        # class.  An empty class name keeps the dataset-agnostic default off.
+        self.semantic_tdom_planar_fallback_class = ""
+        self.semantic_tdom_planar_fallback_min_component_pixels = 1024
+        self.semantic_tdom_planar_fallback_ring_radius_pixels = 15
+        self.semantic_tdom_planar_fallback_min_boundary_consensus = 0.98
+        self.semantic_tdom_planar_fallback_plane_context_pixels = 512
+        self.semantic_tdom_planar_fallback_min_plane_gaussians = 32
+        self.semantic_tdom_planar_fallback_max_plane_mad_world = 1.0
+        self.semantic_tdom_planar_fallback_min_views = 5
+        self.semantic_tdom_planar_fallback_min_agreement = 0.95
+        self.semantic_tdom_planar_fallback_min_groups = 3
         self.semantic_map_publication_interval = 1
         # Zero disables mutable semantic recovery slots during progressive
         # stages. The final semantic model is still archived once.

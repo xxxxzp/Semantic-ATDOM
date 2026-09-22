@@ -232,6 +232,7 @@ class SemanticTdomResult(NamedTuple):
     prior_regularized_variance_proxy: Optional[torch.Tensor]
     radii: Optional[torch.Tensor]
     metrics: Mapping[str, object]
+    class_provenance: Optional[torch.Tensor] = None
 
     @property
     def posterior_variance(self) -> Optional[torch.Tensor]:
@@ -1169,6 +1170,18 @@ def write_semantic_tdom(
     _save_image_atomic(reason_path, reason.numpy(), "PNG")
     record(reason_path)
 
+    if result.class_provenance is not None:
+        provenance = result.class_provenance.detach().cpu().contiguous()
+        if provenance.shape != result.class_ids.shape:
+            raise ValueError("class provenance shape must match class ids")
+        if provenance.dtype != torch.uint8:
+            raise ValueError("class provenance must use uint8 encoding")
+        if bool((provenance > 2).any()):
+            raise ValueError("class provenance contains an unknown code")
+        provenance_path = staging / "class_provenance.png"
+        _save_image_atomic(provenance_path, provenance.numpy(), "PNG")
+        record(provenance_path)
+
     tiff_writer = None
     diagnostic_tensors = {
         "pixel_evidence_support.tif": result.absolute_support,
@@ -1284,6 +1297,18 @@ def write_semantic_tdom(
                     UnknownReason.NO_SEMANTIC_EVIDENCE,
                 )
             },
+            "class_provenance": (
+                None
+                if result.class_provenance is None
+                else {
+                    "file": "class_provenance.png",
+                    "codes": {
+                        "0": "unknown",
+                        "1": "trusted_gaussian",
+                        "2": "planar_multiview_fallback",
+                    },
+                }
+            ),
             "uncertainty_definitions": {
                 "semantic_entropy": "categorical entropy in nats; range [0, ln(K)]",
                 "normalized_entropy": "semantic_entropy / ln(K); range [0, 1]",

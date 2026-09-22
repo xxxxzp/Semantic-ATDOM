@@ -50,6 +50,10 @@ from semantic_atdom.semantics.publication import (
     MapPublicationPolicy,
     publish_tdom_pair,
 )
+from semantic_atdom.semantics.planar_fallback import (
+    PlanarFallbackConfig,
+    apply_planar_multiview_fallback,
+)
 from semantic_atdom.semantics.tdom import (
     SemanticTdomConfig,
     rasterize_rgb_tdom_striped,
@@ -111,6 +115,11 @@ def _estimated_pair_output_bytes(
         bytes_per_pixel += 8 * diagnostic_bytes
     if config.save_probabilities:
         bytes_per_pixel += 2 * int(num_classes)
+    if (
+        request.planar_fallback_config is not None
+        and request.planar_fallback_config.enabled
+    ):
+        bytes_per_pixel += 1
     return pixels * bytes_per_pixel + 1024**2
 
 
@@ -241,6 +250,7 @@ class MapPublicationRequest:
     rgb_pipeline: object
     rgb_background: torch.Tensor
     semantic_config: SemanticTdomConfig
+    planar_fallback_config: Optional[PlanarFallbackConfig] = None
     publication_due: bool = True
     diagnostics_degraded: bool = False
 
@@ -253,6 +263,15 @@ class MapPublicationRequest:
             raise ValueError("publication_due must be a boolean")
         if not isinstance(self.diagnostics_degraded, bool):
             raise ValueError("diagnostics_degraded must be a boolean")
+        if (
+            self.planar_fallback_config is not None
+            and not isinstance(
+                self.planar_fallback_config, PlanarFallbackConfig
+            )
+        ):
+            raise ValueError(
+                "planar_fallback_config must be a PlanarFallbackConfig"
+            )
         if not isinstance(self.alignment, Mapping):
             raise ValueError("map alignment must be an object")
         grid = self.alignment.get("grid")
@@ -1294,6 +1313,7 @@ class ProgressiveSemanticHook:
                 break
         exact_rebuilt = False
         exact_complete = False
+        final_image_groups = ()
         if final:
             if online_usable:
                 self.orchestrator.close_group()
@@ -1384,6 +1404,7 @@ class ProgressiveSemanticHook:
                         entry.image_id for entry in rebuilt.ledger.entries
                     }
                     exact_rebuilt = True
+                    final_image_groups = rebuilt.image_groups
                     exact_complete = (
                         not final_missing and self.final_authoritative_complete
                     )
@@ -1460,6 +1481,8 @@ class ProgressiveSemanticHook:
                 checkpoint,
                 exact_rebuilt,
                 final,
+                cameras,
+                final_image_groups,
             )
         else:
             if not self.orchestrator.state.is_valid:
@@ -1477,6 +1500,8 @@ class ProgressiveSemanticHook:
         checkpoint: Optional[SemanticCheckpoint],
         exact_rebuilt: bool,
         final: bool,
+        source_cameras: Sequence[object],
+        observation_groups: Sequence[Sequence[str]],
     ) -> SemanticSyncResult:
         if not isinstance(gaussians, FrozenGaussianSnapshot):
             raise SemanticSchemaError(
@@ -1556,6 +1581,26 @@ class ProgressiveSemanticHook:
                 self.dataset.class_spec,
                 config=config,
             )
+            fallback_config = request.planar_fallback_config
+            if final and fallback_config is not None and fallback_config.enabled:
+                if not exact_rebuilt or not observation_groups:
+                    raise SemanticSchemaError(
+                        "planar semantic fallback requires the final exact "
+                        "rebuild and its independent observation groups"
+                    )
+                semantic_result = apply_planar_multiview_fallback(
+                    gaussians=gaussians,
+                    semantic_state=self.orchestrator.state,
+                    tdom_camera=request.camera,
+                    alignment=request.alignment,
+                    semantic_result=semantic_result,
+                    class_spec=self.dataset.class_spec,
+                    dataset=self.dataset,
+                    source_cameras=source_cameras,
+                    observation_groups=observation_groups,
+                    geometry_scale_ratio=config.max_gaussian_scale_ratio,
+                    config=fallback_config,
+                ).result
             elapsed = time.perf_counter() - started
             if (
                 not final

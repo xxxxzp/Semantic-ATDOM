@@ -75,6 +75,12 @@ from semantic_atdom.semantics.rebuild import (
     FinalRebuildResult,
     FinalSemanticRebuilder,
 )
+from semantic_atdom.semantics.planar_fallback import (
+    PlanarFallbackConfig,
+    PlanarFallbackOutcome,
+    apply_planar_multiview_fallback,
+    find_bounded_class_candidates,
+)
 
 __all__ = [
     "LedgerEntry",
@@ -132,4 +138,8 @@ __all__ = [
     "FinalRebuildMetrics",
     "FinalRebuildResult",
     "FinalSemanticRebuilder",
+    "PlanarFallbackConfig",
+    "PlanarFallbackOutcome",
+    "apply_planar_multiview_fallback",
+    "find_bounded_class_candidates",
 ]

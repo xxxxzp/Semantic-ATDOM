@@ -72,6 +72,7 @@ from semantic_atdom.semantics.orchestrator import (
     MapPublicationRequest,
     OnlineSemanticConfig,
 )
+from semantic_atdom.semantics.planar_fallback import PlanarFallbackConfig
 from semantic_atdom.semantics.publication import (
     MapGridSpec,
     MapPublicationPolicy,
@@ -1474,6 +1475,7 @@ class GaussianTrainer(mp.Process):
         # Optional WP3 sidecar. It is deliberately outside every RGB optimizer.
         self.semantic_hook = None
         self.semantic_tdom_config = None
+        self.semantic_planar_fallback_config = None
         self.semantic_publication_policy = None
         self.semantic_map_error = None
         if self.args.enable_semantics:
@@ -1565,6 +1567,38 @@ class GaussianTrainer(mp.Process):
                 render_palette=render_palette,
                 render_palette_source=render_palette_source,
             )
+            self.semantic_planar_fallback_config = PlanarFallbackConfig(
+                class_name=(
+                    self.args.semantic_tdom_planar_fallback_class.strip()
+                ),
+                min_component_pixels=(
+                    self.args.semantic_tdom_planar_fallback_min_component_pixels
+                ),
+                ring_radius_pixels=(
+                    self.args.semantic_tdom_planar_fallback_ring_radius_pixels
+                ),
+                min_boundary_consensus=(
+                    self.args.semantic_tdom_planar_fallback_min_boundary_consensus
+                ),
+                plane_context_pixels=(
+                    self.args.semantic_tdom_planar_fallback_plane_context_pixels
+                ),
+                min_plane_gaussians=(
+                    self.args.semantic_tdom_planar_fallback_min_plane_gaussians
+                ),
+                max_plane_mad_world=(
+                    self.args.semantic_tdom_planar_fallback_max_plane_mad_world
+                ),
+                min_views=(
+                    self.args.semantic_tdom_planar_fallback_min_views
+                ),
+                min_agreement=(
+                    self.args.semantic_tdom_planar_fallback_min_agreement
+                ),
+                min_groups=(
+                    self.args.semantic_tdom_planar_fallback_min_groups
+                ),
+            )
             self.semantic_hook = AsyncProgressiveSemanticHook.create(
                 dataset_root=self.args.Source_Path_Dir,
                 output_root=os.path.join(
@@ -1634,6 +1668,9 @@ class GaussianTrainer(mp.Process):
                     rgb_pipeline=self.TDOM_pipeline,
                     rgb_background=self.background,
                     semantic_config=self.semantic_tdom_config,
+                    planar_fallback_config=(
+                        self.semantic_planar_fallback_config
+                    ),
                     publication_due=(
                         final
                         or self.semantic_publication_policy.should_publish(

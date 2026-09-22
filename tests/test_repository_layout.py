@@ -81,6 +81,7 @@ class RepositoryLayoutTests(unittest.TestCase):
             "evaluate_metrics.py",
             "prepare_id_labels.py",
             "migrate_run_output.py",
+            "validate_planar_fallback.py",
         }
         self.assertEqual(supported, {path.name for path in (ROOT / "tools").glob("*.py")})
 
@@ -122,6 +123,7 @@ class RepositoryLayoutTests(unittest.TestCase):
                 "0007-bound-semantic-render-support.md",
                 "0008-run-output-contract.md",
                 "0009-published-renders-and-map-training-video.md",
+                "0010-bounded-planar-semantic-fallback.md",
             },
             {path.name for path in decisions.glob("*.md")},
         )

@@ -332,7 +332,7 @@ class SemanticTdomTests(unittest.TestCase):
             torch.tensor([[0.95]]),
             CLASS_SPEC,
             config,
-        )
+        )._replace(class_provenance=torch.tensor([[2]], dtype=torch.uint8))
         with TemporaryDirectory() as directory:
             root = Path(directory)
             manifest_path = write_semantic_tdom(
@@ -354,6 +354,7 @@ class SemanticTdomTests(unittest.TestCase):
                 "semantic_color.png",
                 "unknown_mask.png",
                 "unknown_reason.png",
+                "class_provenance.png",
                 "pixel_evidence_support.tif",
                 "semantic_entropy.tif",
                 "geometry_coverage.tif",
@@ -419,6 +420,17 @@ class SemanticTdomTests(unittest.TestCase):
                 2.0 / 65534.0,
             )
             self.assertNotIn("posterior_variance.tif", payload["files"])
+            self.assertEqual(
+                payload["class_provenance"],
+                {
+                    "file": "class_provenance.png",
+                    "codes": {
+                        "0": "unknown",
+                        "1": "trusted_gaussian",
+                        "2": "planar_multiview_fallback",
+                    },
+                },
+            )
 
             second_manifest = write_semantic_tdom(
                 result,

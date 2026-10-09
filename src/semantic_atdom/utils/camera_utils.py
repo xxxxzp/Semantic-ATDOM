@@ -80,6 +80,14 @@ def cameraList_from_camInfos(cam_infos, resolution_scale, args):
     return camera_list
 
 def camera_to_JSON(id, camera : Camera):
+    # Dataset CameraInfo and loaded Camera use different attribute names.
+    # Serialize intrinsics on the loaded image grid (including RGB resizing).
+    if isinstance(camera, Camera):
+        width, height = camera.image_width, camera.image_height
+        fov_x, fov_y = camera.FoVx, camera.FoVy
+    else:
+        width, height = camera.width, camera.height
+        fov_x, fov_y = camera.FovX, camera.FovY
     Rt = np.zeros((4, 4))
     Rt[:3, :3] = camera.R.transpose()
     Rt[:3, 3] = camera.T
@@ -92,11 +100,11 @@ def camera_to_JSON(id, camera : Camera):
     camera_entry = {
         'id' : id,
         'img_name' : camera.image_name,
-        'width' : camera.width,
-        'height' : camera.height,
+        'width' : width,
+        'height' : height,
         'position': pos.tolist(),
         'rotation': serializable_array_2d,
-        'fy' : fov2focal(camera.FovY, camera.height),
-        'fx' : fov2focal(camera.FovX, camera.width)
+        'fy' : fov2focal(fov_y, height),
+        'fx' : fov2focal(fov_x, width)
     }
     return camera_entry

@@ -2863,8 +2863,8 @@ class GaussianTrainer(mp.Process):
             )
 
         print("\n[Save At Image {}] Saving Gaussians".format(imagedirname))
-        self._write_final_camera_inventory()
         self.scene.save(imagedirname)
+        self._write_final_camera_inventory()
 
     # 该函数将被送入到一个线程中，用于渐进式训练中的数据读取以及预处理
     def run(self):
@@ -3109,6 +3109,11 @@ class GaussianTrainer(mp.Process):
                     time2 = time.time()
                     self.TimeCost["FinalRefinement"] += time2 - time1
 
+                    # Persist the completed RGB model before fallible derived
+                    # products (semantic rebuild, map/video capture, evaluation).
+                    with torch.no_grad():
+                        self.GS_Save(True, final=True)
+
                     # WP3 closes the online group here; WP5 will rebuild exactly.
                     if self.args.render_TDOM and self.TDOM_Cam is None:
                         with torch.no_grad():
@@ -3134,7 +3139,6 @@ class GaussianTrainer(mp.Process):
                     self.DataSaver_queue.put(msg)
 
                     with torch.no_grad():
-                        self.GS_Save(True, final=True)
                         self.Evaluate("Final_Refinement", True)
 
                     # 像后端传递信息

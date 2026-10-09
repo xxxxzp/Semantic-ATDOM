@@ -1180,10 +1180,14 @@ class ProgressiveSemanticHook:
             _image_id(camera.image_name): camera for camera in cameras
         }
         all_ordered = tuple(overlap.acquisition_order)
-        ordered = tuple(
-            image_id
-            for image_id in all_ordered
-            if image_id in camera_by_id
+        # The live camera inventory is cumulative even when the SfM overlap
+        # export temporarily omits an old identity.  Overlap is needed only
+        # for anchor/new-observation grouping, not to admit camera evidence.
+        # Final rebuilding still uses the authoritative final overlap graph.
+        ordered = (
+            tuple(image_id for image_id in all_ordered if image_id in camera_by_id)
+            if final
+            else tuple(sorted(camera_by_id, key=_acquisition_key))
         )
         if stage_boundaries is not None:
             self._stage_boundaries = list(stage_boundaries)
@@ -1248,22 +1252,9 @@ class ProgressiveSemanticHook:
                 self.dataset.semantic_root / "metadata" / (image_id + ".json")
             ).is_file()
         )
-        missing_overlap_identities = tuple(
-            sorted(set(camera_by_id) - set(all_ordered), key=_acquisition_key)
-        )
-        can_ingest_online = not missing_overlap_identities
-        if online_usable and not final and missing_overlap_identities:
-            errors.append(
-                "overlap snapshot omits persistent cameras {}; deferring new "
-                "semantic observations until a complete overlap snapshot".format(
-                    ", ".join(missing_overlap_identities)
-                )
-            )
-            deferred.extend(newly_ready)
         if (
             online_usable
             and not final
-            and can_ingest_online
             and ledger_images
             and newly_ready
             and min(_acquisition_key(item) for item in newly_ready)
@@ -1282,7 +1273,7 @@ class ProgressiveSemanticHook:
             except Exception as error:
                 errors.append("active-window refresh: {}".format(error))
         for position, image_id in enumerate(
-            ordered if online_usable and can_ingest_online else ()
+            ordered if online_usable else ()
         ):
             if image_id in ledger_images:
                 try:

@@ -1,5 +1,10 @@
 # 语义链路第一性原理加固（2026-09-21）
 
+2026-10-09 核对说明：本文记录当时实现与 231 项测试，不能解读为全部第一性原理
+问题已解决。当前测试为 245 项通过；R05、R06、R08 等后续发现仍待修复，详见
+[审查记录](../problem/first-principles-code-review-2026-10-09.md)。当时未做全量训练，
+后续历史成功 run 与当前提交验收须另行区分。
+
 ## 验收不变量
 
 本轮不以“流程能够运行”为正确性标准，而以以下不变量作为验收边界：
@@ -29,7 +34,8 @@
 
 `SemanticGaussianState.replace_open_group` 通过已有一阶矩和方差重建加权二阶矩，
 在替换开放组时先减旧组、再加新组。这样无需新增长期 `N×K` 张量，也能维护真实的
-在线组间方差。只有局部至少两个组且历史几何未标 stale 时才声明该诊断可用。
+在线组间方差。实现目前按包含开放组的总数判断资格，与合同要求的两个有效闭合组
+不同；这是 R05 待修复项。其可用性也不能自动声明为 `exact_rebuild`。
 
 ### 最终不可变输入绑定
 
@@ -43,7 +49,9 @@
 - 每张实际 RGB bytes 的 hash 及 metadata source binding。
 
 绑定摘要写入最终 rebuild metrics、语义 recovery provenance 和 RGB/Semantic pair
-manifest。输入在长时间训练期间被一致替换时，流程不再错误发布 `exact_final`。
+manifest。该校验覆盖列出的 RGB/label/stage 字节身份；完整 checkpoint/prompt/
+thresholds 生成配置尚未与训练前预检绑定（R08）。不能把它扩大表述为任何来源变化
+都已被拒绝。
 底层 hook 的权威完整性默认值同时改为 false；只有训练 preflight 或显式外部验证者
 可以把它提升为 true，避免未绑定的自定义调用默认声称权威。
 

@@ -1,9 +1,15 @@
 # AMtown01 渐进式语义训练与 159 帧视频实验参考
 
 
-状态：实验方案与复现记录模板（全量训练结果待在 GPU-enabled 环境中重新执行后填写）  
+状态：159 帧计划参数与复现模板；已有独立的 160 帧全量成功运行，不代表本方案已按原参数验收
 数据集：`UAVScenes_Onthefly/interval5_AMtown01`  
-更新日期：2026-09-30
+更新日期：2026-10-09
+
+现存 `amtown01-full-progress160-fixed_20260930-134152_bf6a7c9` 已成功完成：
+stage 13–487、487 个最终相机、100,800 次优化、最终 `exact_final`，视频经本次
+ffprobe 核对为 160 帧、4 fps。该运行来自 dirty worktree，不是当前干净 HEAD 的
+全量验收。本文件保留 159 帧计划；实际运行身份和数据见
+[当前数据与实验核对](../project/current-data-experiment-status.md)。
 
 ## 1. 实验目标
 
@@ -24,7 +30,7 @@ stage 边界进行均匀采样。
 
 - 仓库：`/home/xuzipeng/code/Semantic-A-TDOM/Semantic-A-TDOM`
 - 分支：`semantic/g1-evidence-v2`
-- 当前代码基线：`bf6a7c9`
+- 原方案基线：`bf6a7c9`；本次文档核对的当前代码为 `0665f4b`，没有重新全量训练
 - 关键语义空洞修复：`550408c`，即 bounded planar semantic fallback
 
 正式运行前应将以下信息写入 run 的 `provenance/`，并确认代码改动状态：
@@ -52,7 +58,7 @@ Semantic input:
 - progressive stage：`13..487`，共 475 个连续 stage；
 - RGB：`interval5_CAM`；
 - 原始影像尺寸：约 `2448 × 2048`；
-- 语义标签：490 张，逐图与 RGB 绑定；
+- 语义交付：490 张；所选阶段最终预检及累计相机清单是 487 个身份，不能将两种计数等同；
 - 语义类别：15 类，ignore id 为 `255`；
 - full preflight 应报告：`labels_complete=True`、`source_binding_complete=True`。
 
@@ -148,8 +154,9 @@ TDOM 相机使用约 8 倍更粗的地图采样率，以控制渲染和进程间
 <run_root>/metrics/training_progress.json
 ```
 
-159 帧相较于此前 120 帧约增加 32.5% 的进度渲染开销。Gaussian 优化迭代次数不变，
-但总墙钟时间、GPU 渲染时间、CPU 队列传输和临时帧存储会增加。
+159 相较于 120 的目标帧数增加 32.5%，不等于总渲染开销已实测增加同样比例。
+Gaussian 优化迭代次数不变；墙钟时间、渲染、队列传输和存储成本须通过同配置
+实验测量，不能从帧数直接推出性能结论。
 
 ## 6. 小范围 smoke test
 
@@ -213,9 +220,9 @@ test -w /data3/xzp/data/UAVScenes_Onthefly/interval5_AMtown01/outputs
 `torch_shm_manager` socket 创建失败。正式运行前应确认共享内存已经释放，不能擅自
 删除其他用户的任务目录。
 
-另外，当前 Codex 隔离 shell 曾出现宿主机 GPU 可见但 `/dev/nvidia*` 未透传的情况。
-这种状态不能用于训练；必须确认 `nvidia-smi` 和 PyTorch CUDA 检查在同一个实际运行
-环境中通过。
+历史隔离 shell 曾出现宿主 GPU 可见但设备未透传的情况。2026-10-09 审查环境的
+PyTorch CUDA 可用，CUDA 测试通过；不能继续笼统描述当前环境没有 GPU。
+每次实际运行仍应检查该 shell 的设备可用性。
 
 ## 8. 成功验收标准
 
@@ -227,7 +234,8 @@ test -w /data3/xzp/data/UAVScenes_Onthefly/interval5_AMtown01/outputs
 4. `videos/training_progress.mp4` 可被 `ffprobe` 验证为 H.264，帧数与 metadata 一致；
 5. `products/maps/` 中存在最终 RGB/Semantic 地图及 pair manifest；
 6. `renders/cameras/` 中存在全部最终相机渲染；
-7. 最终语义状态为 `exact_final` 或等价的完成状态，且没有未解释的 error/deferred；
+7. 最终语义状态必须为 `exact_final`，地图发布为 `complete`，且 error/deferred 为空；
+   `exact_partial`、`online_fallback` 不是这个完整方案的等价成功状态；
 8. 在线语义状态只用于体现真实渐进过程，最终地图质量以 final exact rebuild 为准。
 
 ## 9. 相关设计记录

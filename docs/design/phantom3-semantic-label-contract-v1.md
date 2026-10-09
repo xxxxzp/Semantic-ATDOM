@@ -2,6 +2,13 @@
 
 ## 目的与适用范围
 
+2026-10-09 范围说明：本文保留早期 102 张 `phantom3_test100` 的接口示例，不能把
+它当作当前数据盘点。当前 Phantom3 交付为 414 份标签和 metadata，放在场景根的
+`semantic_labels/semantic/` 下；具体路径、尺寸及绑定证据见
+[当前数据与实验核对](../project/current-data-experiment-status.md)。
+文件内容约束仍适用，但 semantic root 可独立于 RGB/SfM root。AMtown01 是独立
+十五类 schema，使用小数时间戳身份，不能复用本例的六位编号与八类定义。
+
 本文规定 `datas/phantom3_test100` 在 Semantic A-TDOM 第一阶段需要提供的离线语义结果。它是 SAM3、ProC-SAM3 或后续其他标签生成器与 Semantic A-TDOM 之间的文件接口，不规定必须使用哪一个模型。
 
 `phantom3_test100` 的数字阶段目录是累积式 SfM 快照：例如 `30/images` 包含前 30 张影像，`31/images` 包含前 31 张影像。相同影像不会因为出现在多个阶段中而成为新的语义观测。因此，每张原始影像的语义结果在数据集根目录只保存一份，不在各阶段目录中复制。
@@ -16,7 +23,7 @@
 
 完整类别 scores 不是第一阶段运行的必需输入。`confidence map`、实例 mask、检测框和彩色预览图也不是融合输入。
 
-对于当前 102 张影像，最小交付物共包含 1 份类别规范、102 张标签 PNG 和 102 份 metadata JSON。
+对于本历史示例的 102 张影像，最小交付物共包含 1 份类别规范、102 张标签 PNG 和 102 份 metadata JSON。
 
 ## 规范目录结构
 
@@ -51,7 +58,7 @@ phantom3_test100/
 标签文件必须满足：
 
 - 与 RGB 影像使用相同文件主名；
-- 与 RGB 影像逐像素对齐，当前数据为宽 1600、高 897；
+- 与 RGB 影像逐像素对齐，本历史示例为宽 1600、高 897；当前交付尺寸见数据核对记录；
 - 单通道 8-bit grayscale PNG，即 PIL `L` 模式、NumPy `uint8`；
 - 每个像素只保存一个闭集类别 ID；
 - 像素值只能是 `0..7` 或 `255`；

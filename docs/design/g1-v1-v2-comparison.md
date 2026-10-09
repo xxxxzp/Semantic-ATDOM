@@ -2,12 +2,17 @@
 
 ## 文档定位
 
-- 状态：当前实现总结，依据截至2026-09-14已经合入并通过 Phantom3 全量运行的代码。
+- 状态：截至2026-09-14的设计与实现演进总结，保留历史比较范围。
 - 当前语义方法：`g1-evidence-v2`。
 - 已退役历史对照：`g1-prior-v1`，仅由冻结标签保留。
 - 当前最小算法 baseline：`g1-evidence-v1.1`，冻结用于复现和 A/B 对照。
 - 本文解释设计演进和工程差异，不替代
   [Semantic TDOM V1 权威数学与产品合同](semantic-tdom-v1.md)。
+
+2026-10-09 的数据与实验事实见
+[当前核对记录](../project/current-data-experiment-status.md)，代码与合同的已知偏差见
+[第一性原理审查](../problem/first-principles-code-review-2026-10-09.md)。
+下文描述的设计能力和历史通过项不表示当前 R01–R09 已修复。
 
 ## 首先澄清两个“版本”维度
 

@@ -1,5 +1,12 @@
 # Phantom3 Semantic A-TDOM V2 完整实验记录
 
+状态：2026-09-14 的 399 张历史运行，含 2026-09-15 冻结模型重渲染记录。
+2026-10-09 注：本文的旧输入路径、1600×897 标签版本、缺失 source binding 和
+`exact_partial` 结论只适用于该历史运行。当前 Phantom3 交付为 414 张、1870×1049，
+最近相关运行预检记录 source binding 完整，详见
+[当前数据与实验核对](current-data-experiment-status.md)。
+本文的命令、指标和 143 项测试计数不更新为新实验数字，避免混淆不同运行。
+
 ## 实验身份
 
 - 日期：2026-09-14
@@ -94,7 +101,7 @@ geometry coverage 中位数约0.9998、support ratio 中位数约0.9464；因此
 - 新 semantic manifest SHA-256：
   `41c06012d9edb99fd0d2917ad63f6fbcae74481c2180b316e88cc99206a81c03`。
 
-最终权威入口是：
+原始历史运行的产品入口是（不是后续尺度过滤重渲染或当前 outputs/latest）：
 
 ```text
 /data3/xzp/data/Onthefly/outputs/semantic_atom_v2/Map_Products/latest.json
@@ -137,7 +144,7 @@ hash、alignment hash、字节数以及最终 latest 指针，结果均通过。
 5. 代码测试共143项全部通过；`python -m compileall -q src`、
    `git diff --check` 和正式产物完整性检查均通过。
 
-## 仍未验证
+## 该历史运行的未验证项
 
 - 标签 source-image binding 尚不完整，因此不能升级为 `exact_final`。
 - 当前地图是无 GIS CRS 的局部固定网格，不能宣称地理坐标已校准。

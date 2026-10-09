@@ -6,6 +6,27 @@ Yiwei Xu, Xiang Wang, Yifei Yu, Wentian Gan, Luca Morelli, Giulio Perda, Xin Wan
 
 ![image](assets/docs/overview.png)
 
+## Current Semantic A-TDOM status
+
+This checkout develops Semantic A-TDOM on `semantic/g1-evidence-v2`. The current
+validated environment is the Linux `semantic-atdom` environment; the Windows
+GUI/SfM instructions below describe the upstream workflow and do not establish
+validation of the current semantic pipeline on Windows.
+
+Start with [current project context](docs/project/global-context.md) and the
+[data and experiment inventory, checked 2026-10-09](docs/project/current-data-experiment-status.md).
+Current deliveries contain 414 Phantom3 labels and 490 AMtown01 labels; the
+selected AMtown01 progressive run has 487 final cameras. A historical AMtown01
+run completed with a 160-frame video. These runs include dirty worktrees and
+are distinct from a full-run validation of the current commit.
+
+The [first-principles review](docs/problem/first-principles-code-review-2026-10-09.md)
+records open recovery, worker shutdown, geometry sampling and product-contract
+issues despite 245 passing tests. Use the current Linux entry point
+`tools/train_progressive.py`, an explicit semantic delivery root, and
+`--resolution 1` for semantic training. Historical commands and results retain
+their original scope; see the linked documents for current defaults and limits.
+
 # Important Notice (Please Read before Start!!!)
 
 The Python environment configuration differs significantly between **Windows** and **Linux** in this project,
@@ -25,16 +46,18 @@ We also provide a **video demonstrating how to use On-the-Fly SfM and A-TDOM**, 
 
 ```shell
 # SSH
-git clone git@github.com:xywjohn/A-TDOM.git --recursive
+git clone git@github.com:xxxxzp/Semantic-ATDOM.git
 ```
 or
 ```shell
 # HTTPS
-git clone https://github.com/xywjohn/A-TDOM --recursive
+git clone https://github.com/xxxxzp/Semantic-ATDOM.git
 ```
 
 The required CUDA dependencies are preserved as offline archives in
 `third_party/archives/` and as clean build sources in `third_party/src/`.
+The original A-TDOM repository is the upstream reference; select
+`semantic/g1-evidence-v2` for the active semantic development line.
 
 Both environment setup flows below install the project in editable mode. This
 step is required before running any command under `tools/`.
@@ -67,7 +90,9 @@ supported command interfaces.
 - [G1 V1, V1.1, and V2 design comparison](docs/design/g1-v1-v2-comparison.md)
 - [Authoritative Semantic TDOM V1 / G1 Evidence V2 contract](docs/design/semantic-tdom-v1.md)
 - [Current project context](docs/project/global-context.md)
-- [Validated Phantom3 V2 experiment](docs/project/phantom3-semantic-atom-v2-result.md)
+- [Current data and experiment status](docs/project/current-data-experiment-status.md)
+- [Historical 399-camera Phantom3 V2 experiment](docs/project/phantom3-semantic-atom-v2-result.md)
+- [Open first-principles review findings](docs/problem/first-principles-code-review-2026-10-09.md)
 - [Bounded planar semantic fallback decision](docs/decisions/0010-bounded-planar-semantic-fallback.md)
 
 # Windows Env Setting
@@ -203,11 +228,14 @@ python tools/train_gui.py
   --GSD_y [float]
 ```
 
-Semantic progressive runs must also pass an explicit semantic delivery root,
-for example `--enable_semantics --semantic_data_root /path/to/delivery`. The
-root must contain `semantic/class_spec.json`, `semantic/labels/`, and
-`semantic/metadata/`. Inputs are preflighted read-only; generated point-cloud
-caches and the preflight report are written below `Model_Path_Dir/cache/`.
+For the current Linux semantic entry point `tools/train_progressive.py`, pass
+`--enable_semantics --semantic_data_root /path/to/delivery --resolution 1`.
+The delivery root must contain `semantic/class_spec.json`, `semantic/labels/`,
+and `semantic/metadata/`. With `--run_name`, published output is allocated under
+`<output_root>/runs/<run_id>/`. Progressive caches live in `<run>/.work/cache/`
+and the retained preflight report in `<run>/provenance/dataset_preflight.json`.
+This contract does not imply that the historical GUI entry point supports the
+same flags. The standalone render reader still has a source-write issue (R03).
 
 <details>
 <summary><span style="font-weight: bold;">Necessary command Line Arguments for tools/train_gui.py</span></summary>
@@ -308,9 +336,11 @@ development machine; change it only when intentionally targeting another GPU.
 
 # Linux Run
 
-Since **On-the-Fly SfM** is not currently available on **Linux**, 
-running **A-TDOM** on Linux requires first executing **On-the-Fly SfM** on **Windows** and saving the intermediate results.
-These results should then be transferred to the Linux environment to proceed with subsequent **3DGS training** and **TDOM generation**.
+The current Linux progressive pipeline consumes exported stage snapshots; it
+does not estimate camera poses internally. The On-the-Fly SfM workflow below
+describes the historical Windows export route. Existing datasets can provide
+compatible `GaussianSplatting/<stage>/bin` or `<stage>/sparse/0` snapshots,
+including the current Phantom3 and UAVScenes deliveries.
 
 In this project, we provide executable versions of **On-the-Fly SfM**,
 which can be download here from [Google Drive](https://drive.google.com/drive/folders/1h322jgzVjQypALrArmYabavg2_NjR3Wl?hl=zh-cn) 

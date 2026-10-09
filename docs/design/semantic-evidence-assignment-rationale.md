@@ -1,9 +1,14 @@
 # Semantic A-TDOM：逐高斯语义证据赋值的设计思路与考虑
 
-- 状态：当前实现说明
+- 状态：主链路设计与实现说明；存在已记录的合同缺口
 - 适用路线：G1 Evidence V2
-- 更新日期：2026-09-21
+- 实现说明基线：2026-09-21；状态核对日期：2026-10-09
 - 权威数学合同：[Semantic TDOM V1 / G1 Evidence V2](semantic-tdom-v1.md)
+
+本文解释主链路为何这样设计，不作为所有工程边界均已满足的验收。在线诊断、
+partial 重建和输入来源绑定的当前缺口见
+[第一性原理审查](../problem/first-principles-code-review-2026-10-09.md)；
+数据与实际实验进展见 [当前核对记录](../project/current-data-experiment-status.md)。
 
 ## 1. 核心结论
 

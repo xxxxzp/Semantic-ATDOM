@@ -2,8 +2,8 @@
 
 ## 文档状态
 
-- 状态：G1 Evidence V2 已实现，并完成 Phantom3 全量训练、最终语义重建和 RGB/Semantic 成对发布验证。
-- 确认日期：2026-09-15。
+- 状态：G1 Evidence V2 主链路已实现，有历史全量成功运行；2026-10-09 审查确认仍有恢复、进程收尾、几何采样和产品声明缺口。
+- 核对日期：2026-10-09；当前代码基线 `0665f4b`。
 - 当前开发分支：`semantic/g1-evidence-v2`。
 - 适用范围：Semantic A-TDOM 的仓库治理、数据、环境、训练期语义主链路和产品状态。
 
@@ -30,13 +30,19 @@
 | Phantom3 label/metadata 的文件 schema 与类别 ID | [Phantom3 语义标签交付规范](../design/phantom3-semantic-label-contract-v1.md) |
 | 类别本体 | 当前数据版本的 `semantic/class_spec.json` |
 | 单次运行参数 | 保存的实验配置和显式 CLI |
+| 当前本机数据与实验进展 | [当前数据与实验核对](current-data-experiment-status.md)及其中引用的 run/预检/产品记录 |
+| 当前代码与合同的偏差 | [第一性原理审查](../problem/first-principles-code-review-2026-10-09.md)，R01–R09 均待处理 |
 | 环境依赖 | 正式验证后的 `environment.yml` 与 fingerprint |
 | 标签来源 | 每影像 metadata |
 | 产品身份、对齐和质量状态 | 产品及 pair manifest |
 
 若旧研究文档、历史源码默认或注释与 G1 Evidence V2 合同冲突，以当前合同为准，并将旧内容标为 superseded，而不是维持两套“已确认”定义。
 
-Phantom3 交付规范仍含早期 `phantom3_test100`、102张和 semantic 同置布局示例；这些只作为历史合同示例，不是当前运行默认。当前本机路径、完整399张运行和外置 semantic root 以本文及[完整实验记录](phantom3-semantic-atom-v2-result.md)为准。
+设计合同描述必须满足的要求，不能单凭合同推断实现已经满足。实验结论绑定特定 run、
+输入版本和代码状态；dirty worktree 的成功不能外推为当前干净提交的验收。
+Phantom3 交付规范中的 `phantom3_test100`、102 张示例，以及
+[399 张实验](phantom3-semantic-atom-v2-result.md)均为历史记录；当前交付与进展以
+[数据与实验核对](current-data-experiment-status.md)为准。
 
 ## 项目与代码边界
 
@@ -76,31 +82,38 @@ Phantom3 交付规范仍含早期 `phantom3_test100`、102张和 semantic 同置
 ### 规范本地路径
 
 ```text
-RGB/SfM 数据根目录：/data3/xzp/data/Onthefly/phantom3
-语义交付根目录：   /data3/xzp/data/Onthefly/semantic_labels
-实际语义目录：     /data3/xzp/data/Onthefly/semantic_labels/semantic
+Phantom3 场景根：/data3/xzp/data/Onthefly/phantom3
+Phantom3 渐进输入：/data3/xzp/data/Onthefly/phantom3/GaussianSplatting
+Phantom3 语义交付父目录：/data3/xzp/data/Onthefly/phantom3/semantic_labels
+Phantom3 实际语义目录：/data3/xzp/data/Onthefly/phantom3/semantic_labels/semantic
+
+AMtown01 场景根：/data3/xzp/data/UAVScenes_Onthefly/interval5_AMtown01
+AMtown01 语义交付父目录：/data3/xzp/data/UAVScenes_Onthefly/interval5_AMtown01/outputs/semantic_inputs/uavscenes_amtown01_observed_v1
 ```
 
-这些是当前机器默认值，不允许硬编码进算法。启用语义时必须显式提供 non-empty semantic data root；当前 CLI 语义是传入“包含 `semantic/` 的父目录”。
+这些是本机已存在的路径，不是算法默认值。启用语义时必须显式提供 non-empty
+semantic data root，即包含 `semantic/` 的父目录。历史文档中不含 `phantom3/` 的
+旧语义路径不能直接用于当前交付。
 
-### CURRENT DECISION：验证切片
+### HISTORICAL STATUS：早期验证切片
 
 - 初始化 stage 30。
 - stage 30 到 31 smoke 已通过。
-- 正式运行采用 `StartFromImageNo=30`、`EndAtImageNo=400`，完成最终集合399张；stage 编号不是已消费影像数。
+- 2026-09-14 的历史运行采用 `StartFromImageNo=30`、`EndAtImageNo=400`，完成最终集合399张；stage 编号不是已消费影像数。
 - “前100张”指 stage 100 注册集合，不指任意目录排序的前100个文件。
-- stage 30 到 100 是早期验证目标，已被本次完整399张实验覆盖。
+- stage 30 到 100 是早期验证目标，已被当时的完整399张实验覆盖。
 
-### CURRENT STATUS：实际数据事实
+### CURRENT STATUS：当前数据事实
 
-- `phantom3` 有数字阶段 3 到 400。
-- stage 100 的 ID 为 `000001..000100`。
-- 最终集合有399张，编号 `000001..000402`，缺少 `000384..000386`。
-- 后期阶段存在非连续 image ID，但 preflight 按实际 camera/stage 集合核验并已通过完整运行。
-- 存储 RGB/label 为 1600×897；`cam_params.json` 原始 SfM 坐标为 1870×1049，两套坐标不能混用。
-- 当前语义交付有399份 label/metadata，没有 `scores/`。
-- 前100张 background 像素为0；全部399张只有 `000112.png` 含6038个 background 像素，约占总像素0.001054%。
-- 当前应描述为“八类 schema，前100张实质观测到类别1–7和ignore”，不能声称八类均已验证。
+- Phantom3 当前为 stage 14–414，共 401 个目录；最近全量预检/最终相机清单包含
+  414 个身份，交付 414 份 label/metadata，尺寸记录为 1870×1049，没有 scores。
+- AMtown01 当前为 stage 13–487，共 475 个目录；交付 490 份 label/metadata，
+  尺寸记录为 2448×2048；所选全量阶段的最终有效相机数为 487，不能写成 490。
+- 两个当前交付的 metadata 分别有 414/490 份 source hash；相应历史成功运行预检
+  记录源绑定完整。本次盘点未重新执行全部输入内容哈希验证。
+- Phantom3 是八类、AMtown01 是十五类，类别名称/ID 从各自 class spec 读取。
+- 399 张、1600×897、缺少 `000384..000386` 和 6038 个 background 像素等结论
+  只描述旧数据版本，不用于当前分布；当前各类别准确率尚未独立验证。
 
 ## 语义数据合同摘要
 
@@ -109,21 +122,24 @@ RGB/SfM 数据根目录：/data3/xzp/data/Onthefly/phantom3
 ```text
 semantic/
 ├── class_spec.json
-├── labels/<six-digit-image-id>.png
-├── metadata/<six-digit-image-id>.json
-└── scores/<six-digit-image-id>.npy        # 可选
+├── labels/<image-id>.png
+├── metadata/<image-id>.json
+└── scores/<image-id>.npy        # 可选
 ```
 
-- 六位数字 filename stem 是 RGB、camera、label 和 metadata 的共同身份。
-- 当前消费顺序是数字 stem；`imagesNames.txt` 只用于 match matrix 行列寻址。
+- RGB、camera、label 和 metadata 共享规范化 image ID；Phantom3 为六位编号，
+  AMtown01 为小数时间戳。`normalize_image_identity()` 只剥离已知图像后缀，保留小数。
+- 当前消费顺序按数值身份排序；overlap 名称表用于矩阵寻址，不等于采集顺序。
 - 真实采集顺序若不同，必须新增显式 manifest，不能静默改排序。
 - label 必须与运行时 RGB/camera tensor 严格同尺寸、同方向、同坐标。
-- 运行时禁止 resize/rotate/flip label；转换必须作为新数据准备版本完成。
+- 运行时禁止隐式 resize/rotate/flip label；启用语义须使用 `--resolution 1`。
+  对有畸变/主点偏移的相机，当前代码显式使用同一标定映射整流 RGB 和标签，
+  分别采用线性/最近邻插值；这与任意改变标签像素域不同。
 - stage 内遗留三分类 `labels/` 不是权威输入，禁止消费。
 
 ### MUST：类别与 ignore
 
-当前数据版本的类别顺序是：
+下表是 Phantom3 当前交付的类别顺序；AMtown01 的十五类见其 class spec，不能复用此表：
 
 | ID | 名称 |
 |---:|---|
@@ -145,16 +161,22 @@ semantic/
 
 - metadata 必须绑定 label/version/model/checkpoint/prompt/threshold/尺寸/ontology/label hash。
 - 新生成 metadata 必须包含 source image 和 SHA-256。
-- 当前最早102份缺少 source binding，允许用于标为 `source_binding=unverified` 的开发 smoke。
+- 早期 102/399 张交付有 source binding 缺口，这是历史事实；当前两份交付和
+  相应运行预检已记录完整绑定，不能继续笼统描述为“当前标签来源未验证”。
 - 正式 `exact_final` 要求 source hash 与当前 RGB 一致，并验证方向/坐标约定。
 - 仅补齐正确 source hash且像素/生成配置不变时，可以保留 label version。
 - 标签、本体、模型或生成配置变化时必须发布新版本。
-- 在线遇到首个缺口后维持连续 readiness watermark；最终重建可以利用缺口后的所有有效标签。
+- 在线遇到首个缺口后须维持连续 readiness watermark；最终重建应利用缺口后的
+  有效标签。但默认训练 preflight 会先要求所选集合标签完整，独立 partial API
+  对损坏 metadata 的隔离仍有 R06 缺口。
 - 缺失不得跳过后当作 background。
 
 ### MUST：原始数据只读
 
-RGB、SfM 和 semantic roots 是只读输入。派生 PLY、索引和转换结果写入 `OUTPUT_ROOT/cache/<dataset-id>/<stage>/`，模型、日志、sidecar 和地图写入 output root。在缓存架构完成前，只能对明确的工作副本执行会写 source 的入口。
+RGB、SfM 和 semantic roots 必须只读。当前 progressive 训练的派生 PLY/cache 位于
+`<run>/.work/cache/<dataset-id>/`，预检副本位于 `provenance/dataset_preflight.json`；
+成功后工作缓存清理。独立 `tools/render.py` 仍可能写 source PLY（R03），不能声明
+所有入口都已满足只读要求。
 
 运行前的只读 preflight 必须核验 stage/camera/RGB/overlap 集合、矩阵、累积性、label/schema/metadata/hash 和显式 root，并报告类别分布、ignore、overlap 分组、source provenance 与后期异常。报告 hash 进入训练和最终产品 manifest。
 
@@ -182,8 +204,9 @@ RGB、SfM 和 semantic roots 是只读输入。派生 PLY、索引和转换结�
 
 - 正式 `semantic-atdom` 已从当前 `environment.yml` 建立；editable package 和全部本地扩展指向当前仓库源码。
 - 真实 import、semantic CUDA symbols、CPU/schema/CUDA 测试和 stage 30→31 smoke 均已通过。
-- 完整399张训练、冻结几何精确语义重建及原子 RGB/Semantic pair 已完成；修复局部地图和大图 RGB OOM 后，最终代码验证为143项测试通过。
-- 训练开始环境记录在输出根 `environment_fingerprint.json`；收尾代码和环境记录在 `final_environment_fingerprint.json`。
+- 当前审查环境的完整测试为 245 项通过，包括 CUDA；143 项是 2026-09-14 的历史计数。
+- 当前 output schema v2 的环境记录为 `provenance/environment_start.json` 和
+  `provenance/environment_end.json`；旧 fingerprint 文件名仅用于历史结果。
 
 ## G1 Evidence V2 摘要
 
@@ -205,7 +228,8 @@ RGB、SfM 和 semantic roots 是只读输入。派生 PLY、索引和转换结�
   高斯子集，且不能定义通用 no-data footprint；后续须另行设计与 RGB 颜色、SAM 标签
   均无关的权威像素有效域。
 - clone/split 的硬不变量是拓扑前后渲染语义场连续；后代复制父状态只是待数值测试的 V2 初始近似。
-- online group disagreement 必须真实更新；最终重建中仅多组证据提供有效支持，局部支持不足的像素是 NaN，不是0，也不应使整幅诊断图失效。
+- online group disagreement 必须由至少两个有效闭合组支持。实现仍会计入开放组，
+  且将可用在线诊断标为 `exact_rebuild`（R05）；不能把这一合同当作已完成的验证。
 
 ## 在线、最终与地图产品
 
@@ -230,7 +254,9 @@ RGB、SfM 和 semantic roots 是只读输入。派生 PLY、索引和转换结�
 
 RGB/Semantic 产品使用共同 `projection_geometry_hash`，完整 RGB 另有 `rgb_model_hash`，语义另有由状态内容计算的不可变 `semantic_state_hash`。pair 不引用会被轮换覆盖的 sidecar slot；两侧 manifest 由最后原子发布的 `pair_manifest.json` 引用。
 
-在线核心产物只保存 hard/color/unknown/evidence-support/entropy/schema/manifest；final 默认增加 coverage、support ratio、Top-1、margin、mixture/group disagreement 和 variance proxy。完整概率栅格始终可选。文件精确定义见权威数学合同。
+当前 CLI 默认只保存核心 hard/color/unknown/evidence-support/entropy/schema/manifest；
+`semantic_tdom_save_diagnostics=False`，最终发布也不默认保存全部诊断栅格。
+诊断和概率栅格需分别显式启用。合同的理想诊断集合与代码默认产物不得混用。
 
 ## 术语
 
@@ -249,13 +275,17 @@ RGB/Semantic 产品使用共同 `projection_geometry_hash`，完整 RGB 另有 `
 
 - 正式硬件基线是单张 24 GB RTX 4090。
 - 非发布 stage 的 semantic snapshot 只包含投影需要的几何与相机，不复制无关 SH；paired publication 的共同 snapshot 为渲染 RGB 必须额外包含 SH。
-- 使用显式低优先级 CUDA stream、ready event、full-snapshot 复制前显存预检、保守输出预算、时间预算和 checkpoint cadence。
+- 使用显式 CUDA stream/priority、ready event、snapshot 复制前显存预检、输出预算和时间预算；CLI 默认 priority 为 0，不能笼统声明默认是低优先级。
 - 超预算时依次停止中间诊断写盘、跳过过时地图渲染并合并到最新 snapshot；不阻塞几何、不丢标签。
 - sidecar checkpoint 只保存 `xyz/opacity/scale/rotation`，不复制 SH；其 `rgb_model_hash` 可以为空。只有 paired publication 的共同冻结快照包含 RGB appearance。
-- 当前未校准运行默认值为：地图每 1 个 stage 候选发布、sidecar 每 5 个 stage checkpoint、512 像素 tile、512 MiB CUDA headroom、8 GiB pair 输出上限、30 秒在线时间预算；final 总是尝试发布和 checkpoint。时间预算是 CUDA 调用边界上的 best-effort gate，不是对单个不可中断 kernel 的硬 deadline。
+- 当前未校准 CLI 默认：`semantic_tdom_final_only=True`、语义 checkpoint 间隔 0
+  （关闭过程恢复槽）、512 像素 tile、512 MiB headroom、8 GiB pair 上限、30 秒
+  在线预算、stream priority 0。地图 cadence 参数为 1，但不表示默认逐阶段发布。
+  无在线消费者时语义只在最终边界重建；训练视频会要求在线语义。final 模型仍归档。
+  时间预算是调用边界的 best-effort gate，不是不可中断 kernel 的硬 deadline。
 - final exact rebuild 单独统计，不计入在线 SLO。
 - `lag<=1` 和具体耗时比例在真实 profile 前只是目标，不能写成已保证事实。
-- 修复后的完整运行中，final exact rebuild 用时111.338秒，峰值 CUDA allocation 约3.15 GB；该数据来自可用显存高于单卡24 GB基线的机器，不替代24 GB目标硬件验证。
+- 2026-09-14 的历史399张运行中，final exact rebuild 用时111.338秒，峰值 CUDA allocation 约3.15 GB；该数据来自可用显存高于单卡24 GB基线的机器，不替代24 GB目标硬件验证。
 
 ## 版本与实施状态
 
@@ -264,26 +294,32 @@ RGB/Semantic 产品使用共同 `projection_geometry_hash`，完整 RGB 另有 `
 - 旧 sidecar 不允许静默 resume，必须从对应几何和标签重建。
 - 旧产物保留时必须标为 superseded，不在原目录无提示覆盖。
 
-截至 2026-09-14：
+截至 2026-10-09，区分已存在的实现、历史运行和未关闭缺口：
 
-| 项目 | 状态 |
+| 项目 | 当前状态 |
 |---|---|
-| 项目范围和几何防火墙 | 已确认 |
-| G1 Evidence V2 数学/产品合同 | 已确认 |
-| 文档权威收敛 | 已完成 |
-| CPU reference/tests | 已完成 |
-| G1 state/recovery/product schema | 已完成 |
-| CUDA V2 实现 | 已完成 |
-| online 状态与独立 final recovery | 已完成 |
-| fixed-grid paired publication | 已通过完整 Phantom3 CUDA 运行；历史 pair 的完整 hash 链复算通过；异常尺度过滤修复后又以同一冻结最终快照完成9216×11264整图重渲染回归 |
-| read-only preflight/cache | 已完成；完整399张 preflight 通过，source binding 仍不完整 |
-| 正式 `semantic-atdom` 环境 | 已建立并完成来源 fingerprint |
-| stage 30→31 smoke | 已在最终修复提交上通过，最终 `lag=0` |
-| 完整399张运行 | 已完成；942,438个高斯，9216×11264全局地图，最终状态 `exact_partial` |
+| G1 Evidence V2 主链路 | 已实现；存在历史全量训练、最终重建与 paired publication 成功记录 |
+| 数学/产品合同 | 已确认，不能据此断言所有代码边界已满足 |
+| CPU/CUDA 测试 | 当前审查 245 passed；R01–R09 仍待处理 |
+| 数据与身份 | 当前 Phantom3 414、AMtown01 最终相机 487；输入与实验细节见核对记录 |
+| 恢复与进程收尾 | checkpoint 接口存在；语义恢复 hash 不稳定（R01）、输出退出可能挂起（R02） |
+| 只读输入与完整来源 | progressive cache 已实现；独立渲染仍写 source（R03），完整生成配置绑定有 R08 缺口 |
+| 在线与独立 final API | 已实现；闭合组资格/诊断状态有 R05 缺口，无效标签隔离有 R06 缺口 |
+| 几何采样与产品补洞 | 投影插值有 R07 问题，补洞可信尺度集合有 R09 偏差 |
+| 固定网格/配对发布 | Phantom3 414 张和 AMtown01 487 张各有已复核的历史完整地图发布 |
+| 当前 HEAD 全量验收 | 本次未重跑；历史 dirty run 不等于当前 `0665f4b` 的全量验收 |
+| 独立语义精度/GIS/资源 SLO | 尚未建立独立语义真值评价、GIS CRS 或固定 24 GB/准实时保证 |
 
-当前 product/scheduling 已建立固定本地网格、同一冻结快照的 RGB/Semantic 原子 pair、latest-wins 请求、投影专用轻量 snapshot，以及显式 stream/headroom/time/output/checkpoint 策略。训练前 preflight 会验证所选累积 stage、camera/RGB、overlap、label/metadata/hash，并将报告与派生 PLY 写入 output/cache；启用语义时不再允许隐式 semantic root。`Use_Tri_Mask` 只控制训练 mask，不能再关闭渐进采样元数据；大图 RGB 与 semantic 均使用分片 TDOM 渲染。完整 Phantom3 运行已证明全局渐进建图、训练、最终重建和配对发布可执行，但其历史 Semantic TDOM 在分支开发时遗漏了 V1 异常尺度过滤，导致3618个纯黑 RGB 像素全部被赋予类别。ADR 0007 已恢复并校准只读语义支持域过滤；修复后的完整大图以同一冻结最终快照完成 CUDA 重渲染回归。当前标签 source-image binding 不完整，因此最终状态诚实标为 `exact_partial`；仍不声称语义准确率、24 GB资源预算、GIS坐标或准实时目标已经验证。
+当前实验事实以 [当前数据与实验核对](current-data-experiment-status.md)为准。
+Phantom3 的 `outputs/latest` 已指向 dirty 尺度生命周期实验分支的恢复运行，且没有
+请求地图发布，不能将该指针当作当前主线 paired map 的验收。AMtown01 最新成功
+运行有 160 帧视频；159 帧文档是计划参数。两者都不能用日期或目录 SHA 替代完整
+实验身份。旧 [399 张实验](phantom3-semantic-atom-v2-result.md)保留原来的
+`exact_partial` 结论，当前 414 张交付及历史成功运行则有完整 source binding。
 
-已完成的实施任务见 [G1 Evidence V2 completed plan](../../plans/completed/2026-09-11-g1-evidence-v2.md)，本次运行的命令、指标、产物身份和未验证项见 [Phantom3 Semantic A-TDOM V2 完整实验记录](phantom3-semantic-atom-v2-result.md)。
+已完成的历史实施任务见 [G1 Evidence V2 completed plan](../../plans/completed/2026-09-11-g1-evidence-v2.md)。
+最新审查与修复验收要求见 [第一性原理问题记录](../problem/first-principles-code-review-2026-10-09.md)；
+文档更新不会关闭任何代码问题。
 
 ## 开始工作前检查
 

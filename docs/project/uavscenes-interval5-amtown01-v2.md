@@ -1,5 +1,23 @@
 # UAVScenes interval5_AMtown01 / V2 适配与运行记录
 
+## 当前进展核对（2026-10-09）
+
+本文件保留 r8/r9、2026-09-16 和输出重构时期的历史记录；其测试数、指标和目录
+不能当作当前默认配置。现存最新成功运行是
+`amtown01-full-progress160-fixed_20260930-134152_bf6a7c9`，manifest 为 `succeeded`，
+最终阶段 487、100,800 次优化、1,030,412 个高斯，语义状态 `exact_final`。
+其 HEAD 为 `bf6a7c9`、dirty 为 true，不能直接声明当前 `0665f4b` 已完成该运行。
+
+当前交付有 490 份标签，但全量预检和累计相机清单是 487 个身份。
+最近运行地图宽×高为 5632×9728；视频为 H.264、1540×1080、160 帧、4 fps，
+487 张逐相机 JPEG 存在。本次复核 pair、两份子 manifest 与 9/9 产品 hash 通过。
+历史 159 帧方案不等于这次已完成运行。具体指标、哈希和来源边界见
+[当前数据与实验核对](current-data-experiment-status.md)。
+
+当前审查有 R01–R09 待处理；尤其语义 checkpoint 恢复、进程失败收尾和诊断声明
+不能用下面的历史验收笼统证明。详见
+[第一性原理审查](../problem/first-principles-code-review-2026-10-09.md)。
+
 ## 输入契约
 
 - 场景根目录：`/data3/xzp/data/UAVScenes_Onthefly/interval5_AMtown01`
@@ -15,7 +33,7 @@
 `configs/semantic/uavscenes_amtown01_observed_v1.json` 显式映射；该配置只接受
 本场景实际出现的 15 个源 ID，新 ID 会使适配失败，避免静默误分类。
 
-## 已验证结果
+## 历史已验证结果：适配、r8/r9 与输出重构
 
 - 适配标签：490/490，逐图绑定标签 SHA-256 与源 RGB SHA-256。
 - 全量预检：13–487 共 475 个连续阶段，最终 487/487 张注册影像标签完整、
@@ -141,15 +159,20 @@ rectification。正式运行默认不保存过程恢复点或完成态 optimizer
 `--recovery_checkpoint_every_stages N`，它只原子替换 `.work/recovery/latest.pt`，
 不会累积每个 stage 的完整模型；成功发布后该工作区会被删除。
 
-当前输出重构验收包括：`pytest -q` 192/192 通过；真实 13–487 persistent-union 预检仍为
+当时的输出重构验收包括：`pytest -q` 192/192 通过；真实 13–487 persistent-union 预检为
 487/487；stage 13–20 极小训练穿过焦距变化和非累积阶段；stage 14 checkpoint 在
 新进程恢复后得到与连续训练相同的最终 L1/PSNR；真实 stage 13 全分辨率标签完成
 CUDA 投影和 final exact rebuild，状态为 `exact_final`、lag=0、无 error/deferred。
 此外，真实 stage 13–22 按正式迭代参数重放，验证乱序在线重建替换 state 后，排队
 拓扑更新仍作用于新的 active state；stage 21 不再发生计数失配，最终同样为
 `exact_final`、lag=0、errors=[]。
-final-only + RGB 视频的两阶段真实 CUDA 验证还确认了渐进阶段没有语义同步任务，
-最终边界仍完成 `exact_final` 和成对地图发布。
+当时 final-only + RGB 视频接口的两阶段 CUDA 验证确认了最终边界重建。
+该 RGB-only 视频接口已被 ADR 0009 的同步 RGB/Semantic 视频替代；当前启用
+`--render_training_progress` 会消费在线语义，不能继续声称渐进阶段没有语义任务。
+
+上面的 checkpoint 恢复成功只证明当时所测路径；当前语义 preflight hash 在首次与
+恢复运行之间不稳定（R01），尚未关闭。当前测试计数为 245，不覆盖所有恢复故障边界。
 
 输出目录的设计依据、保留策略、迁移边界和视频决策见
-`docs/decisions/0008-run-output-contract.md`。
+`docs/decisions/0008-run-output-contract.md`，以及取代其视频/命名部分的
+`docs/decisions/0009-published-renders-and-map-training-video.md`。

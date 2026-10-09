@@ -2,14 +2,19 @@
 
 ## 文档状态与权威范围
 
-- 状态：设计已确认并实现；Phantom3 完整399张端到端运行已验证，最终质量状态为 `exact_partial`。
-- 确认日期：2026-09-12。
+- 状态：设计合同已确认，主链路已实现；当前代码仍有已记录的合同缺口，不能声明逐项全部满足。
+- 设计确认日期：2026-09-12；实现边界核对日期：2026-10-09，代码基线 `0665f4b`。
 - 语义方法版本：`g1-evidence-v2`。
 - 本文是 Semantic TDOM V1 数学、状态和产品行为的唯一权威合同。
 
 [全局认知](../project/global-context.md) 只维护稳定的项目入口、数据/环境事实和本文摘要；ADR 只解释为什么作出决定。其他文档中与本文冲突的公式或产品约定均由本文取代，尤其包括：
 
-完整运行的命令、指标、产物身份和未验证边界见 [Phantom3 Semantic A-TDOM V2 实验记录](../project/phantom3-semantic-atom-v2-result.md)。
+当前数据和实验进展见 [数据与实验核对](../project/current-data-experiment-status.md)；
+[Phantom3 399 张记录](../project/phantom3-semantic-atom-v2-result.md)描述历史版本。
+本合同保留要求；R05（闭合组资格/诊断声明）、R06（无效观测隔离）、
+R08（生成来源绑定）和 R09（补洞可信集合）尚未满足的实现边界见
+[第一性原理审查](../problem/first-principles-code-review-2026-10-09.md)，不得以改写要求
+的方式把缺陷标为已完成。
 
 - 使用 `rho * (alpha / A)` 作为类别质量；
 - leave-one-group-out 共识仍包含 Dirichlet 先验；
@@ -81,9 +86,13 @@ semantic/
 - 标签必须与运行时 RGB/camera tensor 同尺寸、同方向、同像素坐标；运行时不得偷偷 resize、rotate 或 flip。
 - 启用语义时必须显式提供 semantic data root，不得隐式回退到 RGB/SfM source root。
 
-当前 Phantom3 使用八类 schema，但 stage 100 的前100张标签没有任何 background 像素；全部399张中也只有 `000112.png` 含6038个 background 像素。因此当前事实是“八类 schema，前100张实质观测到类别1–7和ignore”，不是“八个类别均已得到验证”。是否长期保留 background，需要在检查上游 ProC-SAM3 的类别语义后另行决定。
+Phantom3 使用八类 schema，AMtown01 使用独立的十五类 schema。旧 399 张交付的
+background 像素统计只用于对应历史版本，不代表当前 414 张交付分布或类别准确率。
+是否保留 background 仍需结合上游模型语义决定，不能通过修改 ignore 含义解决。
 
-详细交付格式见 [Phantom3 语义标签交付规范](phantom3-semantic-label-contract-v1.md)。当前早期 metadata 的 source binding 技术债和本机路径见 [全局认知](../project/global-context.md)。
+详细交付格式见 [Phantom3 语义标签交付规范](phantom3-semantic-label-contract-v1.md)。
+当前交付与相应历史运行预检已记录完整 source binding；生成配置身份的 R08 缺口
+是另一项问题，不应与旧 metadata 缺失 source hash 混淆。
 
 ## 几何防火墙与阶段时序
 
@@ -567,7 +576,7 @@ semantic method/config versions
 
 ## 实施与验证门槛
 
-本版本按以下顺序完成实现与验证：
+本版本的实现与验证门槛如下；列表是要求，不是所有边界已经验证的完成清单：
 
 1. CPU/reference 数学与边界条件测试；
 2. state/schema/version 与旧状态拒绝测试；
@@ -578,8 +587,12 @@ semantic method/config versions
 7. 只读 dataset preflight/cache；
 8. 干净 `semantic-atdom` 环境中的真实 CUDA import；
 9. Phantom3 stage 30 到 31 smoke；
-10. Phantom3 完整399张运行与资源 profile。
+10. 明确输入版本的全量运行与资源 profile；历史 Phantom3 399 张结果和当前
+    Phantom3 414 / AMtown01 487 个最终相机的运行分别记录，不混用验收结论。
 
 CPU 数学合同先于 CUDA 实现稳定。单元测试不替代端到端运行；每项仍未完成的验证必须显式标为“未验证”。
 
-当前实现已经覆盖 evidence-conditioned numerator、prior-free LOO、三条件 gate、异常尺度语义支持域筛选、新 schema、投影专用 snapshot、固定本地网格、原子 RGB/Semantic pair、独立 final rebuild 和只读 dataset preflight/cache。正式环境、真实 CUDA smoke 与 Phantom3 完整399张渐进运行均已验证；完整399张历史产物生成后发现 V2 分支遗漏了 V1 的异常尺度筛选，该回归已由 ADR 0007 修复并完成冻结最终快照整图重渲染验证。剩余边界以[全局认知](../project/global-context.md)和[完整实验记录](../project/phantom3-semantic-atom-v2-result.md)为准。
+当前实现覆盖主要 evidence/LOO/render/state/pair 链路，并有 Phantom3 和 AMtown01
+历史全量成功记录。当前测试为 245 passed，仍存在审查记录中的恢复、只读入口、
+诊断资格、partial API、几何插值、生成来源和补洞集合缺口。历史成功与实现存在
+不替代这些门槛的验收；详细状态见[全局认知](../project/global-context.md)。

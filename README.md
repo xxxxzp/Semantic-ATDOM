@@ -27,6 +27,14 @@ issues despite 245 passing tests. Use the current Linux entry point
 `--resolution 1` for semantic training. Historical commands and results retain
 their original scope; see the linked documents for current defaults and limits.
 
+For training and visualization without final image quality scoring, pass
+`--skip_final_evaluation`. This skips final PSNR/SSIM/VGG-LPIPS evaluation while
+retaining the trained model, semantic rebuild, maps, and progress video. The
+run records evaluation as `skipped`, without fabricated metric values. Use
+`--render_training_progress --render_TDOM --enable_semantics` to produce the
+paired RGB/Semantic TDOM video. Camera exports via `--render_all_cameras`
+currently require final evaluation and cannot be combined with this option.
+
 # Important Notice (Please Read before Start!!!)
 
 The Python environment configuration differs significantly between **Windows** and **Linux** in this project,

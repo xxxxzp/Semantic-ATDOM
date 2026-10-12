@@ -345,9 +345,18 @@ def GetArgs():
         "--recovery_checkpoint_every_stages", type=int, default=0
     )
     parser.add_argument("--save_final_training_state", action="store_true")
+    parser.add_argument(
+        "--skip_final_evaluation", action="store_true",
+        help="Skip final image quality metrics; still publish models, maps and video.",
+    )
 
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
+    if args.skip_final_evaluation and args.render_all_cameras:
+        raise ValueError(
+            "--skip_final_evaluation cannot be combined with --render_all_cameras "
+            "because camera exports currently run inside final evaluation"
+        )
     '''以上是在构建参数配置器'''
 
     if args.training_progress_target_frames < 3:
@@ -2534,6 +2543,24 @@ class GaussianTrainer(mp.Process):
 
     # 对当前高斯模型进行一次评估
     def Evaluate(self, Training_Type, EvaluateRender):
+        if (
+            Training_Type == "Final_Refinement"
+            and self.Finish
+            and getattr(self.args, "skip_final_evaluation", False)
+        ):
+            write_json_atomic(
+                Path(self.args.metrics_dir) / "final_evaluation.json",
+                {
+                    "schema_version": 1,
+                    "status": "skipped",
+                    "reason": "--skip_final_evaluation",
+                    "iteration": int(self.AlreadyTrainingIterations),
+                    "gaussians": int(self.gaussians.get_xyz.shape[0]),
+                    "complete_metrics": False,
+                },
+            )
+            print("Final quality evaluation skipped (--skip_final_evaluation).")
+            return
         DoEvaluate = False
         if Training_Type == "Initialization" and (
                 self.AlreadyTrainingIterations % self.args.InitialTrainingEvaluateInterval == 0 or EvaluateRender):
@@ -3713,6 +3740,7 @@ class On_the_Fly_GS:
                 ),
                 "semantic_checkpoint_interval": args.semantic_checkpoint_interval,
                 "semantic_online": semantic_online_required(args),
+                "skip_final_evaluation": bool(args.skip_final_evaluation),
             },
         )
         self.layout.write_config(vars(args))

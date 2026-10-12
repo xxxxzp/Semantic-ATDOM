@@ -116,18 +116,21 @@ def rectified_pinhole_from_colmap(
 
 @lru_cache(maxsize=32)
 def _rectification_maps(calibration: RectifiedPinhole):
+    # COLMAP puts the first pixel center at (.5, .5); OpenCV remap uses
+    # array indices, whose first center is (0, 0). Keep the stored calibration
+    # in COLMAP coordinates and convert BOTH matrices at this API boundary.
     source = np.array(
         [
-            [calibration.source_fx, 0.0, calibration.source_cx],
-            [0.0, calibration.source_fy, calibration.source_cy],
+            [calibration.source_fx, 0.0, calibration.source_cx - 0.5],
+            [0.0, calibration.source_fy, calibration.source_cy - 0.5],
             [0.0, 0.0, 1.0],
         ],
         dtype=np.float64,
     )
     target = np.array(
         [
-            [calibration.target_fx, 0.0, calibration.target_cx],
-            [0.0, calibration.target_fy, calibration.target_cy],
+            [calibration.target_fx, 0.0, calibration.target_cx - 0.5],
+            [0.0, calibration.target_fy, calibration.target_cy - 0.5],
             [0.0, 0.0, 1.0],
         ],
         dtype=np.float64,

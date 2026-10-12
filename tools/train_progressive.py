@@ -41,7 +41,8 @@ from scipy.spatial import cKDTree
 import math
 import time
 from semantic_atdom.scene.cameras import Camera, DummyCamera, DummyPipeline
-from semantic_atdom.utils.camera_utils import camera_to_JSON, resize_camera_mask
+from semantic_atdom.utils.camera_utils import camera_to_JSON, resize_camera_mask, loadCam
+from semantic_atdom.utils.pixel_grid import PIXEL_GRID_VERSION
 import json
 from semantic_atdom.scene.dataset_readers import (
     load_rectified_image,
@@ -461,10 +462,10 @@ def TrainingPreparation(args):
         raise ValueError(
             "--semantic_data_root is required when --enable_semantics is set"
         )
-    if args.enable_semantics and args.resolution != 1:
+    if args.enable_semantics and args.resolution not in (1, 2, 4, 8):
         raise ValueError(
-            "semantic projection requires --resolution 1 so RGB and labels "
-            "share the validated full-resolution pixel grid"
+            "semantic projection requires --resolution 1, 2, 4 or 8; RGB and labels "
+            "must use an explicit validated pixel mapping"
         )
     if args.checkpoint_iterations:
         raise ValueError(
@@ -472,6 +473,8 @@ def TrainingPreparation(args):
             "step; use --recovery_checkpoint_every_stages for atomic "
             "stage-boundary recovery"
         )
+
+    args.pixel_grid_version = PIXEL_GRID_VERSION
 
     # 输出训练日志
     os.makedirs(args.logs_dir, exist_ok=True)
@@ -1199,52 +1202,7 @@ class DataPreProccesser(mp.Process):
             #             break
 
             for cam_info in NewCamInfos:
-                orig_w, orig_h = cam_info.image.size
-                if self.args.resolution in [1, 2, 4, 8]:
-                    resolution = round(orig_w / (resolution_scale * self.args.resolution)), round(
-                        orig_h / (resolution_scale * self.args.resolution))
-                else:  # should be a type that converts to float
-                    if self.args.resolution == -1:
-                        if orig_w > 1600:
-                            global WARNED
-                            if not WARNED and not self.Silence:
-                                print(
-                                    "[ INFO ] Encountered quite large input images (>1.6K pixels width), rescaling to 1.6K.\n "
-                                    "If this is not desired, please explicitly specify '--resolution/-r' as 1")
-                                WARNED = True
-                            global_down = orig_w / 1600
-                        else:
-                            global_down = 1
-                    else:
-                        global_down = orig_w / self.args.resolution
-
-                    scale = float(global_down) * float(resolution_scale)
-                    resolution = (int(orig_w / scale), int(orig_h / scale))
-
-                resized_image_rgb = PILtoTorch(cam_info.image, resolution)
-
-                gt_image = resized_image_rgb[:3, ...]
-                loaded_mask = None
-
-                if resized_image_rgb.shape[0] == 4:
-                    loaded_mask = resized_image_rgb[3:4, ...]
-
-                # NewCam = Camera(colmap_id=cam_info.uid, R=cam_info.R, T=cam_info.T,
-                #                 FoVx=cam_info.FovX, FoVy=cam_info.FovY,
-                #                 image=gt_image, gt_alpha_mask=loaded_mask, Tri_Mask=cam_info.Tri_Mask,
-                #                 image_name=cam_info.image_name, uid=len(self.scene.train_cameras[resolution_scale]),
-                #                 data_device=self.args.data_device)
-                NewCam = Camera(colmap_id=cam_info.uid, R=cam_info.R, T=cam_info.T,
-                                FoVx=cam_info.FovX, FoVy=cam_info.FovY,
-                                image=gt_image, gt_alpha_mask=loaded_mask,
-                                Tri_Mask=resize_camera_mask(cam_info.Tri_Mask, resolution),
-                                image_name=cam_info.image_name, uid=len(TrainCameras),
-                                data_device=self.args.data_device,
-                                image_path=cam_info.image_path,
-                                calibration=getattr(cam_info, "calibration", None))
-
-                # self.scene.train_cameras[resolution_scale].append(NewCam)
-                # TrainCameras.append(NewCam)
+                NewCam = loadCam(self.args, len(TrainCameras), cam_info, resolution_scale)
 
                 self.GetGradLogForCams([NewCam])
 
@@ -1787,7 +1745,10 @@ class GaussianTrainer(mp.Process):
                 raise ValueError("checkpoint progressive dataset root does not match")
             self.gaussians.restore(checkpoint["gaussians"], self.args)
             restored_cameras = [
-                camera_from_state(item, data_device=self.args.data_device)
+                camera_from_state(
+                    item, data_device=self.args.data_device,
+                    expected_resolution=self.args.resolution,
+                )
                 for item in checkpoint["cameras"]
             ]
             self.scene.setTrainCameras(restored_cameras)

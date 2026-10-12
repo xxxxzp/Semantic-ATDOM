@@ -90,7 +90,7 @@ def load_rectified_image(image_path, calibration):
 
 
 def _rectify_training_mask(mask, calibration):
-    if mask is not None and getattr(mask, "shape", (0,))[0] == 2:
+    if mask is not None and tuple(mask.shape) == (2,):
         return mask
     if not calibration.requires_rectification:
         return mask
@@ -1075,9 +1075,15 @@ def SingleImage_readColmapSceneInfo_Part2(path, train_cam_infos, test_cam_infos,
             for i in range(len(NewCams)):
                 if NewCams[i].image_name == key:
                     LogMask = NewCams[i].LogMask
+                    calibration = getattr(NewCams[i], "calibration", None)
+                    info = next((c for c in train_cam_infos if c.image_name == key), None)
+                    source_height = calibration.height if calibration is not None else getattr(info, "height", OriginImageHeight)
+                    source_width = calibration.width if calibration is not None else getattr(info, "width", OriginImageWidth)
                     break
 
-            sampled_points, Tri_IDs = PointsFilter(sampled_points, LogMask, OriginImageHeight, OriginImageWidth, LogMask.shape[0], LogMask.shape[1], Tri_IDs=Tri_IDs)
+            if LogMask is None:
+                raise ValueError("missing training mask for new camera {}".format(key))
+            sampled_points, Tri_IDs = PointsFilter(sampled_points, LogMask, source_height, source_width, LogMask.shape[0], LogMask.shape[1], Tri_IDs=Tri_IDs)
             time2 = time.time()
             if not Silence:
                 print(f"Points Filter for sampled_points: {time2 - time1}s, Sampled Points Number: {sampled_points.shape[0]}")
@@ -1085,7 +1091,7 @@ def SingleImage_readColmapSceneInfo_Part2(path, train_cam_infos, test_cam_infos,
 
             time1 = time.time()
             if xys_list[key].shape[0] > 500:
-                sampled_xys, sampled_point3D_ids = PointsFilter(xys_list[key], LogMask, OriginImageHeight, OriginImageWidth,
+                sampled_xys, sampled_point3D_ids = PointsFilter(xys_list[key], LogMask, source_height, source_width,
                                                                 LogMask.shape[0], LogMask.shape[1],
                                                                 point3D_ids=point3D_ids_list[key])
             else:

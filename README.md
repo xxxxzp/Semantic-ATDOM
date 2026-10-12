@@ -24,7 +24,10 @@ The [first-principles review](docs/problem/first-principles-code-review-2026-10-
 records open recovery, worker shutdown, geometry sampling and product-contract
 issues despite 245 passing tests. Use the current Linux entry point
 `tools/train_progressive.py`, an explicit semantic delivery root, and
-`--resolution 1` for semantic training. Historical commands and results retain
+`--resolution 1`, `2`, `4`, or `8` for semantic training. These values divide
+the original RGB width and height; source images, SfM and labels remain unchanged.
+See [the coordinate contract and XinCao validation](docs/fix/2026-10-semantic-resolution-248.md).
+Historical commands and results retain
 their original scope; see the linked documents for current defaults and limits.
 
 For training and visualization without final image quality scoring, pass

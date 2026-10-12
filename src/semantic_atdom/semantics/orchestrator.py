@@ -60,7 +60,8 @@ from semantic_atdom.semantics.tdom import (
     rasterize_semantic_tdom,
 )
 from semantic_atdom.utils.image_utils import tdom_to_uint8
-from semantic_atdom.utils.camera_calibration import rectify_array
+from semantic_atdom.semantics.label_grid import rectified_source_labels
+from semantic_atdom.utils.pixel_grid import PIXEL_GRID_VERSION, resize_nearest
 from semantic_atdom.utils.atomic_io import write_json_atomic
 
 
@@ -213,6 +214,8 @@ class OnlineSemanticConfig:
             "min_consensus_support": self.min_consensus_support,
             "prior_total": self.prior_total,
             "boundary_bandwidth": self.boundary_bandwidth,
+            "boundary_bandwidth_units": "rectified_source_pixels",
+            "pixel_grid_version": PIXEL_GRID_VERSION,
             "boundary_floor": self.boundary_floor,
             "eps": self.eps,
         }
@@ -515,34 +518,21 @@ class CudaSemanticProjector:
         self.config = config
 
     def project(self, gaussians, camera, observation: SemanticObservation):
-        labels = observation.labels
-        calibration = getattr(camera, "calibration", None)
-        if calibration is not None and calibration.requires_rectification:
-            labels = rectify_array(
-                labels,
-                calibration,
-                interpolation="nearest",
-                border_value=self.class_spec.ignore_id,
-            )
-        expected_shape = (camera.image_height, camera.image_width)
-        if tuple(labels.shape) != expected_shape:
-            raise SemanticSchemaError(
-                "label {} has shape {}, camera expects {}; full-resolution "
-                "semantic projection does not resize labels".format(
-                    observation.key.image_id, labels.shape, expected_shape
-                )
-            )
-        labels = labels.copy()
-        tri_mask = getattr(camera, "Tri_Mask", None)
-        if tri_mask is not None and tuple(tri_mask.shape[-2:]) == expected_shape:
-            valid_image = tri_mask.detach().to("cpu").numpy().astype(bool)
-            labels[~valid_image.reshape(expected_shape)] = self.class_spec.ignore_id
-        boundary = label_boundary_weights(
-            labels,
+        # Boundary bandwidth is measured on the full rectified SOURCE grid,
+        # independent of the training resolution. IDs, masks and weights share
+        # the same center-based nearest sample locations on the camera grid.
+        source_labels = rectified_source_labels(
+            observation.labels, camera, self.class_spec.ignore_id
+        )
+        source_boundary = label_boundary_weights(
+            source_labels,
             ignore_id=self.class_spec.ignore_id,
             bandwidth=self.config.boundary_bandwidth,
             floor=self.config.boundary_floor,
         )
+        resolution = (int(camera.image_width), int(camera.image_height))
+        labels = resize_nearest(source_labels, resolution)
+        boundary = resize_nearest(source_boundary, resolution)
         result = rasterize_semantic_observation(
             means3d=gaussians.get_xyz,
             opacities=gaussians.get_opacity,

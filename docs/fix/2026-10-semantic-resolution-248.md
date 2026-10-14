@@ -172,3 +172,99 @@ commands and console logs, test logs, videos and final-frame previews.
 `verify_artifacts.py` reproduces camera, map, semantic-state and video checks.
 Do not rerun `run_smoke.py` into the existing nonempty outputs; use fresh output
 roots if repeating the experiment.
+
+## Paired real-data validation (2026-10-14)
+
+The second input is `/data3/xzp/data/Onthefly/XinCao_small_size` (one underscore
+between `small` and `size`). All 229 original images are 4032×3024; all 229 small
+images are 1612×1209. The exact width and height ratio is 2.501240694789082.
+There is no supported divisor that makes the original training grid equal to
+the existing small experiment's resolution-1 grid. Resolution 2 is the closest
+supported original-image factor: 2016×1512, about 25.06% larger on each axis.
+
+The two SfM exports are independent reconstructions. At stage 30, normalized
+focal length differs by 0.19722944725400132, distortion and poses differ, and
+even local camera sets differ. The SAM label versions also differ; five sampled
+raw label pairs agree on 95.64–97.84% of pixels after nearest resizing. Comparing
+final maps or Gaussian counts cannot isolate a resolution implementation error.
+The existing small experiment also used an older pixel-mapping implementation
+and physical GPU 1; it is read-only reference material, not a timing benchmark
+for the new GPU-4 runs.
+If the small calibration were only a resize of the original stage-30 camera,
+its focal length would be 762.9326 pixels; the supplied SfM instead has
+444.9988 pixels. A world-coordinate registration cannot remove this intrinsic
+calibration difference.
+
+Independent analytic checks cover both datasets, stages 18/19/21/229 and
+factors 1/2/4/8 (32 cases). They check inverse-center label/mask samples and
+camera-ray projection including rounded odd heights. Maximum projection error
+is 0.00008948 training pixels; there are zero label/mask mismatches.
+
+The real paired runs use original factors 2/4/8 and small factors 1/2/4.
+Boundary bandwidth is 2 original pixels and `2 * 1612 / 4032` small pixels,
+so the intended physical width agrees within these paired runs. To match the
+historical small experiment's default 2-pixel boundary width instead, use
+`--semantic_boundary_bandwidth 5.002481389578164` on original images.
+Neither bandwidth choice changes class IDs. Source dimensions passed to
+`--OriginImageWidth/Height` remain 4032/3024 and 1612/1209 respectively.
+
+Runs select stages 18–21, where both datasets change calibration at 19 and 21.
+The schedule is 10 initialization, 5 local + 5 global per added image, and 10
+final iterations (50 total). GSD is 0.10 in both world-coordinate systems;
+map pixel sizes can differ because those systems and scene extents differ.
+The validation wrapper observes the production camera-replacement path and
+compares sampled replacement RGB exactly with independently reloaded/rectified
+source RGB, verifies masks and class-ID gating, and checks source calibration.
+
+This validation exposed a pre-existing semantic resume bug: preparation wrote
+`require_complete_initial_snapshot=true` for fresh runs and `false` for resumes.
+The flag is hashed in the input preflight report, so unchanged inputs produced
+different hashes and checkpoint restoration refused them. Preparation now
+retains the original initial-stage contract on resume. The selected stage range
+and all source hashes remain checked. A regression test exercises fresh and
+resumed CLI preparation; it failed before the fix and passes afterward.
+
+All commands, input/experiment hash manifests, analytic results, camera probes,
+checkpoint snapshots and training/video artifacts are stored outside the inputs:
+`/home/xuzipeng/code/Semantic-A-TDOM/validation/semantic-resolution-pair-20261014/`.
+`run_pair.py` mounts both datasets, `/data3/xzp/experiments`, the main checkout
+and shared Conda installation read-only; only physical GPU 4 is visible.
+`inventory.py`, `grid_oracle.py` and `verify_runs.py` reproduce the checks.
+
+### Results
+
+| Source | Factor | Training grid | Final state | Video frames |
+| --- | --- | --- | --- | --- |
+| Original | 2 | 2016×1512 | exact_final | 5 |
+| Original | 4 | 1008×756 | exact_final | 5 |
+| Original | 8 | 504×378 | exact_final | 5 |
+| Small | 1 | 1612×1209 | exact_final | 5 |
+| Small | 2 | 806×604 | exact_final | 5 |
+| Small | 4 | 403×302 | exact_final | 5 |
+| Original, restored from stage 19 | 4 | 1008×756 | exact_final | 4 |
+
+All seven runs succeeded at stage 21 and iteration 50 with 21 cameras, zero
+semantic lag, no errors or deferred IDs, valid categorical ID maps and decoded
+videos. Each fresh run exercised 18 retained-camera replacements at stage 19
+and 20 at stage 21. The checks verify final effective fx/fy using the actual
+rounded training dimensions, including small height 1209→604→302.
+Archived semantic states reload with matching geometry/ontology/context hashes,
+finite nonnegative evidence and no active projection or historical staleness.
+
+The restored run used the unchanged checkpoint from stage 19 (19 cameras,
+iteration 20), actually constructed GPU cameras, continued stages 20 and 21,
+then rebuilt exact final semantics and generated a four-frame remaining
+timeline. Its preflight hash equals the saved hash. Gaussian IDs and the final
+19,555 count match continuous training. All 17,703 Gaussians supported in both
+runs have the same final robust semantic class. Geometry is not bit-identical;
+per-attribute differences are recorded in `continuous-vs-resumed.json`.
+
+All 246 regression tests and 22 CUDA integration tests passed on physical
+GPU 4. The historical small full run's 229 cameras, final semantic status,
+map file hashes and all 120 video frames also passed read-only verification.
+The two input trees and historical experiment tree retain identical path,
+size, mtime and SHA256 manifests (6,809 records including links); the main
+checkout's original uncommitted patch retains its original hash.
+`validation-summary.json` links all machine-readable acceptance evidence.
+These are functional and coordinate-contract checks, not a new full-229-image
+quality benchmark or a proof that independently calibrated maps should match.

@@ -522,9 +522,10 @@ def TrainingPreparation(args):
             end_stage=args.EndAtImageNo,
             image_folder_path=(args.Image_Folder_Path or None),
             identity_policy=args.progressive_identity_policy,
-            require_complete_initial_snapshot=(
-                args.start_checkpoint is None
-            ),
+            # Recovery keeps the original stage range and input contract.
+            # Changing this policy bit changes the hashed preflight report
+            # and rejects a checkpoint even when every input is unchanged.
+            require_complete_initial_snapshot=True,
             max_semantic_tdom_classes=(
                 MAX_SEMANTIC_TDOM_CLASSES if args.render_TDOM else None
             ),

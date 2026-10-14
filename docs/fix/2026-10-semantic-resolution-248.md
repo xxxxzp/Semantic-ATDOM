@@ -202,8 +202,10 @@ is 0.00008948 training pixels; there are zero label/mask mismatches.
 
 The real paired runs use original factors 2/4/8 and small factors 1/2/4.
 Boundary bandwidth is 2 original pixels and `2 * 1612 / 4032` small pixels,
-so the intended physical width agrees within these paired runs. To match the
-historical small experiment's default 2-pixel boundary width instead, use
+so its fraction of the rectified source-image width agrees in these paired
+runs. Because normalized intrinsics differ, this does not make angular or
+world-space widths equal. To match the historical small experiment's default
+2-pixel boundary width as a fraction of the source image instead, use
 `--semantic_boundary_bandwidth 5.002481389578164` on original images.
 Neither bandwidth choice changes class IDs. Source dimensions passed to
 `--OriginImageWidth/Height` remain 4032/3024 and 1612/1209 respectively.

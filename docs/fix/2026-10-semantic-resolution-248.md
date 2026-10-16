@@ -4,8 +4,10 @@
 `r = 1, 2, 4, 8`. The original width and height are divided by `r`, rounded
 separately, exactly as in RGB camera loading. XinCao's 4032×3024 inputs become
 2016×1512, 1008×756 and 504×378. Default CLI behavior is unchanged: semantic
-training requires an explicit supported factor; the RGB-only automatic-width
-and explicit-width modes remain available.
+training requires an explicit supported factor or a target width greater than
+8. Explicit widths use the existing RGB camera sizing convention, for example
+`--resolution 1612` maps 4032×3024 to 1612×1209. Automatic width (`-1`)
+remains available for RGB-only training and is rejected for semantic training.
 
 ## Coordinate contract
 
@@ -65,7 +67,7 @@ training grid; numerical equality of support across factors is not promised.
 `colmap-center-nearest-v1` is recorded in the semantic configuration and camera
 checkpoint records. Semantic recovery rejects an older configuration.
 Camera restoration rejects records without the mapping version and rejects
-dimensions incompatible with the requested factor. Old training checkpoints
+dimensions incompatible with the requested resolution. Old training checkpoints
 must be restarted rather than silently mixing evidence from different grids.
 
 `--skip_final_evaluation` is included from the main worktree's existing
@@ -75,7 +77,7 @@ be combined with `--render_all_cameras`, whose exports still run inside final
 evaluation.
 
 The existing video remains a paired RGB/semantic TDOM training timeline.
-Its map sampling factor is independent of the training factor. Validate class
+Its map sampling factor is independent of the training resolution. Validate class
 IDs using source labels and map ID arrays, not compressed video colors.
 
 ## Validation setup
@@ -270,3 +272,92 @@ checkout's original uncommitted patch retains its original hash.
 `validation-summary.json` links all machine-readable acceptance evidence.
 These are functional and coordinate-contract checks, not a new full-229-image
 quality benchmark or a proof that independently calibrated maps should match.
+
+
+## Full comparison with the existing small-data experiment (2026-10-16)
+
+This is one new complete run, using only original `XinCao` RGB, SfM and
+4032×3024 SAM labels. The existing `XinCao_small_size` experiment is the
+reference; no small-data SfM or labels were substituted into training.
+`--resolution 1612` gives exactly 1612×1209, whereas factor 2 would give
+2016×1512. The explicit-width mode shares the existing RGB size resolver;
+nearest categorical sampling and the original calibration contract are unchanged.
+
+The run uses stages 30–229, 2000 initialization iterations, 100 local plus
+100 global iterations per added image, and 4000 final iterations: 45,800 total.
+It matches the historical schedule, Gaussian budget, map GSD and 120-frame
+video request. Boundary bandwidth is 5.002481389578 original source
+pixels, matching the old two-pixel bandwidth as a fraction of source image
+width. Different intrinsics mean this is not an equal world-space bandwidth.
+Only physical GPU 3 was visible. Both input datasets, historical experiments,
+the main checkout, worktree and shared Conda installation were mounted read-only
+for training. No Conda packages or CUDA extensions were changed.
+
+Training at commit `3266655` succeeded with 229 cameras and
+1,011,973 Gaussians. Every saved camera has a 1612×1209 training
+grid and retains 4032×3024 source calibration. Final semantics are `exact_final`,
+with no lag, deferred images, errors, stale historical evidence or dirty active
+projections. The final ID map is 5632×5120, containing only classes 1–7
+and ignore 255. All nine published product hashes match. The saved training
+and semantic checkpoints reload and validate. The H.264 video is
+2562×1080 with 120 frames, including the exact final frame, and
+passes full ffmpeg decoding. The two-pass final semantic rebuild covers all
+229 images and took 730.14 seconds. All 247 regression tests pass.
+Final per-camera quality evaluation is skipped as in the historical reference;
+the following numbers are separately computed final-map agreement metrics.
+
+The comparison fits a robust camera-derived Sim(3), using all 229 common
+camera centers, then pulls the new map into the reference map window using its
+declared plane and projection matrices. All 229 cameras are inliers; median
+center residual is 0.405871 reference SfM units, p95
+0.930914, median orientation difference 1.940 degrees, and map
+plane normals differ by 7.481 degrees. Labels use nearest remapping and
+RGB uses linear remapping. A known-transform/outlier/identity self-test passes.
+No map-based or semantic optimization is used to improve alignment.
+
+| Final-map measurement | Result |
+| --- | --- |
+| Semantic agreement, both maps known | 79.6353% |
+| Semantic agreement, either map known | 74.9815% |
+| mIoU over present classes, including known/unknown errors | 0.485701 |
+| Reference / new unknown fraction | 13.2887% / 17.2712% |
+| New raster footprint in reference canvas | 94.3681% |
+| RGB PSNR, both semantic maps known | 12.2802 dB |
+| RGB SSIM, known interior | 0.417278 |
+
+**The final results are not equivalent.** The coordinate, class-ID and complete
+pipeline checks pass; these final-map measurements do not establish isolated
+sampling quality or interchangeable reconstructions. At the same 1612 width,
+the original SfM gives focal length 762.932627 versus the reference's
+444.998758, with different distortion, poses and geometry. Across all 229 raw
+input pairs, nearest-downsampled original labels agree with the independently
+predicted small-data labels at 97.3292%, with mIoU
+0.871547; raw RGB PSNR is 30.8645 dB. These raw-input
+numbers precede rectification. Independent SAM versions, compression,
+calibration and the historical half-pixel convention all confound attribution.
+A prior reconstruction is not ground truth. No additional resolution runs
+were launched to tune these results.
+
+All scripts, exact arguments, registered ID/RGB maps, disagreement masks,
+per-class confusion counts and PNG/PDF comparison figures are retained at:
+`/data3/xzp/experiments/Onthefly/XinCao/xincao-downsample-1612-20261016`.
+`latest` selects the successful `original-to-1612-standardalloc` run.
+The first allocator-override initialization failed at torch IPC; it was stopped
+and preserved separately, then restarted with the standard allocator. The
+successful run above is the sole new full result used in the comparison.
+
+Experiment packages now mirror dataset paths relative to `/data3/xzp/data`:
+`Onthefly/XinCao`, `Onthefly/XinCao_small_size`, `Onthefly/phantom3` and
+`UAVScenes_Onthefly/interval5_AMtown01`. Seven completed historical packages
+(67,089,973,626 bytes) were relocated with original paths retained as compatibility
+symlinks. All file inodes, sizes and mtimes were preserved, and key authorities
+and videos were checksummed. The new active run was left in place until its
+supervisor and comparison writers exited, then its completed bundle was moved
+under `experiments/Onthefly/XinCao` with the old validation path retained as a
+link. `/data3/xzp/experiments/index.json` catalogs the layout; migration evidence
+is under `/data3/xzp/experiments/_organization/20261016/`.
+
+Post-training SHA256 verification confirms both original dataset trees
+(3316 and 3276 files), all 217 original XinCao experiment records through
+compatibility paths, and the main checkout's uncommitted patch are unchanged.
+The experiment root's directory layout changed only as explicitly requested.

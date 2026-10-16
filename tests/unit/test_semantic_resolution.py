@@ -23,6 +23,17 @@ from semantic_atdom.utils.pixel_grid import PIXEL_GRID_VERSION, camera_resolutio
 
 
 class SemanticResolutionTests(unittest.TestCase):
+    def test_explicit_width_matches_existing_small_grid_and_categorical_sampling(self):
+        self.assertEqual(camera_resolution(4032, 3024, 1612), (1612, 1209))
+        camera = self._camera(19, 15, 11)
+        self.assertEqual((camera.image_width, camera.image_height), (11, 8))
+        labels = np.arange(19 * 15, dtype=np.uint16).reshape(15, 19) % 8
+        expected = np.array(Image.fromarray(labels).resize((11, 8), Image.Resampling.NEAREST))
+        np.testing.assert_array_equal(labels_on_camera_grid(labels, camera), expected)
+        mask = resize_camera_mask(torch.from_numpy(labels == 7), (11, 8))
+        np.testing.assert_array_equal(mask.numpy()[0], expected == 7)
+        self.assertEqual((camera.calibration.width, camera.calibration.height), (19, 15))
+
     def _camera(self, width=16, height=16, factor=2, radial=False):
         calibration = rectified_pinhole_from_colmap(
             "RADIAL" if radial else "PINHOLE",

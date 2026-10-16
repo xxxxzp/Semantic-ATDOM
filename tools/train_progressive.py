@@ -462,10 +462,14 @@ def TrainingPreparation(args):
         raise ValueError(
             "--semantic_data_root is required when --enable_semantics is set"
         )
-    if args.enable_semantics and args.resolution not in (1, 2, 4, 8):
+    if (
+        args.enable_semantics
+        and args.resolution not in (1, 2, 4, 8)
+        and args.resolution < 9
+    ):
         raise ValueError(
-            "semantic projection requires --resolution 1, 2, 4 or 8; RGB and labels "
-            "must use an explicit validated pixel mapping"
+            "semantic projection requires --resolution 1, 2, 4 or 8, or an "
+            "explicit target width greater than 8; automatic resizing is unsupported"
         )
     if args.checkpoint_iterations:
         raise ValueError(

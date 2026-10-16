@@ -132,7 +132,7 @@ class DatasetPreflightTests(unittest.TestCase):
                     "--semantic_data_root", str(semantic_data),
                     "--Model_Path_Dir", str(root / ("resume" if resume else "fresh")),
                     "--StartFromImageNo", "1", "--EndAtImageNo", "2",
-                    "--enable_semantics", "--resolution", "2",
+                    "--enable_semantics", "--resolution", "1612",
                 ]
                 if resume:
                     argv += ["--start_checkpoint", str(checkpoint)]

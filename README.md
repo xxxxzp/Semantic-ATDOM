@@ -27,6 +27,9 @@ issues despite 245 passing tests. Use the current Linux entry point
 `--resolution 1`, `2`, `4`, or `8` for semantic training. These values divide
 the original RGB width and height; source images, SfM and labels remain unchanged.
 See [the coordinate contract and XinCao validation](docs/fix/2026-10-semantic-resolution-248.md).
+An explicit target width greater than 8 is also supported: `--resolution 1612`
+maps 4032×3024 source images to 1612×1209 while retaining the original camera
+calibration and using nearest sampling for semantic IDs and masks.
 Historical commands and results retain
 their original scope; see the linked documents for current defaults and limits.
 

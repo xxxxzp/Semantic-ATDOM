@@ -325,9 +325,11 @@ No map-based or semantic optimization is used to improve alignment.
 | RGB PSNR, both semantic maps known | 12.2802 dB |
 | RGB SSIM, known interior | 0.417278 |
 
-**The final results are not equivalent.** The coordinate, class-ID and complete
-pipeline checks pass; these final-map measurements do not establish isolated
-sampling quality or interchangeable reconstructions. At the same 1612 width,
+**Acceptance for integration (2026-10-20): the current downsampling
+implementation is accepted.** The coordinate, class-ID and complete pipeline
+checks pass, and visual comparison preserves the main scene structure and
+semantic regions. Strict numerical equivalence and isolated sampling quality
+are not established by these final-map measurements. At the same 1612 width,
 the original SfM gives focal length 762.932627 versus the reference's
 444.998758, with different distortion, poses and geometry. Across all 229 raw
 input pairs, nearest-downsampled original labels agree with the independently

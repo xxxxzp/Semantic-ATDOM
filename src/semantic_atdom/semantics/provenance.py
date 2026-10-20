@@ -80,6 +80,7 @@ def semantic_state_sha256(
         "topology_version": int(state.topology_version),
         "next_gaussian_id": int(state.next_gaussian_id),
         "historical_evidence_stale": bool(state.historical_evidence_stale),
+        "group_disagreement_source": state.group_disagreement_source,
         "group_disagreement_available": bool(
             state.group_disagreement_available
         ),

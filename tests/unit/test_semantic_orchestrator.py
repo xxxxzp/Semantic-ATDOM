@@ -348,7 +348,7 @@ class OnlineSemanticOrchestratorTests(unittest.TestCase):
     def test_online_group_disagreement_tracks_raw_group_moments(self):
         state = SemanticGaussianState.initialize(1, 2)
         runner = OnlineSemanticOrchestrator(
-            state, CLASS_SPEC, OnlineSemanticConfig(max_group_size=1)
+            state, CLASS_SPEC, OnlineSemanticConfig(max_group_size=4)
         )
         matrix = overlap(["000001", "000002"])
 
@@ -356,10 +356,23 @@ class OnlineSemanticOrchestratorTests(unittest.TestCase):
         self.assertFalse(state.group_disagreement_available)
         runner.ingest(observation("000002"), projection([0, 1], 1), matrix)
 
+        self.assertFalse(state.group_disagreement_available)
+        torch.testing.assert_close(state.group_variance, torch.zeros(1, 2))
+        runner.close_group()
         self.assertTrue(state.group_disagreement_available)
         torch.testing.assert_close(
             state.group_variance, torch.tensor([[0.25, 0.25]])
         )
+
+    def test_open_group_does_not_change_closed_group_diagnostic(self):
+        state = SemanticGaussianState.initialize(1, 2)
+        runner = OnlineSemanticOrchestrator(state, CLASS_SPEC, OnlineSemanticConfig(max_group_size=4))
+        matrix = overlap(["000001", "000002", "000003"])
+        runner.ingest(observation("000001"), projection([1, 0], 1), matrix)
+        runner.ingest(observation("000002"), projection([0, 1], 1), matrix)
+        runner.ingest(observation("000003"), projection([1, 0], 1), matrix)
+        self.assertTrue(state.group_disagreement_available)
+        torch.testing.assert_close(state.group_variance, torch.tensor([[.25, .25]]))
 
     def test_ledger_is_idempotent_and_rejects_changed_hash_for_same_key(self):
         state = SemanticGaussianState.initialize(1, 2)

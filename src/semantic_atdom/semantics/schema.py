@@ -209,6 +209,15 @@ class SemanticObservation:
     score_path: Optional[Path]
 
 
+def generation_fingerprint(metadata: Mapping[str, object]) -> str:
+    """Stable generation identity, independent of JSON formatting and paths."""
+    fields = ("model", "checkpoint_sha256", "prompt_config", "thresholds")
+    payload = json.dumps({key: metadata[key] for key in fields},
+                         sort_keys=True, separators=(",", ":"),
+                         ensure_ascii=False, allow_nan=False).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
 class SemanticDataset:
     """Read and validate one dataset-level semantic directory."""
 

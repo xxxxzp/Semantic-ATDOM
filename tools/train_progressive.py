@@ -342,6 +342,8 @@ def GetArgs():
     parser.add_argument(
         "--training_progress_target_frames", type=int, default=120
     )
+    parser.add_argument("--worker_shutdown_timeout", type=float, default=300.0,
+                        help="Maximum seconds to drain each worker during shutdown.")
     parser.add_argument("--training_progress_fps", type=float, default=4.0)
     parser.add_argument(
         "--recovery_checkpoint_every_stages", type=int, default=0
@@ -361,6 +363,8 @@ def GetArgs():
         )
     '''以上是在构建参数配置器'''
 
+    if not math.isfinite(args.worker_shutdown_timeout) or args.worker_shutdown_timeout <= 0:
+        raise ValueError("--worker_shutdown_timeout must be positive and finite")
     if args.training_progress_target_frames < 3:
         raise ValueError(
             "--training_progress_target_frames must be at least 3"
@@ -3778,19 +3782,17 @@ class On_the_Fly_GS:
 
         print("Start Thread...\n")
         self.GaussianTrainer_Thread = mp.Process(target=self.GaussianTrainer.run)
-        self.GaussianTrainer_Thread.start()
-        self.DataPreProccesser.GaussianTrainer_process = (
-            self.GaussianTrainer_Thread
-        )
         self.DataSaver_Thread = mp.Process(target=self.DataSaver.run)
-        self.DataSaver_Thread.start()
         workers = WorkerGroup({
             "trainer": self.GaussianTrainer_Thread,
             "output": self.DataSaver_Thread,
-        })
+        }, timeout=args.worker_shutdown_timeout)
         self.DataPreProccesser.worker_group = workers
+        self.DataPreProccesser.GaussianTrainer_process = self.GaussianTrainer_Thread
         self.DataPreProccesser.DataSaver_process = self.DataSaver_Thread
         try:
+            self.GaussianTrainer_Thread.start()
+            self.DataSaver_Thread.start()
             self.DataPreProccesser.run()
             workers.stop("trainer", self.GaussianTrainer_queue)
             workers.stop("output", self.DataSaver_queue)
@@ -3928,11 +3930,14 @@ class On_the_Fly_GS:
                 require_map=bool(self.GaussianTrainer.args.render_TDOM),
             )
             records["semantic_model"] = archive_semantic_state(self.layout)
-            schema_source = (
-                Path(self.GaussianTrainer.args.semantic_data_root)
-                / "semantic"
-                / "class_spec.json"
-            )
+            schema_source = self.layout.semantic_work / "validated_schema.json"
+            if not schema_source.is_file():
+                raise RuntimeError("validated final semantic schema is missing")
+            with (self.layout.semantic_work / "final_rebuild_metrics.json").open() as stream:
+                final_semantic_metadata = json.load(stream)
+            if (SemanticClassSpec.load(schema_source).fingerprint
+                    != final_semantic_metadata.get("class_spec_sha256")):
+                raise RuntimeError("validated final semantic schema identity changed")
             if schema_source.is_file():
                 schema_destination = self.layout.semantic_model / "schema.json"
                 shutil.copy2(schema_source, schema_destination)

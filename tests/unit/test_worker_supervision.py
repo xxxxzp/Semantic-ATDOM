@@ -102,3 +102,13 @@ class WorkerShutdownTests(unittest.TestCase):
             workers.abort()
             frames.cancel_join_thread()
             frames.close()
+
+    def test_startup_failure_cleanup_accepts_a_worker_that_never_started(self):
+        from semantic_atdom.utils.worker_supervision import WorkerGroup
+        context = mp.get_context('spawn')
+        frames = context.Queue()
+        output = context.Process(target=_drain_frames, args=(frames,))
+        try:
+            WorkerGroup({'output': output}).abort()
+        finally:
+            frames.close()

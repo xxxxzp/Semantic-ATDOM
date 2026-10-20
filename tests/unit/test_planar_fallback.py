@@ -86,7 +86,13 @@ def test_config_rejects_unsafe_thresholds(kwargs, message):
         PlanarFallbackConfig(class_name="water", **kwargs)
 
 
-def test_end_to_end_fallback_updates_class_diagnostics_and_provenance():
+@pytest.mark.parametrize("scale_values, ratio, expected_plane_count", [
+    ([.1] * 3, 14., 3),
+    ([1.] * 32 + [20.] * 32, 14., 32),
+    ([1.] * 33 + [20.] * 32, 14., 33),
+    ([1.] * 32 + [20.] * 32, 0., 64),
+])
+def test_end_to_end_fallback_updates_class_diagnostics_and_provenance(scale_values, ratio, expected_plane_count):
     class_spec = SemanticClassSpec.from_dict(
         {
             "schema_version": 1,
@@ -134,15 +140,11 @@ def test_end_to_end_fallback_updates_class_diagnostics_and_provenance():
         ),
     )
     gaussians = SimpleNamespace(
-        get_xyz=torch.tensor(
-            [[-0.2, -0.2, 0.0], [0.2, -0.2, 0.0], [0.0, 0.2, 0.0]]
-        ),
-        get_scaling=torch.full((3, 3), 0.1),
+        get_xyz=torch.zeros((len(scale_values), 3)),
+        get_scaling=torch.tensor(scale_values)[:, None].repeat(1, 3),
     )
     state = SimpleNamespace(
-        alpha_robust=torch.tensor(
-            [[0.5, 4.5], [0.5, 4.5], [0.5, 4.5]]
-        ),
+        alpha_robust=torch.tensor([[0.5, 4.5]]).repeat(len(scale_values), 1),
         prior_total=1.0,
         num_classes=2,
     )
@@ -169,10 +171,11 @@ def test_end_to_end_fallback_updates_class_diagnostics_and_provenance():
         dataset=dataset,
         source_cameras=(camera,),
         observation_groups=(("000001",),),
-        geometry_scale_ratio=14.0,
+        geometry_scale_ratio=ratio,
         config=config,
     )
 
+    assert outcome.metrics["components"][0]["plane_gaussian_count"] == expected_plane_count
     assert outcome.metrics["filled_pixel_count"] == 4
     assert torch.all(outcome.result.class_ids[3:5, 3:5] == 1)
     assert torch.all(outcome.result.class_provenance[3:5, 3:5] == 2)

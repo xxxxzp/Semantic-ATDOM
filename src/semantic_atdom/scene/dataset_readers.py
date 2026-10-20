@@ -12,6 +12,7 @@
 import torch
 import torch.nn.functional as F
 import os
+import struct
 import sys
 from PIL import Image
 from typing import NamedTuple
@@ -215,11 +216,11 @@ def Get_3D_Sampled_Points_GPU(sampled_points, Tri_IDs, tri_simplices, xys, corre
 
         # 计算重心坐标
         bary_coords = compute_barycentric_coords_torch(sampled_points, a2d, b2d, c2d)  # (M, 3)
-        bary_coords = bary_coords.to(dtype=torch.float32, device=device)
+        bary_coords = bary_coords.to(dtype=corresponding_3d_points.dtype, device=device)
 
         if camera_depths is None:
             raise ValueError("camera-space depths are required for perspective sampling")
-        depths = torch.as_tensor(camera_depths, device=device)[triangle_indices]
+        depths = torch.as_tensor(camera_depths, device=device, dtype=corresponding_3d_points.dtype)[triangle_indices]
         edges = triangle_xys[:, 1:] - triangle_xys[:, :1]
         area = edges[:, 0, 0] * edges[:, 1, 1] - edges[:, 0, 1] * edges[:, 1, 0]
         valid = (torch.isfinite(depths).all(dim=1) & (depths > 0).all(dim=1)
@@ -1059,8 +1060,12 @@ def SingleImage_readColmapSceneInfo_Part2(path, train_cam_infos, test_cam_infos,
         txt_path = os.path.join(path, "bin/points3D.txt")
     if Ply_Cache_Path:
         ply_path = os.fspath(Ply_Cache_Path)
+        if Path(ply_path).resolve().is_relative_to(Path(path).resolve()):
+            raise ValueError("point-cloud output cache must be outside source data")
+    else:
+        get_ply = False
 
-    if not os.path.exists(ply_path):
+    if not get_ply or not os.path.exists(ply_path):
         try:
             POINT3D_IDs, xyz, rgb, _ = read_points3D_ID_binary(bin_path)
         except:
@@ -1261,6 +1266,7 @@ def SingleImage_readColmapSceneInfo_Part2(path, train_cam_infos, test_cam_infos,
     return scene_info
 
 def SingleImage_readColmapSceneInfo(path, images, eval, llffhold=8, get_ply=True, Do_Get_Tri_Mask=False, Image_Name="", points_per_triangle=4, device="cuda", CurrentImagesNames=[]):
+    get_ply = False  # Legacy reader has no output-cache parameter.
     try:
         cameras_extrinsic_file = os.path.join(path, "sparse/0", "images.bin")
         cameras_intrinsic_file = os.path.join(path, "sparse/0", "cameras.bin")
@@ -1301,7 +1307,7 @@ def SingleImage_readColmapSceneInfo(path, images, eval, llffhold=8, get_ply=True
     bin_path = os.path.join(path, "sparse/0/points3D.bin")
     txt_path = os.path.join(path, "sparse/0/points3D.txt")
 
-    if not os.path.exists(ply_path):
+    if not get_ply or not os.path.exists(ply_path):
         try:
             POINT3D_IDs, xyz, rgb, _ = read_points3D_ID_binary(bin_path)
         except:
@@ -1339,7 +1345,7 @@ def SingleImage_readColmapSceneInfo(path, images, eval, llffhold=8, get_ply=True
             # storePly(ply_path, xyz, rgb)
             storePly(ply_path, all_points_3d, all_colors)
         else:
-            plydata = storePly(ply_path, xyz, rgb, False)
+            plydata = storePly(ply_path, all_points_3d, all_colors, False)
             vertices = plydata['vertex']
             positions = np.vstack([vertices['x'], vertices['y'], vertices['z']]).T
             colors = np.vstack([vertices['red'], vertices['green'], vertices['blue']]).T / 255.0
@@ -1404,33 +1410,31 @@ def readColmapSceneInfo(path, images, eval, llffhold=8, get_ply=True, Do_Get_Tri
         ply_path = os.path.join(path, "bin/points3D.ply")
         bin_path = os.path.join(path, "bin/points3D.bin")
         txt_path = os.path.join(path, "bin/points3D.txt")
+    # Source SfM is immutable. A derived PLY may only be written to an
+    # explicitly supplied output cache; otherwise keep the point cloud in RAM.
     if Ply_Cache_Path:
         ply_path = os.fspath(Ply_Cache_Path)
+        if Path(ply_path).resolve().is_relative_to(Path(path).resolve()):
+            raise ValueError("point-cloud output cache must be outside source data")
+    else:
+        get_ply = False
 
-    if not os.path.exists(ply_path):
+    if os.path.exists(ply_path):
+        pcd = fetchPly(ply_path)
+        if not get_ply:
+            ply_path = None
+    else:
         try:
             xyz, rgb, _ = read_points3D_binary(bin_path)
-        except:
+        except (OSError, ValueError, struct.error):
             xyz, rgb, _ = read_points3D_text(txt_path)
-
+        pcd = BasicPointCloud(points=xyz, colors=rgb / 255.0,
+                              normals=np.zeros_like(xyz))
         if get_ply:
-            print("Converting point3d.bin to .ply, will happen only the first time you open the scene.")
-            os.makedirs(os.path.dirname(ply_path), exist_ok=True)
+            os.makedirs(os.path.dirname(os.path.abspath(ply_path)), exist_ok=True)
             storePly(ply_path, xyz, rgb)
         else:
-            plydata = storePly(ply_path, xyz, rgb, False)
-            vertices = plydata['vertex']
-            positions = np.vstack([vertices['x'], vertices['y'], vertices['z']]).T
-            colors = np.vstack([vertices['red'], vertices['green'], vertices['blue']]).T / 255.0
-            normals = np.vstack([vertices['nx'], vertices['ny'], vertices['nz']]).T
-            pcd = BasicPointCloud(points=positions, colors=colors, normals=normals)
             ply_path = None
-
-    if get_ply:
-        try:
-            pcd = fetchPly(ply_path)
-        except:
-            pcd = None
 
     scene_info = SceneInfo(point_cloud=pcd,
                            train_cameras=train_cam_infos,

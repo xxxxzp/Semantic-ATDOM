@@ -17,6 +17,7 @@ import numpy as np
 import torch
 
 from semantic_atdom.semantics.label_grid import labels_on_camera_grid
+from semantic_atdom.semantics.geometry_trust import trusted_geometry_mask
 
 
 @dataclass(frozen=True)
@@ -318,17 +319,8 @@ def apply_planar_multiview_fallback(
     )
 
     xyz = gaussians.get_xyz.detach().cpu().numpy().astype(np.float64, copy=False)
-    scales = gaussians.get_scaling.detach().cpu().numpy()
-    maximum_scales = scales.max(axis=1)
-    median_scale = float(np.median(maximum_scales)) if len(maximum_scales) else 0.0
-    scale_limit = (
-        median_scale * float(geometry_scale_ratio)
-        if geometry_scale_ratio > 0
-        else None
-    )
-    trusted = np.ones(len(xyz), dtype=bool)
-    if scale_limit is not None:
-        trusted &= maximum_scales <= scale_limit
+    trusted, _ = trusted_geometry_mask(gaussians.get_scaling, geometry_scale_ratio)
+    trusted = trusted.cpu().numpy()
     alpha = semantic_state.alpha_robust.detach().cpu().numpy()
     prior = float(semantic_state.prior_total) / int(semantic_state.num_classes)
     evidence = np.maximum(alpha - prior, 0.0)

@@ -15,6 +15,7 @@ from PIL import Image
 import torch
 
 from semantic_atdom.semantics.schema import SemanticClassSpec, sha256_file
+from semantic_atdom.semantics.geometry_trust import trusted_geometry_mask as _trusted_geometry_mask
 from semantic_atdom.semantics.provenance import SEMANTIC_METHOD_VERSION
 from semantic_atdom.semantics.reference import evidence_conditioned_belief
 
@@ -244,48 +245,6 @@ def _empty_uncertainty(reference: torch.Tensor) -> torch.Tensor:
     return torch.full_like(reference, float("nan"))
 
 
-def _trusted_geometry_mask(
-    scales: torch.Tensor, max_scale_ratio: float
-) -> Tuple[torch.Tensor, Dict[str, object]]:
-    """Exclude detached scale outliers from Semantic TDOM support.
-
-    Progressive geometry can contain a small number of extremely large
-    Gaussians whose dark SH appearance is nearly invisible in RGB while their
-    opacity spreads one semantic class across the map border.  This mask only
-    bounds the read-only semantic render; it never mutates geometry or feeds
-    back into training.
-    """
-    if scales.ndim != 2 or scales.shape[1] != 3:
-        raise ValueError("Gaussian scales must have shape [N, 3]")
-    maximum_scales = scales.detach().max(dim=1).values
-    if not bool(torch.isfinite(maximum_scales).all()):
-        raise ValueError("Gaussian scales must be finite")
-    median_scale = (
-        float(maximum_scales.median().item())
-        if maximum_scales.numel()
-        else 0.0
-    )
-    enabled = max_scale_ratio > 0 and maximum_scales.numel() > 0
-    scale_limit = median_scale * max_scale_ratio if enabled else None
-    trusted = torch.ones_like(maximum_scales, dtype=torch.bool)
-    if enabled:
-        trusted &= maximum_scales <= scale_limit
-    input_count = int(maximum_scales.numel())
-    trusted_count = int(trusted.sum().item())
-    return trusted, {
-        "method": "max_world_scale_over_scene_median",
-        "enabled": bool(enabled),
-        "max_gaussian_scale_ratio": float(max_scale_ratio),
-        "median_max_world_scale": median_scale,
-        "max_trusted_world_scale": (
-            None if scale_limit is None else float(scale_limit)
-        ),
-        "input_gaussian_count": input_count,
-        "trusted_gaussian_count": trusted_count,
-        "excluded_gaussian_count": input_count - trusted_count,
-    }
-
-
 @torch.no_grad()
 def rasterize_rgb_tdom_striped(
     gaussians,
@@ -430,8 +389,13 @@ def _semantic_render_features(
     """Build the K+5 per-Gaussian values consumed by the CUDA renderer."""
     alpha = semantic_state.alpha_robust if use_robust else semantic_state.alpha_raw
     alpha = alpha.detach().to(device=device, dtype=torch.float32)
+    open_evidence = (semantic_state.open_robust_evidence if use_robust
+                     else semantic_state.open_raw_evidence).detach().to(device=device, dtype=torch.float32)
+    closed_alpha = alpha - open_evidence
+
     if gaussian_mask is not None:
         alpha = alpha[gaussian_mask]
+        closed_alpha = closed_alpha[gaussian_mask]
     belief = evidence_conditioned_belief(
         alpha, prior_total=semantic_state.prior_total, eps=eps
     )
@@ -444,7 +408,7 @@ def _semantic_render_features(
     group_disagreement = semantic_state.group_variance.detach().to(
         device=device, dtype=torch.float32
     )
-    group_count = semantic_state.group_count.detach().to(device=device)
+    group_count = (semantic_state.group_count - semantic_state.open_group_count).detach().to(device=device)
     if gaussian_mask is not None:
         group_disagreement = group_disagreement[gaussian_mask]
         group_count = group_count[gaussian_mask]
@@ -452,7 +416,10 @@ def _semantic_render_features(
     group_eligible = group_count >= 2
     if not semantic_state.group_disagreement_available:
         group_eligible = torch.zeros_like(group_eligible)
-    group_support = evidence_ratio * group_eligible.to(dtype=torch.float32)
+    closed_evidence_ratio = evidence_conditioned_belief(
+        closed_alpha, prior_total=semantic_state.prior_total, eps=eps
+    ).evidence_ratio
+    group_support = closed_evidence_ratio * group_eligible.to(dtype=torch.float32)
     prior_regularized_mean = alpha / (concentration.unsqueeze(1) + eps)
     prior_regularized_variance_proxy = (
         (1.0 - prior_regularized_mean.square().sum(dim=1)).clamp_min(0.0)
@@ -1034,7 +1001,7 @@ def rasterize_semantic_tdom(
             group_disagreement, float("nan")
         )
     updated_metrics["group_disagreement_status"] = (
-        "exact_rebuild"
+        semantic_state.group_disagreement_source
         if semantic_state.group_disagreement_available
         else "unavailable"
     )

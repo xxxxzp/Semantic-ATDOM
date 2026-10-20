@@ -1298,6 +1298,13 @@ class ProgressiveSemanticHook:
         if final:
             if online_usable:
                 self.orchestrator.close_group()
+            try:
+                disk_spec = SemanticClassSpec.load(self.dataset.semantic_root / "class_spec.json")
+                if disk_spec.ontology_fingerprint != self.dataset.class_spec.ontology_fingerprint:
+                    raise SemanticSchemaError("semantic ontology changed on disk before final rebuild")
+            except (SemanticSchemaError, OSError, ValueError) as error:
+                input_binding_error = True
+                errors.append("final class specification: {}".format(error))
             final_ready = []
             final_missing = []
             for image_id in all_ordered:
@@ -1312,7 +1319,17 @@ class ProgressiveSemanticHook:
                 if image_id not in camera_by_id:
                     final_missing.append(image_id)
                 elif label_path.is_file() and metadata_path.is_file():
-                    final_ready.append(image_id)
+                    try:
+                        # Explicit partial mode admits each observation
+                        # independently; one malformed file must not hide
+                        # valid later views. Strict binding failures above
+                        # still prevent any authoritative final rebuild.
+                        self.dataset.load_observation(image_id)
+                    except (SemanticSchemaError, OSError, ValueError) as error:
+                        final_missing.append(image_id)
+                        errors.append("final invalid observation {}: {}".format(image_id, error))
+                    else:
+                        final_ready.append(image_id)
                 else:
                     final_missing.append(image_id)
             deferred = list(dict.fromkeys(deferred + final_missing))
@@ -1329,6 +1346,16 @@ class ProgressiveSemanticHook:
                         overlap,
                         online_state=self.orchestrator.state,
                     )
+                    if self.final_input_binding is not None:
+                        validate_final_preflight_binding(
+                            report_path=self.preflight_report_path,
+                            expected_report_sha256=self.preflight_report_sha256,
+                            semantic_dataset=self.dataset,
+                            image_ids=all_ordered,
+                            camera_by_id=camera_by_id,
+                            snapshot_root=snapshot_root,
+                            geometry_stage=geometry_stage,
+                        )
                     rebuilt_provenance = dict(rebuilt.label_provenance)
                     if self.final_input_binding is not None:
                         rebuilt_provenance["input_binding"] = {
@@ -1365,6 +1392,7 @@ class ProgressiveSemanticHook:
                                 else None
                             ),
                             "groups": [list(group) for group in rebuilt.image_groups],
+                            "class_spec_sha256": self.dataset.class_spec.fingerprint,
                             "input_binding": (
                                 None
                                 if self.final_input_binding is None
@@ -1377,6 +1405,10 @@ class ProgressiveSemanticHook:
                             ),
                             "metrics": rebuilt.metrics.to_dict(),
                         },
+                    )
+                    self._save_json_atomic(
+                        self.output_root / "validated_schema.json",
+                        self.dataset.class_spec.to_dict(),
                     )
                     # Swap only after every fallible rebuild/metrics operation
                     # completed, so failure always leaves the online state live.
@@ -1882,6 +1914,8 @@ class AsyncProgressiveSemanticHook:
         self._pending_stage_count = 0
         self._latest_stage_token = 0
         self._latest_stage_request = None
+        self._latest_projection_token = 0
+        self._latest_projection_request = None
         self._last_result = None
         self._error = None
         self._is_valid = True
@@ -1963,6 +1997,7 @@ class AsyncProgressiveSemanticHook:
                 return
             self._closed = True
             self._latest_stage_request = None
+            self._latest_projection_request = None
         self._executor.shutdown(wait=wait)
 
     def wait_for_idle(self) -> None:
@@ -2000,6 +2035,7 @@ class AsyncProgressiveSemanticHook:
 
         if not final:
             with self._lock:
+                projection_only_marker = False
                 pending_publication = (
                     None
                     if self._latest_stage_request is None
@@ -2018,7 +2054,13 @@ class AsyncProgressiveSemanticHook:
                         stage_boundaries=tuple(self._stage_boundaries),
                         publication_request=None,
                     )
-                    token = None
+                    # Keep the already queued map, but coalesce later projection
+                    # snapshots independently. Markers retain their original
+                    # queue positions relative to topology deltas.
+                    self._latest_projection_token += 1
+                    token = self._latest_projection_token
+                    self._latest_projection_request = request
+                    projection_only_marker = True
                     queued_product_key = pending_publication.product_key
                 elif (
                     publication_request is not None
@@ -2072,8 +2114,8 @@ class AsyncProgressiveSemanticHook:
                 self._stage_pending = True
                 self._idle_event.clear()
             future = self._executor.submit(
-                self._run_stage_marker if token is not None else self._run_stage,
-                token if token is not None else request,
+                self._run_projection_marker if projection_only_marker else self._run_stage_marker,
+                token,
             )
             future.add_done_callback(self._stage_done)
             status = self._current_status(geometry_stage)
@@ -2178,6 +2220,16 @@ class AsyncProgressiveSemanticHook:
         if request is None:
             return None
         return self._run_stage(request)
+
+    def _run_projection_marker(self, token):
+        with self._lock:
+            if token != self._latest_projection_token:
+                return None
+            request = self._latest_projection_request
+            self._latest_projection_request = None
+        if request is not None:
+            return self._run_stage(request)
+        return None
 
     def _run_stage(self, request: _PendingStageRequest):
         result = self._execute_core(*request.core_args())

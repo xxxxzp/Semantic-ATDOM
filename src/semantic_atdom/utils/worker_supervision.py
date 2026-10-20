@@ -1,10 +1,13 @@
 """Bounded shutdown for cooperating multiprocessing workers and their queues."""
 import time
+import math
 from queue import Full
 
 
 class WorkerGroup:
     def __init__(self, workers, timeout=300.0):
+        if not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError("worker shutdown timeout must be positive and finite")
         self.workers = dict(workers)
         self.expected = set()
         self.timeout = timeout
@@ -47,6 +50,8 @@ class WorkerGroup:
             if process.is_alive():
                 process.terminate()
         for process in self.workers.values():
+            if process.pid is None:
+                continue
             process.join(timeout=3)
             if process.is_alive():
                 process.kill()

@@ -8,6 +8,8 @@ from typing import Mapping, Sequence
 
 from semantic_atdom.semantics.schema import (
     SemanticDataset,
+    SemanticClassSpec,
+    generation_fingerprint,
     SemanticSchemaError,
     sha256_file,
 )
@@ -108,6 +110,9 @@ def validate_final_preflight_binding(
             )
         )
     class_spec = semantic_dataset.class_spec
+    disk_spec = SemanticClassSpec.load(semantic_dataset.semantic_root / "class_spec.json")
+    if disk_spec.ontology_fingerprint != class_spec.ontology_fingerprint:
+        raise SemanticSchemaError("semantic ontology changed on disk since preflight")
     if report.get("class_spec_sha256") != class_spec.fingerprint:
         raise SemanticSchemaError("class specification changed since preflight")
     if report.get("ontology_sha256") != class_spec.ontology_fingerprint:
@@ -168,6 +173,13 @@ def validate_final_preflight_binding(
             raise SemanticSchemaError(
                 "label content changed since preflight: {}".format(image_id)
             )
+        if generation_fingerprint(observation.metadata) != expected.get("generation_sha256"):
+            raise SemanticSchemaError(
+                "label generation identity changed or is unbound since preflight: {}".format(image_id)
+            )
+        if ("score_sha256" not in expected
+                or observation.metadata.get("score_sha256") != expected["score_sha256"]):
+            raise SemanticSchemaError("semantic score content changed since preflight: {}".format(image_id))
         camera = camera_by_id.get(image_id)
         image_path = None if camera is None else getattr(camera, "image_path", None)
         if not image_path:

@@ -2,6 +2,7 @@ import os
 import hashlib
 import csv
 from queue import Empty
+from semantic_atdom.utils.worker_supervision import WorkerGroup
 import random
 from pathlib import Path
 import torch
@@ -936,14 +937,19 @@ class DataPreProccesser(mp.Process):
 
     def _ensure_trainer_alive(self):
         """Fail promptly if the training child exited without a stop message."""
-        process = self.GaussianTrainer_process
-        if process is not None and not process.is_alive():
-            process.join(timeout=0)
-            raise RuntimeError(
-                "GaussianTrainer exited unexpectedly with code {}".format(
-                    process.exitcode
+        supervisor = getattr(self, "worker_group", None)
+        if supervisor is not None:
+            supervisor.check()
+            return
+        for name, process in (
+            ("GaussianTrainer", self.GaussianTrainer_process),
+            ("output", getattr(self, "DataSaver_process", None)),
+        ):
+            if process is not None and not process.is_alive():
+                process.join(timeout=0)
+                raise RuntimeError(
+                    f"{name} worker exited unexpectedly with code {process.exitcode}"
                 )
-            )
 
     def _wait_for_trainer_message(self, timeout=0.1):
         """Block without busy-spinning while retaining child health checks."""
@@ -3712,7 +3718,7 @@ class On_the_Fly_GS:
         self.layout.write_config(vars(args))
         self.DataPreProccesser_queue = mp.Queue()
         self.GaussianTrainer_queue = mp.Queue()
-        self.DataSaver_queue = mp.Queue()
+        self.DataSaver_queue = mp.Queue(maxsize=2)
 
         self.DataPreProccesser = DataPreProccesser(args, lp, op, pp)
         self.DataPreProccesser.DataPreProccesser_queue = self.DataPreProccesser_queue
@@ -3778,35 +3784,28 @@ class On_the_Fly_GS:
         )
         self.DataSaver_Thread = mp.Process(target=self.DataSaver.run)
         self.DataSaver_Thread.start()
+        workers = WorkerGroup({
+            "trainer": self.GaussianTrainer_Thread,
+            "output": self.DataSaver_Thread,
+        })
+        self.DataPreProccesser.worker_group = workers
+        self.DataPreProccesser.DataSaver_process = self.DataSaver_Thread
         try:
             self.DataPreProccesser.run()
+            workers.stop("trainer", self.GaussianTrainer_queue)
+            workers.stop("output", self.DataSaver_queue)
         except BaseException:
-            if self.GaussianTrainer_Thread.is_alive():
-                self.GaussianTrainer_Thread.terminate()
-            self.GaussianTrainer_Thread.join()
-            self.DataSaver_queue.put(["stop"])
-            self.DataSaver_Thread.join(timeout=5)
-            if self.DataSaver_Thread.is_alive():
-                self.DataSaver_Thread.terminate()
-                self.DataSaver_Thread.join()
+            workers.abort()
             raise
-
-        self.GaussianTrainer_queue.put(["stop"])
-        self.GaussianTrainer_Thread.join()
-        if self.GaussianTrainer_Thread.exitcode != 0:
-            raise RuntimeError(
-                "Gaussian trainer exited with code {}".format(
-                    self.GaussianTrainer_Thread.exitcode
-                )
-            )
-        self.DataSaver_queue.put(["stop"])
-        self.DataSaver_Thread.join()
-        if self.DataSaver_Thread.exitcode != 0:
-            raise RuntimeError(
-                "output worker exited with code {}".format(
-                    self.DataSaver_Thread.exitcode
-                )
-            )
+        finally:
+            for queue in (
+                self.DataPreProccesser_queue,
+                self.GaussianTrainer_queue,
+                self.DataSaver_queue,
+            ):
+                # Never wait for an undrainable feeder during error cleanup.
+                queue.cancel_join_thread()
+                queue.close()
         artifacts, final_stage, optimizer_iteration = self._finalize_success()
         subprocess.run(
             [

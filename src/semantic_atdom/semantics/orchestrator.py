@@ -1416,6 +1416,9 @@ class ProgressiveSemanticHook:
                     ledger_images = {
                         entry.image_id for entry in rebuilt.ledger.entries
                     }
+                    # Online ingestion may have stopped at an invalid earlier
+                    # view. The exact partial pass has now admitted later views.
+                    deferred = [image_id for image_id in deferred if image_id not in ledger_images]
                     exact_rebuilt = True
                     final_image_groups = rebuilt.image_groups
                     exact_complete = (

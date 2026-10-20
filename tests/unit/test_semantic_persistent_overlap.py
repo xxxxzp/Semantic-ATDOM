@@ -111,7 +111,7 @@ class PersistentOverlapTests(unittest.TestCase):
                                       stage, final=True)
             self.assertEqual(result.status, "exact_partial")
             self.assertIn("000003", calls)
-            self.assertIn("000002", result.deferred_image_ids)
+            self.assertEqual(result.deferred_image_ids, ("000002",))
             self.assertTrue(any("000002" in error for error in result.errors))
             self.assertEqual({entry.image_id for entry in hook.orchestrator.ledger.entries},
                              {"000001", "000003"})

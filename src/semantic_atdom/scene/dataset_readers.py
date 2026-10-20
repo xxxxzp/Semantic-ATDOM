@@ -146,34 +146,23 @@ def getNerfppNorm(cam_info):
     return {"translate": translate, "radius": radius}
 
 def compute_barycentric_coords_torch(p, a, b, c):
+    """Screen-space weights without a cancellation-prone Gram determinant.
+
+    A few Delaunay cells are very thin. Evaluate their oriented areas in
+    float64 even when image/world tensors use float32, then let the sampler
+    return geometry in the input point dtype.
     """
-    输入：
-        p: (N, 2)
-        a, b, c: (N, 2)
-    输出：
-        bary_coords: (N, 3)
-    """
-    v0 = b - a  # (N, 2)
-    v1 = c - a
-    v2 = p - a
+    p, a, b, c = (value.to(dtype=torch.float64) for value in (p, a, b, c))
+    first, second, point = b - a, c - a, p - a
 
-    d00 = torch.sum(v0 * v0, dim=1)  # (N,)
-    d01 = torch.sum(v0 * v1, dim=1)
-    d11 = torch.sum(v1 * v1, dim=1)
-    d20 = torch.sum(v2 * v0, dim=1)
-    d21 = torch.sum(v2 * v1, dim=1)
+    def cross(left, right):
+        return left[:, 0] * right[:, 1] - left[:, 1] * right[:, 0]
 
-    denom = d00 * d11 - d01 * d01  # (N,)
-
-    # 避免除以 0（退化三角形）
-    eps = 1e-8
-    denom = torch.where(denom == 0, torch.ones_like(denom) * eps, denom)
-
-    v = (d11 * d20 - d01 * d21) / denom
-    w = (d00 * d21 - d01 * d20) / denom
-    u = 1.0 - v - w
-
-    return torch.stack([u, v, w], dim=1)  # (N, 3)
+    denominator = cross(first, second)
+    denominator = torch.where(denominator != 0, denominator, float("nan"))
+    v = cross(point, second) / denominator
+    w = cross(first, point) / denominator
+    return torch.stack((1.0 - v - w, v, w), dim=1)
 
 def Get_3D_Sampled_Points_GPU(sampled_points, Tri_IDs, tri_simplices, xys, corresponding_3d_points, corresponding_3d_points_rgb, sampled_corresponding_3d_points=None, sampled_corresponding_3d_points_rgb=None, *, camera_depths=None):
     """
@@ -264,31 +253,18 @@ def Get_3D_Sampled_Points_GPU(sampled_points, Tri_IDs, tri_simplices, xys, corre
     return all_points_3d, all_colors
 
 def compute_barycentric_coords(p, a, b, c):
-    """
-    计算点 p 相对于三角形 abc 的重心坐标
-    p, a, b, c 都是 2D 点 (x, y)
-    返回 (w1, w2, w3) 重心权重
-    """
-    v0 = b - a
-    v1 = c - a
-    v2 = p - a
+    p, a, b, c = (np.asarray(value, dtype=np.float64) for value in (p, a, b, c))
+    first, second, point = b - a, c - a, p - a
 
-    d00 = np.dot(v0, v0)
-    d01 = np.dot(v0, v1)
-    d11 = np.dot(v1, v1)
-    d20 = np.dot(v2, v0)
-    d21 = np.dot(v2, v1)
+    def cross(left, right):
+        return left[0] * right[1] - left[1] * right[0]
 
-    denom = d00 * d11 - d01 * d01
-    if denom == 0:
-        # 退化三角形，返回默认值
-        return np.array([1.0, 0.0, 0.0])
-
-    v = (d11 * d20 - d01 * d21) / denom
-    w = (d00 * d21 - d01 * d20) / denom
-    u = 1.0 - v - w
-
-    return np.array([u, v, w])
+    denominator = cross(first, second)
+    if denominator == 0:
+        return np.full(3, np.nan)
+    v = cross(point, second) / denominator
+    w = cross(first, point) / denominator
+    return np.array((1.0 - v - w, v, w))
 
 def Get_3D_Sampled_Points(sampled_points, Tri_IDs, tri, xys, corresponding_3d_points, corresponding_3d_points_rgb, sampled_corresponding_3d_points=None, sampled_corresponding_3d_points_rgb=None, *, camera_depths=None):
     time1 = time.time()

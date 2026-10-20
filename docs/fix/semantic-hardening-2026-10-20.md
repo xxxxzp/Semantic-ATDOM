@@ -62,3 +62,19 @@ Four obsolete worktrees were removed after checking active references.
 The two dirty worktrees have binary patches, untracked-file backups, and
 `refs/backup/worktree-cleanup-20261020/*` recovery references. Their branches
 remain available. The main checkout and the new fix worktree are retained.
+
+The first production smoke run on original XinCao (`--resolution 4`, stages
+30–32, 50 optimizer iterations) completed initialization, incremental training,
+exact final reconstruction and H.264 video publication. All **997** protected
+file hashes matched. This is a functional smoke check, not the earlier full-run
+quality comparison.
+
+A real-SfM projection oracle additionally exposed cancellation in the old Gram
+formula for very thin triangles, especially with float32 screen coordinates.
+Both samplers now evaluate oriented 2D areas in float64 and return tensor
+geometry in its original dtype. A minimal thin-triangle test failed on NumPy,
+Torch CPU, and CUDA before this repair. On 392 sampled triangles from four
+original XinCao camera poses, the corrected float32 world-point reprojection
+has maximum error **0.000876 source pixels**, and float64 maximum error is
+below `7e-10` pixels. The oracle independently projects co-visible SfM vertices;
+it verifies the sampling constraint, not bundle-adjustment or semantic accuracy.

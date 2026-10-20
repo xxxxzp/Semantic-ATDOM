@@ -30,3 +30,26 @@ class PerspectiveSamplingTests(unittest.TestCase):
                 np.testing.assert_allclose(projected[:, :2] / projected[:, 2:], samples, atol=1e-6)
                 # The triangle's camera-space plane is x/2 + 3*y/4 - z = -1.
                 np.testing.assert_allclose(projected[:, 0]/2 + 3*projected[:, 1]/4 - projected[:, 2], -1, atol=1e-6)
+
+    def test_thin_triangle_preserves_pixel_ray_with_float32_inputs(self):
+        screen = np.array([[0., 0.], [1000., 1000.], [2000., 2000.1]], dtype=np.float32)
+        depths = np.array([1., 2., 4.], dtype=np.float32)
+        world = np.column_stack((screen / 1000 * depths[:, None], depths))
+        target = np.array([[1300., 1300.05]], dtype=np.float32)
+        triangles = np.array([[0, 1, 2]])
+        for device in ('numpy', 'cpu', 'cuda'):
+            if device == 'cuda' and not torch.cuda.is_available():
+                continue
+            with self.subTest(device=device):
+                if device == 'numpy':
+                    points, _ = Get_3D_Sampled_Points(target, np.array([0]),
+                        SimpleNamespace(simplices=triangles), screen, world, world,
+                        camera_depths=depths)
+                else:
+                    t = lambda value: torch.as_tensor(value, device=device)
+                    points, _ = Get_3D_Sampled_Points_GPU(t(target), t(np.array([0])),
+                        t(triangles), t(screen), t(world), t(world), camera_depths=t(depths))
+                    self.assertEqual(points.dtype, torch.float32)
+                    points = points.cpu().numpy()
+                pixels = points[:, :2] / points[:, 2:] * 1000
+                np.testing.assert_allclose(pixels, target, atol=.005, rtol=0)

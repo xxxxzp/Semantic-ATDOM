@@ -114,3 +114,15 @@ Canonical experiment bundle:
 `/data3/xzp/experiments/Onthefly/XinCao/semantic-hardening-20261020`.
 These short runs establish lifecycle, coordinate, binding and publication
 behavior; they do not replace a complete 229-camera quality experiment.
+
+## Complete 229-camera experiment
+
+The full original-XinCao run at commit `e2c5301` completed all 45,800
+optimizer iterations, exact final semantics, and the 120-frame video. The
+[full comparison](../exp/semantic-hardening-full-2026-10-20.md) records nearly
+unchanged training-view RGB quality and 97.17% semantic agreement on jointly
+known map pixels. This run was slower in online end-to-end processing and
+final semantic projection. An additional cross-check also confirmed a
+pre-existing mismatch between the declared grid column axis and actual
+rendered projection in both old and new maps; this metadata issue remains
+unrepaired. The original data, prior results, and main checkout stayed intact.

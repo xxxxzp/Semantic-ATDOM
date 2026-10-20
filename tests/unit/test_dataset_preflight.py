@@ -4,6 +4,7 @@ import hashlib
 import json
 import struct
 import unittest
+from unittest import mock
 
 import numpy as np
 from PIL import Image
@@ -114,6 +115,37 @@ class DatasetPreflightTests(unittest.TestCase):
             self.assertTrue(result.authoritative_exact_complete)
             self.assertEqual(report["class_pixel_counts"], [0, 8])
             self.assertEqual(sha256_file(result.report_path), result.report_sha256)
+
+    def test_training_resume_preserves_preflight_identity_for_unchanged_inputs(self):
+        from tools.train_progressive import GetArgs, TrainingPreparation
+
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            dataset, semantic_data = self._fixture(root)
+            checkpoint = root / "2" / "chkpnt2.pth"
+            checkpoint.parent.mkdir()
+            checkpoint.write_bytes(b"only preparation is exercised")
+            hashes = []
+            for resume in (False, True):
+                argv = [
+                    "train_progressive.py", "--Source_Path_Dir", str(dataset),
+                    "--semantic_data_root", str(semantic_data),
+                    "--Model_Path_Dir", str(root / ("resume" if resume else "fresh")),
+                    "--StartFromImageNo", "1", "--EndAtImageNo", "2",
+                    "--enable_semantics", "--resolution", "1612",
+                ]
+                if resume:
+                    argv += ["--start_checkpoint", str(checkpoint)]
+                with mock.patch("sys.argv", argv), mock.patch(
+                    "tools.train_progressive.safe_state"
+                ):
+                    args, _, _, _ = GetArgs()
+                    prepared = TrainingPreparation(args)
+                hashes.append(args.dataset_preflight_sha256)
+                for stream in prepared[1:4]:
+                    if stream is not None:
+                        stream.close()
+            self.assertEqual(hashes[0], hashes[1])
 
     def test_preflight_requires_explicit_semantic_root_and_external_output(self):
         with TemporaryDirectory() as directory:

@@ -16,7 +16,7 @@ import cv2
 import numpy as np
 import torch
 
-from semantic_atdom.utils.camera_calibration import rectify_array
+from semantic_atdom.semantics.label_grid import labels_on_camera_grid
 
 
 @dataclass(frozen=True)
@@ -250,28 +250,7 @@ def _unproject_pixels_to_plane(
 
 def _rectified_labels(dataset, camera, image_id: str) -> np.ndarray:
     observation = dataset.load_observation(image_id)
-    labels = observation.labels
-    calibration = getattr(camera, "calibration", None)
-    if calibration is not None and calibration.requires_rectification:
-        labels = rectify_array(
-            labels,
-            calibration,
-            interpolation="nearest",
-            border_value=dataset.class_spec.ignore_id,
-        )
-    expected = (int(camera.image_height), int(camera.image_width))
-    if tuple(labels.shape) != expected:
-        raise ValueError(
-            "planar fallback label {} has shape {}, expected {}".format(
-                image_id, labels.shape, expected
-            )
-        )
-    labels = labels.copy()
-    tri_mask = getattr(camera, "Tri_Mask", None)
-    if tri_mask is not None and tuple(tri_mask.shape[-2:]) == expected:
-        valid = tri_mask.detach().cpu().numpy().astype(bool).reshape(expected)
-        labels[~valid] = dataset.class_spec.ignore_id
-    return labels
+    return labels_on_camera_grid(observation.labels, camera, dataset.class_spec.ignore_id)
 
 
 def apply_planar_multiview_fallback(

@@ -162,8 +162,11 @@ class ProgressiveEmptyStageTests(unittest.TestCase):
             ),
         ]
         new_cameras = [
-            SimpleNamespace(image_name=name, LogMask=np.ones((2, 2), dtype=bool))
-            for name in ("a", "b")
+            SimpleNamespace(
+                image_name=name, LogMask=np.ones((2, 2), dtype=bool),
+                calibration=SimpleNamespace(width=width, height=height),
+            )
+            for name, width, height in (("a", 19, 15), ("b", 21, 17))
         ]
         with tempfile.TemporaryDirectory() as root, mock.patch.multiple(
             dataset_readers,
@@ -223,6 +226,11 @@ class ProgressiveEmptyStageTests(unittest.TestCase):
                 get_ply=False,
                 Diary=io.StringIO(),
                 Silence=True,
+            )
+
+            self.assertEqual(
+                [call.args[2:4] for call in patched["PointsFilter"].call_args_list],
+                [(15, 19), (17, 21)],
             )
 
         np.testing.assert_array_equal(

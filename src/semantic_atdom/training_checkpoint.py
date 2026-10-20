@@ -14,6 +14,7 @@ from semantic_atdom.scene.cameras import Camera
 from semantic_atdom.scene.dataset_readers import load_rectified_image
 from semantic_atdom.utils.camera_calibration import RectifiedPinhole
 from semantic_atdom.utils.general_utils import PILtoTorch
+from semantic_atdom.utils.pixel_grid import PIXEL_GRID_VERSION, camera_resolution
 
 
 CHECKPOINT_SCHEMA_VERSION = 2
@@ -75,6 +76,7 @@ def camera_to_state(camera):
     if not image_path:
         raise ValueError("camera {} has no source image path".format(camera.image_name))
     return {
+        "pixel_grid_version": PIXEL_GRID_VERSION,
         "uid": int(camera.uid),
         "colmap_id": int(camera.colmap_id),
         "R": np.asarray(camera.R),
@@ -92,7 +94,9 @@ def camera_to_state(camera):
     }
 
 
-def camera_from_state(state, *, data_device):
+def camera_from_state(state, *, data_device, expected_resolution=None):
+    if state.get("pixel_grid_version") != PIXEL_GRID_VERSION:
+        raise ValueError("checkpoint camera pixel mapping changed; restart training")
     calibration_payload = state.get("calibration")
     calibration = (
         RectifiedPinhole.from_dict(calibration_payload)
@@ -106,6 +110,10 @@ def camera_from_state(state, *, data_device):
     else:
         image = load_rectified_image(state["image_path"], calibration)
     resolution = (int(state["image_width"]), int(state["image_height"]))
+    if expected_resolution is not None:
+        expected = camera_resolution(*image.size, expected_resolution)
+        if resolution != expected:
+            raise ValueError("checkpoint camera resolution does not match this run")
     resized = PILtoTorch(image, resolution)
     return Camera(
         colmap_id=int(state["colmap_id"]),

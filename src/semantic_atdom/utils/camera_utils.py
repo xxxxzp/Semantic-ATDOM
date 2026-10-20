@@ -12,47 +12,35 @@
 from semantic_atdom.scene.cameras import Camera
 import numpy as np
 import torch
-import torch.nn.functional as F
 from semantic_atdom.utils.general_utils import PILtoTorch
 from semantic_atdom.utils.graphics_utils import fov2focal
+from semantic_atdom.utils.pixel_grid import camera_resolution, nearest_indices
 
 WARNED = False
 
 
 def resize_camera_mask(mask, resolution):
-    if mask is None or getattr(mask, "shape", (0,))[0] == 2:
+    if mask is None or tuple(mask.shape) == (2,):
         return mask
     value = mask if isinstance(mask, torch.Tensor) else torch.from_numpy(np.asarray(mask))
     if value.ndim == 2:
         value = value.unsqueeze(0)
-    target = (int(resolution[1]), int(resolution[0]))
-    if tuple(value.shape[-2:]) != target:
-        value = F.interpolate(
-            value.unsqueeze(0).float(), size=target, mode="nearest"
-        ).squeeze(0).bool()
-    return value
+    if value.ndim != 3 or value.shape[0] != 1:
+        raise ValueError("camera mask must have shape [H, W] or [1, H, W]")
+    width, height = map(int, resolution)
+    rows = torch.from_numpy(nearest_indices(value.shape[-2], height)).to(value.device)
+    columns = torch.from_numpy(nearest_indices(value.shape[-1], width)).to(value.device)
+    return value.index_select(-2, rows).index_select(-1, columns).bool()
 
 def loadCam(args, id, cam_info, resolution_scale):
     orig_w, orig_h = cam_info.image.size
 
-    if args.resolution in [1, 2, 4, 8]:
-        resolution = round(orig_w/(resolution_scale * args.resolution)), round(orig_h/(resolution_scale * args.resolution))
-    else:  # should be a type that converts to float
-        if args.resolution == -1:
-            if orig_w > 1600:
-                global WARNED
-                if not WARNED:
-                    print("[ INFO ] Encountered quite large input images (>1.6K pixels width), rescaling to 1.6K.\n "
-                        "If this is not desired, please explicitly specify '--resolution/-r' as 1")
-                    WARNED = True
-                global_down = orig_w / 1600
-            else:
-                global_down = 1
-        else:
-            global_down = orig_w / args.resolution
-
-        scale = float(global_down) * float(resolution_scale)
-        resolution = (int(orig_w / scale), int(orig_h / scale))
+    resolution = camera_resolution(orig_w, orig_h, args.resolution, resolution_scale)
+    if args.resolution == -1 and orig_w > 1600:
+        global WARNED
+        if not WARNED:
+            print("[ INFO ] Large input images are rescaled to 1.6K; use --resolution 1 to retain their size")
+            WARNED = True
 
     resized_image_rgb = PILtoTorch(cam_info.image, resolution)
 

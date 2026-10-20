@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 from tools.train_progressive import (
     DataSaver,
+    GaussianTrainer,
     StageTrainingInputCache,
     TrainingProgressReporter,
     release_camera_sampling_buffers,
@@ -51,6 +52,23 @@ class _RecordingProgressBar:
 
 
 class TrainingHotPathTests(unittest.TestCase):
+    def test_skip_final_evaluation_records_iteration_without_calling_metrics(self):
+        with TemporaryDirectory() as directory:
+            trainer = SimpleNamespace(
+                Finish=True,
+                args=SimpleNamespace(skip_final_evaluation=True, metrics_dir=directory),
+                AlreadyTrainingIterations=110,
+                gaussians=SimpleNamespace(get_xyz=SimpleNamespace(shape=(18579, 3))),
+            )
+            # No EvaluateModel or CUDA context: any metric call must fail.
+            GaussianTrainer.Evaluate(trainer, "Final_Refinement", True)
+            record = json.loads((Path(directory) / "final_evaluation.json").read_text())
+            self.assertEqual(record["status"], "skipped")
+            self.assertEqual(record["iteration"], 110)
+            self.assertEqual(record["gaussians"], 18579)
+            self.assertFalse(record["complete_metrics"])
+            self.assertNotIn("lpips", record)
+
     def test_stage_cache_transfers_new_inputs_once_but_does_not_retain_global_views(self):
         new_image = _RecordingImage("new")
         global_image = _RecordingImage("global")

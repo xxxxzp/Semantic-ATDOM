@@ -78,3 +78,39 @@ original XinCao camera poses, the corrected float32 world-point reprojection
 has maximum error **0.000876 source pixels**, and float64 maximum error is
 below `7e-10` pixels. The oracle independently projects co-visible SfM vertices;
 it verifies the sampling constraint, not bundle-adjustment or semantic accuracy.
+
+## Final acceptance
+
+- Final complete suite: **274 tests and 11 subtests passed**, with the existing
+  three dependency warnings. Command/log: `final-all-tests-command.json` and
+  `final-all-tests.log` in the validation directory above.
+- After the thin-triangle correction, a fresh original-data `--resolution 4`
+  run (`verified-original-r4`) again completed stages 30–32 and 50 optimizer
+  iterations. It published 21,137 Gaussians, an `exact_final` result over all
+  32 cumulative cameras, a 512×512 paired map, and four H.264 frames at
+  2366×1080. It completed in 241.20 seconds; protected hashes matched.
+- A stage-31 checkpoint was captured into the isolated validation directory.
+  `resumed-original-r4` restored it, trained stage 32, rebuilt final semantics,
+  and published its final map and three-frame H.264 video. The preflight hash
+  matched the fresh run, and protected hashes matched again.
+- The resumed and continuous runs have the same Gaussian count, group counts,
+  and **100% Gaussian hard-class agreement**. Floating geometry and evidence
+  are not bit-identical: maximum absolute XYZ difference is 0.003788 world
+  units; maximum raw/robust evidence difference is 0.198377. No bit-identical
+  recovery trajectory or attribution of those differences is claimed.
+- The production standalone `tools/render.py` rendered all **24 cameras in
+  the actual local stage-32 COLMAP snapshot** against read-only originals.
+  This inventory differs from the progressive run's 32 cumulative cameras.
+  Source hashes matched and no source PLY was created.
+- Artifact verification reloads schema-5 semantic state through its public
+  loader, validates its geometry/context hashes, checks the archived schema
+  against final input binding, verifies the final map pointer and categorical
+  IDs, and compares video frame counts/dimensions with `ffprobe`. Both fresh
+  and resumed artifact sets passed. See `artifact-verification.json`.
+- A final partial-mode regression also checks that an admitted later view is
+  removed from the deferred inventory after successful exact partial rebuild.
+
+Canonical experiment bundle:
+`/data3/xzp/experiments/Onthefly/XinCao/semantic-hardening-20261020`.
+These short runs establish lifecycle, coordinate, binding and publication
+behavior; they do not replace a complete 229-camera quality experiment.

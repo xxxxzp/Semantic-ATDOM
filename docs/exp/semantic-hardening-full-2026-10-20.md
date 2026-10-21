@@ -125,3 +125,15 @@
 实验目录中的 `run_full.py` 是实际全程执行器；`verify_protocol.py` 核验数据和训练参数；`evaluate_rgb.py`、`run_rgb_eval.py` 在相同 GPU 和相机清单上评价两模型；`compare_maps.py` 执行世界坐标对齐；`verify_full.py` 验收最终状态与产品；`summarize_comparison.py` 汇总 JSON/CSV/PNG/PDF，`write_report.py` 生成本报告。
 
 `comparison-selftest.json` 保存比较器的恒等/已知平移/离散标签/混淆矩阵自检。分析脚本与命令均保存在独立实验目录，不修改训练实现、原始数据、共享环境或旧结果。
+
+## 2026-10-21：性能重放补充
+
+对相同原始标签、相同相机/标定/掩膜和同一物理 GPU 4，分别载入旧、新最终 Gaussian 模型，选取影像 000001、000115、000229；排除首次初始化，交替顺序各重复两次。该诊断不修改原始数据、已有训练结果、Conda 或 CUDA 扩展。
+
+- 旧模型投影中位数 1.530201 秒，新模型 1.550867 秒，新/旧约 1.0135；这个三视图重放未复现完整实验约两倍的差距，不足以证明任何全局稳定的速度结论。
+- CPU 原始分辨率边界权重计算中位数约 1.380 / 1.388 秒，约占投影总时间 90%；CUDA wrapper/kernel 约 0.0143 / 0.0140 秒。该 CPU 处理存在重复计算，属于后续优化目标，但其函数本体在新旧版本之间没有改变。
+- 增量端到端总时间增加 402.015 秒，其中等待语义结果增加 392.844 秒，约占新增耗时 97.7%。视频帧入队耗时两次均约 0.004 秒，不能将变慢直接归咎于新增的有界视频队列。
+- 这缩小了耗时范围，尚未确定完整运行中投影慢约两倍的触发条件；三视图重放不能排除其余视图、worker 调度、资源负载或其他调用上下文的作用。新增严格校验会产生开销，但不能独自解释投影计时内的全部增加。
+- 本次未启用平面语义回填（`semantic_tdom_planar_fallback_class` 为空），因此平面回填筛选一致性修复不能解释本次画质变化。
+
+结构化数据与执行脚本：[projection-replay.json](/data3/xzp/experiments/Onthefly/XinCao/semantic-hardening-full-20261020/validation/projection-replay.json)、[replay_projection.py](/data3/xzp/experiments/Onthefly/XinCao/semantic-hardening-full-20261020/validation/replay_projection.py)。这是归因诊断，未修改生产代码，也未将性能问题标记为已解决。

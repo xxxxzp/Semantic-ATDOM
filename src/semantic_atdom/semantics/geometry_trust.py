@@ -43,5 +43,3 @@ def trusted_geometry_mask(
         "trusted_gaussian_count": trusted_count,
         "excluded_gaussian_count": input_count - trusted_count,
     }
-
-

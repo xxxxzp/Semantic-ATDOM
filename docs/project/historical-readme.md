@@ -1,0 +1,588 @@
+# 历史 README 归档
+
+归档自 2026-10-21、提交 `c512355` 的 README，保留上游 Windows GUI、On-the-Fly SfM 配置与引用信息。
+其中的环境、命令和状态说明具有历史性；当前 Linux 语义流程请以[主 README](../../README.md)为准。
+
+---
+
+# A-TDOM: Active TDOM via On-the-Fly 3DGS
+Yiwei Xu, Xiang Wang, Yifei Yu, Wentian Gan, Luca Morelli, Giulio Perda, Xin Wang*, Zongqian Zhan, and Fabio Remondino
+
+[![arxiv](https://img.shields.io/badge/arxiv-2406.15643-red)](https://arxiv.org/abs/2509.12759)
+
+![image](../../assets/docs/overview.png)
+
+## Current Semantic A-TDOM status
+
+This checkout develops Semantic A-TDOM on `semantic/g1-evidence-v2`. The current
+validated environment is the Linux `semantic-atdom` environment; the Windows
+GUI/SfM instructions below describe the upstream workflow and do not establish
+validation of the current semantic pipeline on Windows.
+
+Start with [current project context](../../docs/project/global-context.md) and the
+[data and experiment inventory, checked 2026-10-09](../../docs/project/current-data-experiment-status.md).
+Current deliveries contain 414 Phantom3 labels and 490 AMtown01 labels; the
+selected AMtown01 progressive run has 487 final cameras. A historical AMtown01
+run completed with a 160-frame video. These runs include dirty worktrees and
+are distinct from a full-run validation of the current commit.
+
+The [first-principles review](../../docs/problem/first-principles-code-review-2026-10-09.md)
+records open recovery, worker shutdown, geometry sampling and product-contract
+issues despite 245 passing tests. Use the current Linux entry point
+`tools/train_progressive.py`, an explicit semantic delivery root, and
+`--resolution 1`, `2`, `4`, or `8` for semantic training. These values divide
+the original RGB width and height; source images, SfM and labels remain unchanged.
+See [the coordinate contract and XinCao validation](../../docs/fix/2026-10-semantic-resolution-248.md).
+An explicit target width greater than 8 is also supported: `--resolution 1612`
+maps 4032×3024 source images to 1612×1209 while retaining the original camera
+calibration and using nearest sampling for semantic IDs and masks.
+Historical commands and results retain
+their original scope; see the linked documents for current defaults and limits.
+
+For training and visualization without final image quality scoring, pass
+`--skip_final_evaluation`. This skips final PSNR/SSIM/VGG-LPIPS evaluation while
+retaining the trained model, semantic rebuild, maps, and progress video. The
+run records evaluation as `skipped`, without fabricated metric values. Use
+`--render_training_progress --render_TDOM --enable_semantics` to produce the
+paired RGB/Semantic TDOM video. Camera exports via `--render_all_cameras`
+currently require final evaluation and cannot be combined with this option.
+
+# Important Notice (Please Read before Start!!!)
+
+The Python environment configuration differs significantly between **Windows** and **Linux** in this project,
+and the supported functionalities also vary across the two platforms.
+
+If you intend to run the project on **Windows** and execute it concurrently with **On-the-Fly SfM**,
+thereby enabling true *simultaneous camera pose acquisition, 3DGS training, and TDOM generation*,
+please refer to [Windows Env Setting](#windows-env-setting) and [Windows Run](#windows-run).
+
+If you intend to run the project on **Linux** and only perform `Simulation Experiments`,
+please refer to [Linux Env Setting](#linux-env-setting) and [Linux Run](#linux-run).
+
+We also provide a **video demonstrating how to use On-the-Fly SfM and A-TDOM**, you can download it from
+[here](https://drive.google.com/drive/folders/1h322jgzVjQypALrArmYabavg2_NjR3Wl?hl=zh-cn).
+
+# Cloning the Repository
+
+```shell
+# SSH
+git clone git@github.com:xxxxzp/Semantic-ATDOM.git
+```
+or
+```shell
+# HTTPS
+git clone https://github.com/xxxxzp/Semantic-ATDOM.git
+```
+
+The required CUDA dependencies are preserved as offline archives in
+`third_party/archives/` and as clean build sources in `third_party/src/`.
+The original A-TDOM repository is the upstream reference; select
+`semantic/g1-evidence-v2` for the active semantic development line.
+
+Both environment setup flows below install the project in editable mode. This
+step is required before running any command under `tools/`.
+
+## Command layout
+
+Project entry points live under `tools/`. The directory migration renamed the
+original scripts as follows:
+
+| Original name | Current path |
+|---|---|
+| `ContinuosProgressiveTrain4.py` | `tools/train_progressive.py` |
+| `WindowsTrain.py` | `tools/train_windowed.py` |
+| `Window-On-the-Fly-Train.py` | `tools/train_gui.py` |
+| `render.py` | `tools/render.py` |
+| `convert.py` | `tools/convert_colmap.py` |
+| `metrics.py` | `tools/evaluate_metrics.py` |
+| `DatasetPrepare.py` | `tools/legacy/prepare_dataset.py` |
+| `DownSample.py` | `tools/legacy/downsample_images.py` |
+| `GetDemo.py` | `tools/legacy/create_demo_video.py` |
+| `Test.py` | `tools/legacy/export_colmap_stages.py` |
+| `full_eval.py` | `tools/legacy/full_eval.py` |
+
+The scripts under `tools/legacy/` are retained for traceability and are not
+supported command interfaces.
+
+## Semantic A-TDOM documentation
+
+- [How semantic evidence is assigned to Gaussians and why](../../docs/design/semantic-evidence-assignment-rationale.md)
+- [G1 V1, V1.1, and V2 design comparison](../../docs/design/g1-v1-v2-comparison.md)
+- [Authoritative Semantic TDOM V1 / G1 Evidence V2 contract](../../docs/design/semantic-tdom-v1.md)
+- [Current project context](../../docs/project/global-context.md)
+- [Current data and experiment status](../../docs/project/current-data-experiment-status.md)
+- [Historical 399-camera Phantom3 V2 experiment](../../docs/project/phantom3-semantic-atom-v2-result.md)
+- [Open first-principles review findings](../../docs/problem/first-principles-code-review-2026-10-09.md)
+- [Bounded planar semantic fallback decision](../../docs/decisions/0010-bounded-planar-semantic-fallback.md)
+
+# Windows Env Setting
+
+If you are configuring the Python environment for **A-TDOM** on **Windows**,
+please **do not use** `environment.yml`. Instead, set up the environment using the following commands:
+
+```shell
+conda create -n ATDOM python=3.9.0
+conda activate ATDOM
+conda install cudatoolkit=11.6 -c conda-forge
+conda install pytorch=1.12.1 torchvision=0.13.1 torchaudio=0.12.1 -c pytorch
+
+pip install plyfile
+pip install tqdm
+pip install opencv-python
+pip install lpips
+pip install scikit-image
+
+pip install third_party/src/diff-gaussian-rasterization
+pip install third_party/src/simple-knn
+pip install third_party/src/fused-ssim
+python -m pip install --no-deps -e .
+```
+
+Since **PyTorch3D** does not provide precompiled binaries for **Windows**, you need to manually download and build it from source.
+Please refer to the official repository: [PyTorch3D GitHub](https://github.com/facebookresearch/pytorch3d).
+When compiling **PyTorch3D**, please pay close attention to the compatibility between
+**CUB**, **PyTorch3D**, and the version of **Visual Studio**. In this project, we use **PyTorch3D v0.7.1** together with **CUB v1.15.0**,
+and **Visual Studio 2019 or 2022** is recommended.
+
+Please ensure that all prerequisites required to build **PyTorch3D** are properly installed,
+including compatible versions of **CUB** and **Visual Studio**,
+and that you have downloaded the correct version of the **PyTorch3D** source code.
+
+Then, open either `x64 Native Tools Command Prompt for VS 2019` or `x64 Native Tools Command Prompt for VS 2022`,
+and run the following commands:
+
+```shell
+conda activate ATDOM
+cd ...\pytorch3d-0.7.1
+python setup.py install
+```
+
+# Windows Run
+
+When running on **Windows**, we provide visualization support for **TDOM generation**,
+allowing the results of **orthographic splatting** from the current 3DGS field to be displayed during 3DGS progressive training.
+In addition, **A-TDOM** can be executed concurrently with **On-the-Fly SfM**
+to achieve true *simultaneous camera pose acquisition, 3DGS training, and TDOM generation*.
+Alternatively, **A-TDOM** can also be run after **On-the-Fly SfM** has finished
+exporting all intermediate results, enabling **simulation experiments**.
+
+In this project, we provide executable versions of **On-the-Fly SfM**,
+which can be download here from [Google Drive](https://drive.google.com/drive/folders/1h322jgzVjQypALrArmYabavg2_NjR3Wl?hl=zh-cn)
+or [BaiDuCloud, Extract Code=w7m3](https://pan.baidu.com/s/1JOxjhIUvbfwyK1XFUTR0vw?pwd=w7m3)
+If you would like to learn how to export the intermediate results, please refer to [Data Preparation](#data-preparation).
+
+## Before Run A-TDOM Concurrently With On-the-Fly SfM
+
+If you would like to run **A-TDOM** concurrently with **On-the-Fly SfM**,
+you need to start **On-the-Fly SfM** first (please refer to [Data Preparation](#data-preparation) for usage details),
+and then launch **A-TDOM**. If all image data are captured and stored in `Image_Folder_Path` and
+**On-the-Fly SfM** saves all SfM results in `Source_Path_Dir`, your directory structure should be organized as follows:
+
+*****************************************
+
+.../Image_Folder_Path\
+=> NULL (Waiting for new images)
+
+.../Source_Path_Dir\
+=> GaussianSplatting\
+==> NULL (Waiting for SfM results from On-the Fly SfM)
+...
+
+*****************************************
+
+## Before Simulation Experiments On Windows
+
+`Simulation Experiments` require running **On-the-Fly SfM** in advance to generate and export the intermediate results.
+If the intermediate results generated by **On-the-Fly SfM** are stored in `Source_Path_Dir`,
+and the image data are stored in `Image_Folder_Path`,
+your directory structure should be organized as follows:
+
+*****************************************
+
+.../Image_Folder_Path\
+=> 0001.jpg, 0002.jpg, 0003.jpg, ...
+
+.../Source_Path_Dir\
+=> GaussianSplatting\
+==> 3\
+===> bin, ...\
+==> 4\
+===> bin, ...\
+...
+
+*****************************************
+
+## 3DGS Training and TDOM Generation On Windows
+
+If you would like to output the results of **3DGS training** to `Model_Path_Dir`,
+please run the following command to perform 3DGS training:
+
+```shell
+python tools/train_gui.py
+  --Source_Path_Dir .../your_path
+  --Model_Path_Dir .../your_path
+  --Image_Folder_Path .../your_path
+  --OriginImageHeight [int]
+  --OriginImageWidth [int]
+  --points_per_triangle [int]
+  --LogMaskThreshold [float]
+  --Use_Tri_Mask
+```
+
+If you would like to generate **TDOM** simultaneously during training,
+please run the following command:
+
+```shell
+python tools/train_gui.py
+  --Source_Path_Dir .../your_path
+  --Model_Path_Dir .../your_path
+  --Image_Folder_Path .../your_path
+  --OriginImageHeight [int]
+  --OriginImageWidth [int]
+  --points_per_triangle [int]
+  --LogMaskThreshold [float]
+  --show_TDOM
+  --Use_Tri_Mask
+  --render_TDOM
+  --GSD_x [float]
+  --GSD_y [float]
+```
+
+For the current Linux semantic entry point `tools/train_progressive.py`, pass
+`--enable_semantics --semantic_data_root /path/to/delivery --resolution 1`.
+The delivery root must contain `semantic/class_spec.json`, `semantic/labels/`,
+and `semantic/metadata/`. With `--run_name`, published output is allocated under
+`<output_root>/runs/<run_id>/`. Progressive caches live in `<run>/.work/cache/`
+and the retained preflight report in `<run>/provenance/dataset_preflight.json`.
+This contract does not imply that the historical GUI entry point supports the
+same flags. The standalone render reader still has a source-write issue (R03).
+
+Semantic training now updates the semantic field progressively and reuses it
+for the final map by default (`approx_final`). `--semantic_final_rebuild`
+explicitly enables full final-geometry reprojection and two-pass fusion
+(`exact_final` for a complete authoritative input). The semantic field is not
+a loss term for RGB geometry training. `--semantic_tdom_final_only` controls map
+publication, independently of online fusion.
+
+Default map rasters are `rgb/tdom.png` and `semantic/semantic_color.png`;
+small manifests, class definitions and the render palette accompany them.
+Optional rasters can be selected with `--semantic_tdom_save_class_ids`,
+`--semantic_tdom_save_masks`, `--semantic_tdom_save_evidence`, and
+`--semantic_tdom_save_entropy`. `--semantic_tdom_save_diagnostics` enables the
+full auxiliary set, and `--semantic_tdom_save_probabilities` enables the
+probability cube. Class IDs always remain categorical. See
+[ADR 0012](../../docs/decisions/0012-minimal-map-products-and-online-finalization.md)
+for policy, validation and compatibility details.
+
+<details>
+<summary><span style="font-weight: bold;">Necessary command Line Arguments for tools/train_gui.py</span></summary>
+
+  #### --Source_Path_Dir {str}
+  Path to the source directory containing all camera pose information and sparse point cloud.
+  #### --Model_Path_Dir {str}
+  Path where the trained model should be stored.
+  #### --Image_Folder_Path {str}
+  Path to directory containing all image data.
+  #### --IterationFirstScene {int}
+  Training iterations for initial training phase.
+  #### --FinalOptimizationIterations {int}
+  Training iterations for final refinement phase.
+  #### --StartFromImageNo {int}
+  It indicates from which image the progressive training begins. This image and all the images before it are used for scene initialization.
+  #### --OriginImageHeight {int}
+  The original image height input into On-Fly SfM.
+  #### --OriginImageWidth {int}
+  The original image width input into On-Fly SfM.
+  #### --points_per_triangle {int}
+  The number of points collected in each triangle when conducting point sampling based on the Delunay triangulation.
+  #### --LogMaskThreshHold {float}
+  Gradient difference threshold used to determine whether new Gaussians should be added. A larger value results in fewer Gaussians being added, while a smaller value leads to more.
+  #### --show_TDOM
+  When enabled, the generated **TDOM** is continuously visualized during progressive 3DGS training.
+  #### --Use_Tri_Mask
+  When enabled, use the mask generated from Delaunay Triangulation for 3DGS training.
+  #### --NoDebug
+  When enabled, rendering quality evaluation is disabled during progressive 3DGS training.
+  #### --render_RGB
+  When enabled, the newly added image is rendered after completing the training stage for each new image.
+  #### --render_TDOM
+  When enabled, orthogonal splatting is performed on the current 3DGS field after each training stage, and a TDOM is generated.
+  #### --GetDemo
+  When enabled, a demo is generated based on the rendered results during training. This option must be used together with `--render_RGB` or `--render_TDOM`.
+  #### --GSD_x {float}
+  GSD of the generated TDOM along the Y-axis. If set to `0`, the GSD will be automatically determined.
+  #### --GSD_y {float}
+  GSD of the generated TDOM along the Y-axis. If set to `0`, the GSD will be automatically determined.
+
+</details>
+
+## Example
+
+We use the **phantom3-ieu** dataset
+(you can download it [here](https://www.adv-ci.com/blog/source/npu-drone-map-dataset/))
+as an example. The following command demonstrates how to perform 3DGS training with simultaneous TDOM generation:
+
+```shell
+python tools/train_gui.py
+  --Source_Path_Dir .../phantom3-ieu
+  --Model_Path_Dir .../phantom3-ieu
+  --Image_Folder_Path .../images
+  --OriginImageHeight 1049
+  --OriginImageWidth 1870
+  --points_per_triangle 30
+  --LogMaskThreshold 0.15
+  --show_TDOM
+  --Use_Tri_Mask
+  --render_TDOM
+  --GSD_x 0.00
+  --GSD_y 0.00
+```
+
+Due to the absence of GCPs, **On-the-Fly SfM** performs camera pose estimation
+and sparse point cloud reconstruction in a relative coordinate system.
+As a result, the scale of the coordinate system may vary across different runs of **3DGS training** and **TDOM generation**.
+
+Therefore, we temporarily set `--GSD_x` and `--GSD_y` to `0`,
+allowing the system to automatically determine the appropriate GSD
+for each rendering based on the current scene scale.
+
+# Linux Env Setting
+
+If you are configuring **Semantic A-TDOM** on Linux, create the pinned
+environment and build every local CUDA extension from this checkout:
+
+```shell
+cd .../Semantic-A-TDOM
+conda env create --file environment.yml
+conda activate semantic-atdom
+CUDA_HOME="$CONDA_PREFIX" TORCH_CUDA_ARCH_LIST=8.9 \
+  python -m pip install --no-build-isolation --no-deps \
+  third_party/src/diff-gaussian-rasterization
+CUDA_HOME="$CONDA_PREFIX" TORCH_CUDA_ARCH_LIST=8.9 \
+  python -m pip install --no-build-isolation --no-deps \
+  third_party/src/simple-knn
+CUDA_HOME="$CONDA_PREFIX" TORCH_CUDA_ARCH_LIST=8.9 \
+  python -m pip install --no-build-isolation --no-deps \
+  third_party/src/fused-ssim
+python -m pip install --no-deps -e .
+```
+
+The editable install is required before running commands under `tools/`.
+`TORCH_CUDA_ARCH_LIST=8.9` is the pinned build target for the current RTX 4090
+development machine; change it only when intentionally targeting another GPU.
+
+# Linux Run
+
+The current Linux progressive pipeline consumes exported stage snapshots; it
+does not estimate camera poses internally. The On-the-Fly SfM workflow below
+describes the historical Windows export route. Existing datasets can provide
+compatible `GaussianSplatting/<stage>/bin` or `<stage>/sparse/0` snapshots,
+including the current Phantom3 and UAVScenes deliveries.
+
+In this project, we provide executable versions of **On-the-Fly SfM**,
+which can be download here from [Google Drive](https://drive.google.com/drive/folders/1h322jgzVjQypALrArmYabavg2_NjR3Wl?hl=zh-cn)
+or [BaiDuCloud, Extract Code=w7m3](https://pan.baidu.com/s/1JOxjhIUvbfwyK1XFUTR0vw?pwd=w7m3)
+If you would like to learn how to export the intermediate results, please refer to [Data Preparation](#data-preparation).
+
+## Before Run On Linux
+
+If the intermediate results generated by **On-the-Fly SfM** are stored in `Source_Path_Dir`,
+and the image data are stored in `Image_Folder_Path`,
+your directory structure should be organized as follows:
+
+*****************************************
+
+.../Image_Folder_Path\
+=> 0001.jpg, 0002.jpg, 0003.jpg, ...
+
+.../Source_Path_Dir\
+=> GaussianSplatting\
+==> 3\
+===> bin, ...\
+==> 4\
+===> bin, ...\
+...
+
+*****************************************
+
+## 3DGS Training and TDOM Generation On Linux
+
+If you would like to output the results of **3DGS training** to `Model_Path_Dir`,
+please run the following command to perform 3DGS training:
+
+```shell
+python tools/train_progressive.py
+  --Source_Path_Dir .../your_path
+  --Model_Path_Dir .../your_path
+  --Image_Folder_Path .../your_path
+  --OriginImageHeight [int]
+  --OriginImageWidth [int]
+  --points_per_triangle [int]
+  --LogMaskThreshold [float]
+  --Use_Tri_Mask
+```
+
+If you would like to generate **TDOM** simultaneously during training,
+please run the following command:
+
+```shell
+python tools/train_progressive.py
+  --Source_Path_Dir .../your_path
+  --Model_Path_Dir .../your_path
+  --Image_Folder_Path .../your_path
+  --OriginImageHeight [int]
+  --OriginImageWidth [int]
+  --points_per_triangle [int]
+  --LogMaskThreshold [float]
+  --Use_Tri_Mask
+  --render_TDOM
+  --GSD_x [float]
+  --GSD_y [float]
+```
+
+<details>
+<summary><span style="font-weight: bold;">Necessary command Line Arguments for tools/train_progressive.py</span></summary>
+
+  #### --Source_Path_Dir {str}
+  Path to the source directory containing all camera pose information and sparse point cloud.
+  #### --Model_Path_Dir {str}
+  Path where the trained model should be stored.
+  #### --Image_Folder_Path {str}
+  Path to directory containing all image data.
+  #### --IterationFirstScene {int}
+  Training iterations for initial training phase.
+  #### --FinalOptimizationIterations {int}
+  Training iterations for final refinement phase.
+  #### --StartFromImageNo {int}
+  It indicates from which image the progressive training begins. This image and all the images before it are used for scene initialization.
+  #### --OriginImageHeight {int}
+  The original image height input into On-Fly SfM.
+  #### --OriginImageWidth {int}
+  The original image width input into On-Fly SfM.
+  #### --points_per_triangle {int}
+  The number of points collected in each triangle when conducting point sampling based on the Delunay triangulation.
+  #### --LogMaskThreshHold {float}
+  Gradient difference threshold used to determine whether new Gaussians should be added. A larger value results in fewer Gaussians being added, while a smaller value leads to more.
+  #### --NoDebug
+  When enabled, rendering quality evaluation is disabled during progressive 3DGS training.
+  #### --Use_Tri_Mask
+  When enabled, use the mask generated from Delaunay Triangulation for 3DGS training.
+  #### --render_RGB
+  When enabled, the newly added image is rendered after completing the training stage for each new image.
+  #### --render_TDOM
+  When enabled, orthogonal splatting is performed on the current 3DGS field after each training stage, and a TDOM is generated.
+  #### --GetDemo
+  When enabled, a demo is generated based on the rendered results during training. This option must be used together with `--render_RGB` or `--render_TDOM`.
+  #### --GSD_x {float}
+  GSD of the generated TDOM along the Y-axis. If set to `0`, the GSD will be automatically determined.
+  #### --GSD_y {float}
+  GSD of the generated TDOM along the Y-axis. If set to `0`, the GSD will be automatically determined.
+
+</details>
+
+## Example
+
+We use the **phantom3-ieu** dataset
+(you can download it [here](https://www.adv-ci.com/blog/source/npu-drone-map-dataset/))
+as an example. The following command demonstrates how to perform 3DGS training with simultaneous TDOM generation:
+
+```shell
+python tools/train_progressive.py
+  --Source_Path_Dir .../phantom3-ieu
+  --Model_Path_Dir .../phantom3-ieu
+  --Image_Folder_Path .../images
+  --OriginImageHeight 1049
+  --OriginImageWidth 1870
+  --points_per_triangle 30
+  --LogMaskThreshold 0.15
+  --Use_Tri_Mask
+  --render_TDOM
+  --GSD_x 0.00
+  --GSD_y 0.00
+```
+
+Due to the absence of GCPs, **On-the-Fly SfM** performs camera pose estimation
+and sparse point cloud reconstruction in a relative coordinate system.
+As a result, the scale of the coordinate system may vary across different runs of **3DGS training** and **TDOM generation**.
+
+Therefore, we temporarily set `--GSD_x` and `--GSD_y` to `0`,
+allowing the system to automatically determine the appropriate GSD
+for each rendering based on the current scene scale.
+
+# Data Preparation
+
+On-the-Fly SfM is a semi real-time Structure-from-Motion (SfM) system that currently supports **only Windows**.
+It can process data while images are being captured, as long as the acquired images can be transmitted to the computer in time.
+You can use the mobile image transmission app we provide for this purpose: https://sygant.github.io/onthefly/SfMClienten.html
+
+At the same time, On-the-Fly SfM also **supports processing previously collected datasets**.
+Both modes use exactly the same workflow within On-the-Fly SfM. You can download the On-the-Fly SfM here
+from [Google Drive](https://drive.google.com/drive/folders/1h322jgzVjQypALrArmYabavg2_NjR3Wl?hl=zh-cn)
+or [BaiDuCloud, Extract Code=w7m3](https://pan.baidu.com/s/1JOxjhIUvbfwyK1XFUTR0vw?pwd=w7m3)
+
+After extracting the downloaded archive, before run, **you have to open the config.ini and modify the PythonHome, PythonWorkspace, and GlobalFeatureModel paths (absolute path) to the corresponding locations on your computer**.
+
+All of these paths should point to other folders located in the **same directory as config.ini**, as shown below:
+
+```shell
+[Python]
+# Python 虚拟环境目录
+# Python virtual environment directory
+PythonHome = ...\On-the-FlyGS\Python
+
+# Python 脚本工作目录
+# Working directory for Python scripts
+PythonWorkspace = ...\On-the-FlyGS\pyscripts
+
+# 全局特征模型路径
+# Path to the global feature model
+GlobalFeatureModel = ...\On-the-FlyGS\pyscripts
+```
+
+Then, locate and run On-the-FlySfM.exe in the bin folder. After the interface opens,
+please wait until the following message appears in the Log panel at the bottom before proceeding with the subsequent operations:
+
+```shell
+Initializing PyTorch environment...
+Python environment initialize success!
+Python version: 3.10.10 (tags/v3.10.10:aad5f6a, Feb  7 2023, 17:20:36) [MSC v.1929 64 bit (AMD64)]
+The global extractor has been successfully loaded!
+The local extractor has been successfully loaded!
+The similar matcher has been successfully loaded!
+```
+
+Next, click **Project -> New Project** in the top-left corner.
+For Images, directly select the folder that contains the input images.
+For Database, choose a directory where you want to store the SfM output results.
+
+Note that the paths specified here must be **consistent** with the `--Image_Folder_Path` and `--Source_Path_Dir` parameters set in **Windows Run** or **Linux Run**. As shown below:
+
+```shell
+Database = ...\output\scene1                   # Same as --Source_Path_Dir
+Images = ...\dataset\scene1\images             # Same as --Image_Folder_Path
+
+--Source_Path_Dir ...\output\scene1            # Same as Database
+--Image_Folder_Path ...\dataset\scene1\images  # Same as Images
+```
+
+Now, please start On-the-Fly SfM. If you want to run A-TDOM Concurrently With On-the-Fly SfM, please proceed to [Before Run A-TDOM Concurrently With On-the-Fly SfM](#before-run-a-tdom-concurrently-with-on-the-fly-sfm) + [3DGS Training and TDOM Generation On Windows](#3dgs-training-and-tdom-generation-on-windows) to continue with the next steps.
+
+If you intend to conduct **simulation experiments**, please wait until On-the-Fly SfM has **completed full point cloud generation and camera pose estimation**, and proceed to [Before Simulation Experiments On Windows](#before-simulation-experiments-on-windows) + [3DGS Training and TDOM Generation On Windows](#3dgs-training-and-tdom-generation-on-windows) or [Before Run On Linux](#before-run-on-linux) + [3DGS Training and TDOM Generation On Linux](#3dgs-training-and-tdom-generation-on-linux) to continue with the next steps.
+
+When you need to close On-the-FlySfM.exe, it is recommended to use Taskmgr.exe to completely close it to prevent some threads from continuing to run in the background.
+
+# BibTex
+
+```shell
+@article{xu2026tdom,
+  title={A-TDOM: Active TDOM via on-the-fly 3DGS},
+  author={Xu, Yiwei and Wang, Xiang and Yu, Yifei and Gan, Wentian and Morelli, Luca and Perda, Giulio and Wang, Xin and Zhan, Zongqian and Remondino, Fabio},
+  journal={International Journal of Computer Vision},
+  volume={134},
+  number={8},
+  pages={370},
+  year={2026},
+  publisher={Springer}
+}
+
+```

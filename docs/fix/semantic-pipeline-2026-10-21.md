@@ -41,3 +41,30 @@ same data/grid. No extension or shared environment change was made.
 
 Full-run throughput, quality, capture latency and backpressure require the
 matched 229-camera experiment, rather than inference from zero foreground wait.
+
+## Complete-run rejection and correction
+
+The first complete pipeline run is retained at
+`/data3/xzp/experiments/Onthefly/XinCao/semantic-pipeline-exclusive-20261021`.
+It passed all input, state, map, camera, RGB screening and 120-frame video
+checks, but failed the performance screen: 5.034 seconds/new image versus
+4.543 in the accepted reference. Final semantics improved from 173.096 to
+84.492 seconds. Startup capture capacity waiting was 52.916 seconds; next-image
+feedback waiting increased from 0.313 to 1.163 seconds/new image. This version
+was not accepted as the completed optimization.
+
+The correction shares the trainer's existing FOV/calibration replacement
+predicate with the sparse metadata reader. The reader omits full source-grid
+mask construction/rectification only for retained cameras whose existing RGB
+and mask the trainer will keep. New/changed cameras and legacy callers retain
+their previous behavior. On real stage-180 input, 27 old cameras took 3.413
+seconds before and 0.002 seconds with the metadata-only path; poses and
+calibrations are identical. The initialization frame is also drained before
+opening the incremental stream, preserving the reference startup boundary.
+
+The sampling formula and optimizer are unchanged. Earlier input preparation
+can change which eligible training iteration supplies the existing adaptive
+`Render_New` preview, so final model identity is not guaranteed; matched full
+quality checks remain required. An independent OpenCV thread-budget probe did
+not show meaningful standalone benefit, and no speculative parent-thread
+policy change was added.

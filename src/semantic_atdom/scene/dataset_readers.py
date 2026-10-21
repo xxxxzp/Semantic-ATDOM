@@ -29,6 +29,7 @@ from semantic_atdom.utils.camera_calibration import (
     rectify_points,
     rectification_valid_mask,
     rectified_pinhole_from_colmap,
+    projection_matches_retained,
 )
 from semantic_atdom.utils.image_identity import normalize_image_identity
 from semantic_atdom.scene.gaussian_model import BasicPointCloud
@@ -752,7 +753,20 @@ def On_the_Fly_readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder, 
     sys.stdout.write('\n')
     return cam_infos
 
-def SingleImage_readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder, Do_Get_Tri_Mask=False, Image_Name="", CurrentImagesNames=[], Silence=False, No_Key_Region=False):
+_MASK_PREPARATION_STATS = {'retained_camera_masks_skipped': 0}
+
+
+def mask_preparation_statistics():
+    return dict(_MASK_PREPARATION_STATS)
+
+
+def SingleImage_readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder, Do_Get_Tri_Mask=False, Image_Name="", CurrentImagesNames=[], Silence=False, No_Key_Region=False, retained_camera_mappings=None):
+    """Read sparse metadata, optionally omitting unused retained-camera masks.
+
+    A supplied retained mapping uses the trainer's replacement predicate. When
+    it matches, callers must keep the existing RGB tensor/mask; this record
+    carries pose metadata only. Without it, the historical reader is unchanged.
+    """
     cam_infos = []
     point3D_ids_list = {}
     xys_list = {}
@@ -833,7 +847,10 @@ def SingleImage_readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder,
 
         else:
             image = None
-            if Do_Get_Tri_Mask:
+            previous = (None if retained_camera_mappings is None
+                        else retained_camera_mappings.get(image_name))
+            retained = projection_matches_retained(FovX, FovY, calibration, previous)
+            if Do_Get_Tri_Mask and not retained:
                 Tri_Mask = Get_Tri_Mask(
                     extr,
                     width,
@@ -843,7 +860,13 @@ def SingleImage_readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder,
                 )
             else:
                 Tri_Mask = None
-            Tri_Mask = _rectify_training_mask(Tri_Mask, calibration)
+            if retained:
+                # The trainer retains its existing RGB tensor and mask when
+                # this same predicate holds. This metadata-only camera carries
+                # new pose, not another full source-grid mask to discard.
+                _MASK_PREPARATION_STATS['retained_camera_masks_skipped'] += 1
+            else:
+                Tri_Mask = _rectify_training_mask(Tri_Mask, calibration)
 
 
         cam_info = CameraInfo(uid=uid, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
@@ -944,7 +967,7 @@ def On_the_Fly_readColmapSceneInfo(path, images, eval, CurrentImagesNames, llffh
                            ply_path=ply_path)
     return scene_info
 
-def SingleImage_readColmapSceneInfo_Part1(path, images, eval, llffhold=8, Image_Name="", CurrentImagesNames=[], Do_Get_Tri_Mask=False, Diary=None, Silence=False, No_Key_Region=False, NewInputFormat=False, Image_Folder_Path=""):
+def SingleImage_readColmapSceneInfo_Part1(path, images, eval, llffhold=8, Image_Name="", CurrentImagesNames=[], Do_Get_Tri_Mask=False, Diary=None, Silence=False, No_Key_Region=False, NewInputFormat=False, Image_Folder_Path="", retained_camera_mappings=None):
     time1 = time.time()
     if not NewInputFormat:
         try:
@@ -982,6 +1005,7 @@ def SingleImage_readColmapSceneInfo_Part1(path, images, eval, llffhold=8, Image_
                                                                               Do_Get_Tri_Mask=Do_Get_Tri_Mask,
                                                                               CurrentImagesNames=CurrentImagesNames,
                                                                               Silence=Silence,
+                                                                              retained_camera_mappings=retained_camera_mappings,
                                                                               No_Key_Region=No_Key_Region)
 
     time2 = time.time()

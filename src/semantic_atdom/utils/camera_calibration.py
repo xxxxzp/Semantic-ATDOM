@@ -8,10 +8,20 @@ semantic projection so both modalities remain pixel aligned.
 
 from dataclasses import asdict, dataclass
 from functools import lru_cache
+import math
 from typing import Mapping, Sequence
 
 import cv2
 import numpy as np
+
+
+def projection_matches_retained(fov_x, fov_y, calibration, previous):
+    """The exact replacement predicate shared by reader and trainer."""
+    return previous is not None and (
+        math.isclose(fov_x, previous['FoVx'], rel_tol=0.0, abs_tol=1e-12)
+        and math.isclose(fov_y, previous['FoVy'], rel_tol=0.0, abs_tol=1e-12)
+        and calibration == previous.get('calibration')
+    )
 
 
 _PARAMETER_COUNTS = {

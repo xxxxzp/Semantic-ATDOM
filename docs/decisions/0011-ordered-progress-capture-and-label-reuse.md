@@ -24,6 +24,11 @@ worker no longer needs to be globally idle before rendering its own ordered
 capture. Final refinement drains earlier jobs, performs the authoritative
 rebuild, and captures the final frame synchronously.
 
+Initialization is a distinct readiness boundary: its first video job is drained
+before opening the incremental stream. This preserves the prior startup
+contract and avoids charging the initial camera batch to an arbitrary later
+stage's capacity wait. Both startup cost and full wall time remain measured.
+
 At most two complete video jobs may be retained, including the active job.
 Admission waits when capacity is exhausted; requested frames are never dropped.
 This backpressure is measured separately from semantic wait. Existing map
@@ -49,3 +54,20 @@ The auditable video timeline records background delay, RGB/semantic rendering
 and result-ready latency for each requested boundary. End-to-end training time,
 final semantic reconstruction and full run wall time must be compared as well;
 zero foreground semantic wait alone does not establish a throughput improvement.
+
+The first complete implementation measured 5.034 seconds per new image versus
+4.543 in the accepted reference, despite faster final semantics. It failed the
+performance screen and was not accepted as the final optimization. Its explicit
+capacity wait was 52.916 seconds, mostly at startup; foreground next-image
+feedback waiting also increased from 0.313 to 1.163 seconds per new image.
+
+The progressive input reader was rebuilding and rectifying full source-grid
+masks for old cameras, then discarding them because the trainer retained its
+existing RGB/mask whenever calibration/FOV matched. The reader now receives the
+retained projection mappings and shares that exact replacement predicate with
+the trainer. Matching old-camera records contain pose metadata only. New views,
+changed calibrations/FOV and legacy callers without retained metadata still
+prepare masks normally. No new sparse sample, optimizer or geometry rule is
+introduced. A real 27-camera stage-180 replay measured 3.413 seconds of this
+discarded work versus 0.002 seconds for metadata only, with identical poses and
+calibrations. Full acceptance still requires the complete matched experiment.

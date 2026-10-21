@@ -45,10 +45,12 @@ import math
 import time
 from semantic_atdom.scene.cameras import Camera, DummyCamera, DummyPipeline
 from semantic_atdom.utils.camera_utils import camera_to_JSON, resize_camera_mask, loadCam
+from semantic_atdom.utils.camera_calibration import projection_matches_retained
 from semantic_atdom.utils.pixel_grid import PIXEL_GRID_VERSION
 import json
 from semantic_atdom.scene.dataset_readers import (
     load_rectified_image,
+    mask_preparation_statistics,
     sceneLoadTypeCallbacks,
 )
 from semantic_atdom.scene.progressive_layout import (
@@ -121,21 +123,9 @@ TRAINING_PROGRESS_UPDATE_INTERVAL = 10
 def camera_image_mapping_changed(camera_info, previous):
     """Return whether a retained RGB tensor needs the new rectification map."""
 
-    return not (
-        math.isclose(
-            camera_info.FovX,
-            previous["FoVx"],
-            rel_tol=0.0,
-            abs_tol=1e-12,
-        )
-        and math.isclose(
-            camera_info.FovY,
-            previous["FoVy"],
-            rel_tol=0.0,
-            abs_tol=1e-12,
-        )
-        and camera_info.calibration == previous.get("calibration")
-    )
+    return not projection_matches_retained(
+        camera_info.FovX, camera_info.FovY, camera_info.calibration, previous)
+
 
 
 def trainable_cameras(cameras):
@@ -1003,7 +993,8 @@ class DataPreProccesser(mp.Process):
                 Silence=self.Silence,
                 No_Key_Region=self.args.No_Key,
                 NewInputFormat=NewInputFormat,
-                Image_Folder_Path=self.args.Image_Folder_Path)
+                Image_Folder_Path=self.args.Image_Folder_Path,
+                retained_camera_mappings=TrainCameras)
         elif os.path.exists(os.path.join(self.args.source_path_second, "bin")):
             NewInputFormat = True
             CurrentImagesNames = list(TrainCameras.keys())
@@ -1019,7 +1010,8 @@ class DataPreProccesser(mp.Process):
                 Silence=self.Silence,
                 No_Key_Region=self.args.No_Key,
                 NewInputFormat=NewInputFormat,
-                Image_Folder_Path=self.args.Image_Folder_Path)
+                Image_Folder_Path=self.args.Image_Folder_Path,
+                retained_camera_mappings=TrainCameras)
         else:
             assert False, "Could not recognize scene type!"
 
@@ -1818,6 +1810,8 @@ class GaussianTrainer(mp.Process):
         self._run_semantic_hook("initialization")
         with torch.no_grad():
             self._capture_training_progress_tdom("Initialization")
+        if self.args.render_training_progress and self.semantic_hook is not None:
+            self.semantic_hook.wait_for_idle()
 
         # 向前端传递信息，表示初始训练已经完成，可以开始读取后续的影像
         self.SendImagePos_to_DataPreProccesser(True)
@@ -3755,6 +3749,8 @@ class On_the_Fly_GS:
             self.GaussianTrainer_Thread.start()
             self.DataSaver_Thread.start()
             self.DataPreProccesser.run()
+            write_json_atomic(Path(self.GaussianTrainer.args.metrics_dir) / "data_preprocessing.json",
+                              mask_preparation_statistics())
             workers.stop("trainer", self.GaussianTrainer_queue)
             workers.stop("output", self.DataSaver_queue)
         except BaseException:

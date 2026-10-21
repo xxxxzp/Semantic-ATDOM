@@ -60,9 +60,9 @@ from semantic_atdom.semantics.tdom import (
     rasterize_semantic_tdom,
 )
 from semantic_atdom.utils.image_utils import tdom_to_uint8
-from semantic_atdom.semantics.label_grid import rectified_source_labels
-from semantic_atdom.utils.pixel_grid import PIXEL_GRID_VERSION, resize_nearest
+from semantic_atdom.utils.pixel_grid import PIXEL_GRID_VERSION
 from semantic_atdom.utils.atomic_io import write_json_atomic
+from semantic_atdom.semantics.prepared_labels import PreparedLabelCache
 
 
 _GEOMETRY_ATTRIBUTE_NAMES = RGB_MODEL_ATTRIBUTE_NAMES
@@ -299,6 +299,7 @@ class _PendingStageRequest:
     stage_boundaries: Tuple[str, ...]
     publication_request: Optional[MapPublicationRequest]
     publication_status_override: Optional[str] = None
+    on_synchronized: object = None
 
     def core_args(self) -> Tuple[object, ...]:
         return (
@@ -533,33 +534,32 @@ def label_boundary_weights(
 class CudaSemanticProjector:
     """Adapt a camera, Gaussian model, and validated label to the WP2 kernel."""
 
-    def __init__(self, class_spec: SemanticClassSpec, config: OnlineSemanticConfig):
+    def __init__(self, class_spec: SemanticClassSpec, config: OnlineSemanticConfig,
+                 prepared_cache_root=None):
         self.class_spec = class_spec
         self.config = config
+        self.prepared_labels = PreparedLabelCache(prepared_cache_root)
 
     def project(self, gaussians, camera, observation: SemanticObservation):
         # Boundary bandwidth is measured on the full rectified SOURCE grid,
         # independent of the training resolution. IDs, masks and weights share
         # the same center-based nearest sample locations on the camera grid.
-        source_labels = rectified_source_labels(
-            observation.labels, camera, self.class_spec.ignore_id
+        started = time.perf_counter()
+        labels, boundary = self.prepared_labels.prepare(
+            observation.labels, camera, self.class_spec.ignore_id,
+            self.config.boundary_bandwidth, self.config.boundary_floor,
+            label_boundary_weights,
         )
-        source_boundary = label_boundary_weights(
-            source_labels,
-            ignore_id=self.class_spec.ignore_id,
-            bandwidth=self.config.boundary_bandwidth,
-            floor=self.config.boundary_floor,
-        )
-        resolution = (int(camera.image_width), int(camera.image_height))
-        labels = resize_nearest(source_labels, resolution)
-        boundary = resize_nearest(source_boundary, resolution)
+        stats = self.prepared_labels.stats
+        stats['preparation_seconds'] = stats.get('preparation_seconds', 0.0) + time.perf_counter() - started
+        stats['projection_calls'] = stats.get('projection_calls', 0) + 1
         result = rasterize_semantic_observation(
             means3d=gaussians.get_xyz,
             opacities=gaussians.get_opacity,
             scales=gaussians.get_scaling,
             rotations=gaussians.get_rotation,
-            labels=torch.from_numpy(labels.astype(np.int64, copy=False)),
-            boundary_weights=torch.from_numpy(boundary),
+            labels=torch.from_numpy(labels.astype(np.int64, copy=True)),
+            boundary_weights=torch.from_numpy(boundary.copy()),
             viewmatrix=camera.world_view_transform,
             projmatrix=camera.full_proj_transform,
             tan_fovx=math.tan(float(camera.FoVx) * 0.5),
@@ -1112,7 +1112,8 @@ class ProgressiveSemanticHook:
                 state, dataset.class_spec, config
             )
         if projector is None:
-            projector = CudaSemanticProjector(dataset.class_spec, config)
+            projector = CudaSemanticProjector(dataset.class_spec, config,
+                                            output_root / 'prepared_labels')
         hook = cls(
             dataset,
             orchestrator,
@@ -1949,6 +1950,12 @@ class AsyncProgressiveSemanticHook:
         self._idle_event = threading.Event()
         self._idle_event.set()
         self._semantic_stream = None
+        # Preserve explicitly requested video stages without retaining an
+        # unbounded sequence of complete appearance snapshots.
+        self._capture_slots = threading.BoundedSemaphore(2)
+        self.last_capture_backpressure_seconds = 0.0
+        self.capture_stats = dict(submitted=0, completed=0, pending=0,
+                                  max_pending=0, backpressure_seconds=0.0)
         state_device = getattr(self.orchestrator.state, "device", torch.device("cpu"))
         if torch.device(state_device).type == "cuda":
             self._semantic_stream = torch.cuda.Stream(
@@ -2043,6 +2050,7 @@ class AsyncProgressiveSemanticHook:
         snapshot_root: Path,
         final: bool = False,
         publication_request: Optional[MapPublicationRequest] = None,
+        on_synchronized=None,
     ) -> SemanticSyncResult:
         if self._closed:
             raise RuntimeError("asynchronous semantic hook is closed")
@@ -2050,11 +2058,53 @@ class AsyncProgressiveSemanticHook:
             self._raise_background_error()
         camera_ids = tuple(_image_id(item.image_name) for item in cameras)
         if camera_ids:
-            boundary = max(
-                camera_ids, key=_acquisition_key
-            )
+            boundary = max(camera_ids, key=_acquisition_key)
             if not self._stage_boundaries or self._stage_boundaries[-1] != boundary:
                 self._stage_boundaries.append(boundary)
+        if not final and on_synchronized is not None:
+            if not callable(on_synchronized):
+                raise TypeError('on_synchronized must be callable')
+            started = time.perf_counter()
+            while not self._capture_slots.acquire(timeout=0.1):
+                self._raise_background_error()
+            self.last_capture_backpressure_seconds = time.perf_counter() - started
+            registered = False
+            try:
+                if self._closed:
+                    raise RuntimeError('asynchronous semantic hook is closed')
+                self._raise_background_error()
+                frozen_publication, publication_status_override = self._freeze_publication_request(
+                    publication_request, gaussians, final=False)
+                request = _PendingStageRequest(
+                    geometry_stage, tuple(FrozenCameraSnapshot(item) for item in cameras),
+                    FrozenGaussianSnapshot(gaussians), Path(snapshot_root), False,
+                    tuple(self._stage_boundaries), frozen_publication,
+                    publication_status_override, on_synchronized)
+                with self._lock:
+                    self._pending_stage_count += 1
+                    self._stage_pending = True
+                    self._idle_event.clear()
+                    stats = self.capture_stats
+                    stats['submitted'] += 1
+                    stats['pending'] += 1
+                    stats['max_pending'] = max(stats['max_pending'], stats['pending'])
+                    stats['backpressure_seconds'] += self.last_capture_backpressure_seconds
+                    registered = True
+                future = self._executor.submit(self._run_stage, request)
+                future.add_done_callback(self._stage_done)
+                future.add_done_callback(self._capture_done)
+            except BaseException:
+                if registered:
+                    with self._lock:
+                        self._pending_stage_count -= 1
+                        self.capture_stats['pending'] -= 1
+                        self.capture_stats['submitted'] -= 1
+                        if self._pending_stage_count == 0:
+                            self._stage_pending = False
+                            self._idle_event.set()
+                self._capture_slots.release()
+                raise
+            return self._current_status(geometry_stage)
 
         if not final:
             with self._lock:
@@ -2263,7 +2313,19 @@ class AsyncProgressiveSemanticHook:
             status_writer = getattr(self.core, "_write_sync_status", None)
             if callable(status_writer):
                 status_writer(result)
+        capture = getattr(request, 'on_synchronized', None)
+        if capture is not None:
+            # Same worker, before any later topology marker or stage: no copy
+            # of the large semantic state and no live trainer geometry reads.
+            self._execute_callable(capture, self.core,
+                                   request.snapshot, result)
         return result
+
+    def _capture_done(self, future):
+        with self._lock:
+            self.capture_stats['pending'] -= 1
+            self.capture_stats['completed'] += int(future.exception() is None)
+        self._capture_slots.release()
 
     def _execute_core(
         self,

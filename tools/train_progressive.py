@@ -2,6 +2,8 @@ import os
 import hashlib
 import csv
 from queue import Empty
+from semantic_atdom.utils.progress_capture import ProgressCapture
+from semantic_atdom.semantics.orchestrator import FrozenCameraSnapshot
 from semantic_atdom.utils.worker_supervision import WorkerGroup
 import random
 from pathlib import Path
@@ -1665,6 +1667,10 @@ class GaussianTrainer(mp.Process):
                 "map publication request is invalid; semantic fusion "
                 "continues: {}".format(error)
             )
+        capture = None
+        capture_started = time.perf_counter()
+        if not final and self._training_progress_due(expected_training_type):
+            capture = self._make_training_progress_capture(expected_training_type)
         try:
             result = hook.synchronize(
                 geometry_stage=self.imagenum,
@@ -1673,7 +1679,16 @@ class GaussianTrainer(mp.Process):
                 snapshot_root=snapshot_root,
                 final=final,
                 publication_request=publication_request,
+                on_synchronized=capture,
             )
+            if capture is not None:
+                self._queued_progress_capture = (
+                    (int(self.imagenum), expected_training_type),
+                    dict(requested=True, asynchronous=True, semantic_wait_seconds=0.0,
+                         rgb_tdom_seconds=0.0, semantic_tdom_seconds=0.0,
+                         frame_enqueue_seconds=0.0,
+                         capture_submit_seconds=time.perf_counter()-capture_started,
+                         capture_backpressure_seconds=hook.last_capture_backpressure_seconds))
             self.last_semantic_sync_result = result
             print(
                 "Semantic sync [{}]: geometry={}, through={}, lag={}, map={}".format(
@@ -1697,6 +1712,10 @@ class GaussianTrainer(mp.Process):
             if final:
                 self.gaussians.set_topology_observer(None)
                 hook.close()
+                prepared = getattr(hook.core.projector, "prepared_labels", None)
+                write_json_atomic(Path(self.args.metrics_dir) / "semantic_pipeline.json",
+                    dict(schema_version=1, captures=dict(hook.capture_stats),
+                         prepared_labels=None if prepared is None else dict(prepared.stats)))
             return result
         except Exception as error:
             SemanticWarning(
@@ -2056,61 +2075,10 @@ class GaussianTrainer(mp.Process):
             height,
         )
 
-    def _capture_training_progress_tdom(self, training_type, final=False):
-        timing = {
-            "requested": False,
-            "semantic_wait_seconds": 0.0,
-            "rgb_tdom_seconds": 0.0,
-            "semantic_tdom_seconds": 0.0,
-            "frame_enqueue_seconds": 0.0,
-        }
-        if not self._training_progress_due(training_type, final=final):
-            return timing
-        timing["requested"] = True
+    def _make_training_progress_capture(self, training_type, final=False):
         if self.TDOM_Cam is None or self.TDOM_alignment is None:
-            raise RuntimeError(
-                "training progress frame is due but its TDOM camera is missing"
-            )
-        if self.semantic_hook is None or self.last_semantic_sync_result is None:
-            raise RuntimeError(
-                "training progress frame requires a synchronized semantic state"
-            )
-        started = time.perf_counter()
-        self.semantic_hook.wait_for_idle()
-        timing["semantic_wait_seconds"] = time.perf_counter() - started
-        committed_status = self.semantic_hook.current_status(self.imagenum)
-        semantic_through = committed_status.semantic_through_image
-        if semantic_through is None or int(committed_status.lag_batches) != 0:
-            raise RuntimeError(
-                "training progress semantic state is not exact for stage {} "
-                "(through={}, lag={})".format(
-                    self.imagenum,
-                    semantic_through,
-                    committed_status.lag_batches,
-                )
-            )
-
+            raise RuntimeError("training progress frame is due but its TDOM camera is missing")
         camera = self._training_progress_camera()
-        started = time.perf_counter()
-        rendered = rasterize_rgb_tdom_striped(
-            self.gaussians,
-            camera,
-            self.background,
-            self.semantic_tdom_config,
-        )
-        rgb_output = tdom_to_uint8(rendered)
-        timing["rgb_tdom_seconds"] = time.perf_counter() - started
-        # The striped renderer has already copied the completed RGB map to the
-        # host.  Drop its CUDA working set before semantic TDOM sizes its own
-        # fixed buffers; otherwise the allocator cache can make reclaimable
-        # RGB binning memory look unavailable and fail a valid frame.
-        del rendered
-        torch.cuda.empty_cache()
-        started = time.perf_counter()
-        semantic_output = self._semantic_progress_frame(camera)
-        timing["semantic_tdom_seconds"] = time.perf_counter() - started
-        torch.cuda.empty_cache()
-
         cameras = sorted(
             self.scene.getTrainCameras(), key=self._camera_order_key
         )
@@ -2150,13 +2118,6 @@ class GaussianTrainer(mp.Process):
                     / float(denominator),
                 ),
             ),
-            "semantic_through_image": semantic_through,
-            "semantic_status": committed_status.status,
-            "semantic_lag_batches": int(committed_status.lag_batches),
-            "semantic_historical_evidence_stale": bool(
-                committed_status.historical_evidence_stale
-            ),
-            "semantic_errors": list(committed_status.errors),
             "window": self.TDOM_alignment["window"],
             "grid": grid,
             "map_downsample": TRAINING_PROGRESS_MAP_DOWNSAMPLE,
@@ -2164,41 +2125,37 @@ class GaussianTrainer(mp.Process):
             "row_plane_direction": row_direction,
             "trajectory_pixels": trajectory_pixels,
         }
-        started = time.perf_counter()
-        self.DataSaver_queue.put(
-            ["SaveTrainingProgress", rgb_output, semantic_output, metadata]
-        )
-        timing["frame_enqueue_seconds"] = time.perf_counter() - started
-        del rgb_output, semantic_output, camera
-        return timing
+        # Everything captured here belongs to this training boundary. No live
+        # trainer/model/camera references are read by the background callback.
+        return ProgressCapture(
+            FrozenCameraSnapshot(camera), self.background.detach().clone(),
+            self.semantic_tdom_config, copy.deepcopy(metadata), self.DataSaver_queue,
+            time.perf_counter())
 
-    def _semantic_progress_frame(self, camera):
-        if self.semantic_hook is None:
-            raise RuntimeError(
-                "semantic progress video requested without a valid semantic state"
-            )
+    def _capture_training_progress_tdom(self, training_type, final=False):
+        timing = dict(requested=False, semantic_wait_seconds=0.0,
+                      rgb_tdom_seconds=0.0, semantic_tdom_seconds=0.0,
+                      frame_enqueue_seconds=0.0, capture_backpressure_seconds=0.0,
+                      capture_submit_seconds=0.0, asynchronous=False)
+        if not self._training_progress_due(training_type, final=final):
+            return timing
+        if not final:
+            queued = getattr(self, "_queued_progress_capture", None)
+            if queued is None or queued[0] != (int(self.imagenum), training_type):
+                raise RuntimeError("training progress stage was not queued with semantic synchronization")
+            self._queued_progress_capture = None
+            return queued[1]
+        if self.semantic_hook is None or self.last_semantic_sync_result is None:
+            raise RuntimeError("training progress requires a synchronized semantic state")
+        started = time.perf_counter()
         self.semantic_hook.wait_for_idle()
-        core = self.semantic_hook.core
-        result = rasterize_semantic_tdom(
-            self.gaussians,
-            core.orchestrator.state,
-            camera,
-            core.dataset.class_spec,
-            config=self.semantic_tdom_config,
-        )
-        if result.colors is not None:
-            return result.colors.permute(1, 2, 0).detach().cpu().numpy()
-        palette = self.semantic_tdom_config.render_palette
-        if palette is None:
-            palette = tuple(
-                item.color for item in core.dataset.class_spec.classes
-            )
-        palette = np.asarray(palette, dtype=np.uint8)
-        class_ids = result.class_ids.detach().cpu().numpy().astype(np.int64)
-        colors = palette[np.clip(class_ids, 0, len(palette) - 1)]
-        unknown = result.unknown_mask.detach().cpu().numpy()
-        colors[unknown] = 0
-        return colors
+        timing['semantic_wait_seconds'] = time.perf_counter() - started
+        status = self.semantic_hook.current_status(self.imagenum)
+        capture = self._make_training_progress_capture(training_type, final=True)
+        measured = capture(self.semantic_hook.core, self.gaussians, status)
+        timing.update(requested=True, rgb_tdom_seconds=measured['rgb_tdom_seconds'],
+                      semantic_tdom_seconds=measured['semantic_tdom_seconds'])
+        return timing
 
     # 3DGS模型训练核心函数
     def Train_Gaussians(self, iteration, Training_Type):

@@ -126,3 +126,14 @@ final semantic projection. An additional cross-check also confirmed a
 pre-existing mismatch between the declared grid column axis and actual
 rendered projection in both old and new maps; this metadata issue remains
 unrepaired. The original data, prior results, and main checkout stayed intact.
+
+## Follow-up performance repair
+
+Commit `d6df0c1` preserves these correctness repairs while accelerating exact
+source-grid boundary weights. A new full run measured 4.543 seconds per new
+image (previously 8.300), 0.674 seconds of video semantic waiting (previously
+4.342), and 173.096 seconds for final semantics (previously 1523.899).
+All 229 source/training weight arrays are bit-identical to the old definition.
+See the [performance repair](semantic-performance-2026-10-21.md) and
+[complete comparison](../exp/semantic-performance-full-2026-10-21.md) for
+quality measurements, exact protocol and limitations.

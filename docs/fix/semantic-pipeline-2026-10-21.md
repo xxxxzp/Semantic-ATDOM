@@ -68,3 +68,27 @@ can change which eligible training iteration supplies the existing adaptive
 quality checks remain required. An independent OpenCV thread-budget probe did
 not show meaningful standalone benefit, and no speculative parent-thread
 policy change was added.
+
+## Final complete acceptance
+
+The corrected `7a92357` run completed 229 cameras and 45,800 optimizer steps
+with exact final semantics and all 120 audited video frames. Average online
+processing improved from 4.543 to 3.612 seconds/new image; geometry was
+3.244 versus 3.255 seconds. Final semantics took 80.949 versus 173.096 seconds,
+and manifest wall time 1132.448 versus 1445.210 seconds. Capacity backpressure
+totaled 0.001199 seconds, with at most one retained capture observed.
+
+The run omitted 7,745 discarded old-camera mask preparations. Final camera
+poses, calibration and retained masks exactly match the reference inventory.
+All 229 cached training ID/weight arrays match the uncached reference hashes.
+288 tests and 68 subtests passed. Training-view RGB mean PSNR/SSIM/LPIPS
+changed by +0.04020 dB / +0.001445 / −0.001770; semantic agreement on jointly
+known map pixels is 97.024%, a consistency measure without independent truth.
+The 3,406 protected file hashes match, and GPU 4 peer samples found no external
+compute task. Reference training used physical GPU 2, so device/shared-resource
+differences remain a limit on the single-run speedup estimate.
+
+See the [complete report](../exp/semantic-pipeline-full-2026-10-21.md) and
+`/data3/xzp/experiments/Onthefly/XinCao/semantic-pipeline-final-20261021`.
+The first pipeline trial failed its performance screen and is retained as
+evidence; it was not substituted for the final accepted run.

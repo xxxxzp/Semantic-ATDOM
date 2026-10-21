@@ -2874,6 +2874,10 @@ class GaussianTrainer(mp.Process):
         random.seed(0)
         np.random.seed(0)
         torch.manual_seed(0)
+        # Configure this process before starting the semantic executor. Keep
+        # OpenCV preprocessing within the existing Torch/OMP CPU budget rather
+        # than changing its global thread policy inside concurrent projections.
+        cv2.setNumThreads(max(1, torch.get_num_threads()))
         torch.cuda.set_device(
             torch.device("cuda:{}".format(int(self.args.gpu)))
         )

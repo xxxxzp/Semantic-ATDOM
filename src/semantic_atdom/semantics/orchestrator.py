@@ -500,6 +500,26 @@ def label_boundary_weights(
     boundary[:, :-1] |= horizontal
     if bandwidth <= 0 or not bool(boundary.any()):
         weights = np.ones(labels.shape, dtype=np.float32)
+    elif bandwidth <= 128 and 0 <= floor <= 1 and max(labels.shape) <= 32768:
+        import cv2
+
+        # Only the finite reliability band needs a non-unit weight. OpenCV's
+        # PRECISE L2 transform finds the same Euclidean distances as SciPy,
+        # without its full float64 distance/index working arrays. Do not use
+        # the approximate 3x3 or 5x5 chamfer transforms here.
+        # The raster bound also keeps squared distances within signed int32.
+        distance = cv2.distanceTransform(
+            (~boundary).astype(np.uint8), cv2.DIST_L2, cv2.DIST_MASK_PRECISE
+        )
+        near = distance <= np.ceil(bandwidth) + 1
+        # Distances on this integer pixel lattice have integer squares. In
+        # this bounded band, rounding recovers that exact integer from the
+        # float32 transform; sqrt/ramp in float64 then preserves the original
+        # final float32 weights, including irrational diagonal distances.
+        exact_distance = np.sqrt(np.rint(distance[near].astype(np.float64) ** 2))
+        weights = np.ones(labels.shape, dtype=np.float32)
+        ramp = np.clip(exact_distance / float(bandwidth), 0.0, 1.0)
+        weights[near] = (floor + (1.0 - floor) * ramp).astype(np.float32)
     else:
         from scipy.ndimage import distance_transform_edt
 

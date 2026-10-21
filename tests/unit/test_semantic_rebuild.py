@@ -143,6 +143,9 @@ class FinalSemanticRebuilderTests(unittest.TestCase):
             result.state.alpha_robust, reference.robust_alpha
         )
         self.assertTrue(result.state.group_disagreement_available)
+        self.assertEqual(result.state.group_disagreement_source, "exact_final")
+        result.state.close_open_group()
+        self.assertEqual(result.state.group_disagreement_source, "exact_final")
 
 
 if __name__ == "__main__":

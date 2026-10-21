@@ -60,9 +60,9 @@ from semantic_atdom.semantics.tdom import (
     rasterize_semantic_tdom,
 )
 from semantic_atdom.utils.image_utils import tdom_to_uint8
-from semantic_atdom.semantics.label_grid import rectified_source_labels
-from semantic_atdom.utils.pixel_grid import PIXEL_GRID_VERSION, resize_nearest
+from semantic_atdom.utils.pixel_grid import PIXEL_GRID_VERSION
 from semantic_atdom.utils.atomic_io import write_json_atomic
+from semantic_atdom.semantics.prepared_labels import PreparedLabelCache
 
 
 _GEOMETRY_ATTRIBUTE_NAMES = RGB_MODEL_ATTRIBUTE_NAMES
@@ -110,8 +110,11 @@ def _estimated_pair_output_bytes(
     pixels = int(request.camera.image_width) * int(request.camera.image_height)
     config = request.semantic_config
     diagnostic_bytes = 2 if config.quantize_diagnostics else 4
-    # RGB, semantic id/color, unknown mask/reason and two mandatory rasters.
-    bytes_per_pixel = 3 + 1 + 3 + 1 + 1 + 2 * diagnostic_bytes
+    exports = config.export_options()
+    # Only RGB and semantic color are mandatory image products.
+    bytes_per_pixel = 3 + 3
+    bytes_per_pixel += int(exports["class_ids"]) + 2 * int(exports["masks"])
+    bytes_per_pixel += (int(exports["evidence"]) + int(exports["entropy"])) * diagnostic_bytes
     if config.save_diagnostics:
         bytes_per_pixel += 8 * diagnostic_bytes
     if config.save_probabilities:
@@ -119,6 +122,7 @@ def _estimated_pair_output_bytes(
     if (
         request.planar_fallback_config is not None
         and request.planar_fallback_config.enabled
+        and exports["masks"]
     ):
         bytes_per_pixel += 1
     return pixels * bytes_per_pixel + 1024**2
@@ -135,15 +139,17 @@ def _fit_publication_output_budget(
     candidate = request
     estimated = _estimated_pair_output_bytes(candidate, num_classes)
     config = candidate.semantic_config
-    if estimated > max_output_bytes and (
-        config.save_diagnostics or config.save_probabilities
-    ):
+    if estimated > max_output_bytes and any(config.export_options().values()):
         candidate = replace(
             candidate,
             semantic_config=replace(
                 config,
                 save_diagnostics=False,
                 save_probabilities=False,
+                save_class_ids=False,
+                save_masks=False,
+                save_evidence=False,
+                save_entropy=False,
             ),
             diagnostics_degraded=True,
         )
@@ -299,6 +305,7 @@ class _PendingStageRequest:
     stage_boundaries: Tuple[str, ...]
     publication_request: Optional[MapPublicationRequest]
     publication_status_override: Optional[str] = None
+    on_synchronized: object = None
 
     def core_args(self) -> Tuple[object, ...]:
         return (
@@ -500,6 +507,26 @@ def label_boundary_weights(
     boundary[:, :-1] |= horizontal
     if bandwidth <= 0 or not bool(boundary.any()):
         weights = np.ones(labels.shape, dtype=np.float32)
+    elif bandwidth <= 128 and 0 <= floor <= 1 and max(labels.shape) <= 32768:
+        import cv2
+
+        # Only the finite reliability band needs a non-unit weight. OpenCV's
+        # PRECISE L2 transform finds the same Euclidean distances as SciPy,
+        # without its full float64 distance/index working arrays. Do not use
+        # the approximate 3x3 or 5x5 chamfer transforms here.
+        # The raster bound also keeps squared distances within signed int32.
+        distance = cv2.distanceTransform(
+            (~boundary).astype(np.uint8), cv2.DIST_L2, cv2.DIST_MASK_PRECISE
+        )
+        near = distance <= np.ceil(bandwidth) + 1
+        # Distances on this integer pixel lattice have integer squares. In
+        # this bounded band, rounding recovers that exact integer from the
+        # float32 transform; sqrt/ramp in float64 then preserves the original
+        # final float32 weights, including irrational diagonal distances.
+        exact_distance = np.sqrt(np.rint(distance[near].astype(np.float64) ** 2))
+        weights = np.ones(labels.shape, dtype=np.float32)
+        ramp = np.clip(exact_distance / float(bandwidth), 0.0, 1.0)
+        weights[near] = (floor + (1.0 - floor) * ramp).astype(np.float32)
     else:
         from scipy.ndimage import distance_transform_edt
 
@@ -513,33 +540,32 @@ def label_boundary_weights(
 class CudaSemanticProjector:
     """Adapt a camera, Gaussian model, and validated label to the WP2 kernel."""
 
-    def __init__(self, class_spec: SemanticClassSpec, config: OnlineSemanticConfig):
+    def __init__(self, class_spec: SemanticClassSpec, config: OnlineSemanticConfig,
+                 prepared_cache_root=None):
         self.class_spec = class_spec
         self.config = config
+        self.prepared_labels = PreparedLabelCache(prepared_cache_root)
 
     def project(self, gaussians, camera, observation: SemanticObservation):
         # Boundary bandwidth is measured on the full rectified SOURCE grid,
         # independent of the training resolution. IDs, masks and weights share
         # the same center-based nearest sample locations on the camera grid.
-        source_labels = rectified_source_labels(
-            observation.labels, camera, self.class_spec.ignore_id
+        started = time.perf_counter()
+        labels, boundary = self.prepared_labels.prepare(
+            observation.labels, camera, self.class_spec.ignore_id,
+            self.config.boundary_bandwidth, self.config.boundary_floor,
+            label_boundary_weights,
         )
-        source_boundary = label_boundary_weights(
-            source_labels,
-            ignore_id=self.class_spec.ignore_id,
-            bandwidth=self.config.boundary_bandwidth,
-            floor=self.config.boundary_floor,
-        )
-        resolution = (int(camera.image_width), int(camera.image_height))
-        labels = resize_nearest(source_labels, resolution)
-        boundary = resize_nearest(source_boundary, resolution)
+        stats = self.prepared_labels.stats
+        stats['preparation_seconds'] = stats.get('preparation_seconds', 0.0) + time.perf_counter() - started
+        stats['projection_calls'] = stats.get('projection_calls', 0) + 1
         result = rasterize_semantic_observation(
             means3d=gaussians.get_xyz,
             opacities=gaussians.get_opacity,
             scales=gaussians.get_scaling,
             rotations=gaussians.get_rotation,
-            labels=torch.from_numpy(labels.astype(np.int64, copy=False)),
-            boundary_weights=torch.from_numpy(boundary),
+            labels=torch.from_numpy(labels.astype(np.int64, copy=True)),
+            boundary_weights=torch.from_numpy(boundary.copy()),
             viewmatrix=camera.world_view_transform,
             projmatrix=camera.full_proj_transform,
             tan_fovx=math.tan(float(camera.FoVx) * 0.5),
@@ -922,6 +948,7 @@ class ProgressiveSemanticHook:
         final_authoritative_complete: bool = False,
         preflight_report_path: Optional[Path] = None,
         preflight_report_sha256: Optional[str] = None,
+        final_rebuild: bool = True,
     ):
         self.dataset = dataset
         self.orchestrator = orchestrator
@@ -929,6 +956,9 @@ class ProgressiveSemanticHook:
         self.output_root = Path(output_root)
         self.publication_policy = publication_policy or MapPublicationPolicy()
         self.final_authoritative_complete = bool(final_authoritative_complete)
+        # Preserve the direct hook API's exact-rebuild contract. The trainer
+        # explicitly selects its default online finalization policy.
+        self.final_rebuild = bool(final_rebuild)
         if (preflight_report_path is None) != (preflight_report_sha256 is None):
             raise ValueError(
                 "preflight report path and SHA-256 must be supplied together"
@@ -956,6 +986,7 @@ class ProgressiveSemanticHook:
         final_authoritative_complete: bool = False,
         preflight_report_path: Optional[Path] = None,
         preflight_report_sha256: Optional[str] = None,
+        final_rebuild: bool = True,
     ) -> "ProgressiveSemanticHook":
         config = config or OnlineSemanticConfig()
         dataset = SemanticDataset(semantic_dataset_root or dataset_root)
@@ -1092,7 +1123,8 @@ class ProgressiveSemanticHook:
                 state, dataset.class_spec, config
             )
         if projector is None:
-            projector = CudaSemanticProjector(dataset.class_spec, config)
+            projector = CudaSemanticProjector(dataset.class_spec, config,
+                                            output_root / 'prepared_labels')
         hook = cls(
             dataset,
             orchestrator,
@@ -1102,6 +1134,7 @@ class ProgressiveSemanticHook:
             final_authoritative_complete=final_authoritative_complete,
             preflight_report_path=preflight_report_path,
             preflight_report_sha256=preflight_report_sha256,
+            final_rebuild=final_rebuild,
         )
         status_path = output_root / "sync_status.json"
         if resume and status_path.is_file():
@@ -1298,6 +1331,13 @@ class ProgressiveSemanticHook:
         if final:
             if online_usable:
                 self.orchestrator.close_group()
+            try:
+                disk_spec = SemanticClassSpec.load(self.dataset.semantic_root / "class_spec.json")
+                if disk_spec.ontology_fingerprint != self.dataset.class_spec.ontology_fingerprint:
+                    raise SemanticSchemaError("semantic ontology changed on disk before final rebuild")
+            except (SemanticSchemaError, OSError, ValueError) as error:
+                input_binding_error = True
+                errors.append("final class specification: {}".format(error))
             final_ready = []
             final_missing = []
             for image_id in all_ordered:
@@ -1312,11 +1352,22 @@ class ProgressiveSemanticHook:
                 if image_id not in camera_by_id:
                     final_missing.append(image_id)
                 elif label_path.is_file() and metadata_path.is_file():
-                    final_ready.append(image_id)
+                    try:
+                        # Explicit partial mode admits each observation
+                        # independently; one malformed file must not hide
+                        # valid later views. Strict binding failures above
+                        # still prevent any authoritative final rebuild.
+                        if self.final_rebuild or image_id not in ledger_images:
+                            self.dataset.load_observation(image_id)
+                    except (SemanticSchemaError, OSError, ValueError) as error:
+                        final_missing.append(image_id)
+                        errors.append("final invalid observation {}: {}".format(image_id, error))
+                    else:
+                        final_ready.append(image_id)
                 else:
                     final_missing.append(image_id)
             deferred = list(dict.fromkeys(deferred + final_missing))
-            if final_ready and not input_binding_error:
+            if self.final_rebuild and final_ready and not input_binding_error:
                 try:
                     rebuilt = FinalSemanticRebuilder(
                         self.dataset,
@@ -1329,6 +1380,16 @@ class ProgressiveSemanticHook:
                         overlap,
                         online_state=self.orchestrator.state,
                     )
+                    if self.final_input_binding is not None:
+                        validate_final_preflight_binding(
+                            report_path=self.preflight_report_path,
+                            expected_report_sha256=self.preflight_report_sha256,
+                            semantic_dataset=self.dataset,
+                            image_ids=all_ordered,
+                            camera_by_id=camera_by_id,
+                            snapshot_root=snapshot_root,
+                            geometry_stage=geometry_stage,
+                        )
                     rebuilt_provenance = dict(rebuilt.label_provenance)
                     if self.final_input_binding is not None:
                         rebuilt_provenance["input_binding"] = {
@@ -1365,6 +1426,7 @@ class ProgressiveSemanticHook:
                                 else None
                             ),
                             "groups": [list(group) for group in rebuilt.image_groups],
+                            "class_spec_sha256": self.dataset.class_spec.fingerprint,
                             "input_binding": (
                                 None
                                 if self.final_input_binding is None
@@ -1378,12 +1440,19 @@ class ProgressiveSemanticHook:
                             "metrics": rebuilt.metrics.to_dict(),
                         },
                     )
+                    self._save_json_atomic(
+                        self.output_root / "validated_schema.json",
+                        self.dataset.class_spec.to_dict(),
+                    )
                     # Swap only after every fallible rebuild/metrics operation
                     # completed, so failure always leaves the online state live.
                     self.orchestrator = replacement
                     ledger_images = {
                         entry.image_id for entry in rebuilt.ledger.entries
                     }
+                    # Online ingestion may have stopped at an invalid earlier
+                    # view. The exact partial pass has now admitted later views.
+                    deferred = [image_id for image_id in deferred if image_id not in ledger_images]
                     exact_rebuilt = True
                     final_image_groups = rebuilt.image_groups
                     exact_complete = (
@@ -1391,7 +1460,7 @@ class ProgressiveSemanticHook:
                     )
                 except Exception as error:
                     errors.append("final exact rebuild: {}".format(error))
-            elif not input_binding_error:
+            elif self.final_rebuild and not input_binding_error:
                 errors.append("final exact rebuild has no valid observations")
 
         through_index = 0
@@ -1415,6 +1484,12 @@ class ProgressiveSemanticHook:
         )
         if exact_rebuilt:
             status = "exact_final" if exact_complete else "exact_partial"
+        elif final and not self.final_rebuild:
+            status = (
+                "approx_final"
+                if online_usable and not errors and not deferred and lag == 0
+                else "failed"
+            )
         elif final:
             status = (
                 "online_fallback"
@@ -1438,6 +1513,37 @@ class ProgressiveSemanticHook:
             status,
             historical_stale,
         )
+        if final and result.status in {"exact_final", "exact_partial", "approx_final"}:
+            try:
+                if not self.final_rebuild and self.final_input_binding is not None:
+                    validate_final_preflight_binding(
+                        report_path=self.preflight_report_path,
+                        expected_report_sha256=self.preflight_report_sha256,
+                        semantic_dataset=self.dataset,
+                        image_ids=all_ordered,
+                        camera_by_id=camera_by_id,
+                        snapshot_root=snapshot_root,
+                        geometry_stage=geometry_stage,
+                    )
+                if not self.final_rebuild:
+                    # A resumed run may retain metrics from a previous final
+                    # attempt; do not archive them as evidence for online reuse.
+                    (self.output_root / "final_rebuild_metrics.json").unlink(missing_ok=True)
+                self._save_json_atomic(self.output_root / "validated_schema.json",
+                                       self.dataset.class_spec.to_dict())
+                self._save_json_atomic(self.output_root / "final_semantic_metadata.json", {
+                    "schema_version": 1,
+                    "mode": "rebuild" if self.final_rebuild else "online",
+                    "status": result.status,
+                    "geometry_stage": geometry_stage,
+                    "class_spec_sha256": self.dataset.class_spec.fingerprint,
+                    "projection_geometry_hash": semantic_projection_sha256(_projection_attributes(gaussians)),
+                    "historical_evidence_stale": historical_stale,
+                    "input_binding": None if self.final_input_binding is None else self.final_input_binding.to_dict(),
+                })
+            except Exception as error:
+                errors.append("final semantic metadata: {}".format(error))
+                result = result._replace(errors=tuple(errors), status="failed")
         checkpoint = None
         if self.orchestrator.state.is_valid and self.checkpoint_required(
             geometry_stage,
@@ -1882,6 +1988,8 @@ class AsyncProgressiveSemanticHook:
         self._pending_stage_count = 0
         self._latest_stage_token = 0
         self._latest_stage_request = None
+        self._latest_projection_token = 0
+        self._latest_projection_request = None
         self._last_result = None
         self._error = None
         self._is_valid = True
@@ -1892,6 +2000,12 @@ class AsyncProgressiveSemanticHook:
         self._idle_event = threading.Event()
         self._idle_event.set()
         self._semantic_stream = None
+        # Preserve explicitly requested video stages without retaining an
+        # unbounded sequence of complete appearance snapshots.
+        self._capture_slots = threading.BoundedSemaphore(2)
+        self.last_capture_backpressure_seconds = 0.0
+        self.capture_stats = dict(submitted=0, completed=0, pending=0,
+                                  max_pending=0, backpressure_seconds=0.0)
         state_device = getattr(self.orchestrator.state, "device", torch.device("cpu"))
         if torch.device(state_device).type == "cuda":
             self._semantic_stream = torch.cuda.Stream(
@@ -1963,6 +2077,7 @@ class AsyncProgressiveSemanticHook:
                 return
             self._closed = True
             self._latest_stage_request = None
+            self._latest_projection_request = None
         self._executor.shutdown(wait=wait)
 
     def wait_for_idle(self) -> None:
@@ -1985,6 +2100,7 @@ class AsyncProgressiveSemanticHook:
         snapshot_root: Path,
         final: bool = False,
         publication_request: Optional[MapPublicationRequest] = None,
+        on_synchronized=None,
     ) -> SemanticSyncResult:
         if self._closed:
             raise RuntimeError("asynchronous semantic hook is closed")
@@ -1992,14 +2108,57 @@ class AsyncProgressiveSemanticHook:
             self._raise_background_error()
         camera_ids = tuple(_image_id(item.image_name) for item in cameras)
         if camera_ids:
-            boundary = max(
-                camera_ids, key=_acquisition_key
-            )
+            boundary = max(camera_ids, key=_acquisition_key)
             if not self._stage_boundaries or self._stage_boundaries[-1] != boundary:
                 self._stage_boundaries.append(boundary)
+        if not final and on_synchronized is not None:
+            if not callable(on_synchronized):
+                raise TypeError('on_synchronized must be callable')
+            started = time.perf_counter()
+            while not self._capture_slots.acquire(timeout=0.1):
+                self._raise_background_error()
+            self.last_capture_backpressure_seconds = time.perf_counter() - started
+            registered = False
+            try:
+                if self._closed:
+                    raise RuntimeError('asynchronous semantic hook is closed')
+                self._raise_background_error()
+                frozen_publication, publication_status_override = self._freeze_publication_request(
+                    publication_request, gaussians, final=False)
+                request = _PendingStageRequest(
+                    geometry_stage, tuple(FrozenCameraSnapshot(item) for item in cameras),
+                    FrozenGaussianSnapshot(gaussians), Path(snapshot_root), False,
+                    tuple(self._stage_boundaries), frozen_publication,
+                    publication_status_override, on_synchronized)
+                with self._lock:
+                    self._pending_stage_count += 1
+                    self._stage_pending = True
+                    self._idle_event.clear()
+                    stats = self.capture_stats
+                    stats['submitted'] += 1
+                    stats['pending'] += 1
+                    stats['max_pending'] = max(stats['max_pending'], stats['pending'])
+                    stats['backpressure_seconds'] += self.last_capture_backpressure_seconds
+                    registered = True
+                future = self._executor.submit(self._run_stage, request)
+                future.add_done_callback(self._stage_done)
+                future.add_done_callback(self._capture_done)
+            except BaseException:
+                if registered:
+                    with self._lock:
+                        self._pending_stage_count -= 1
+                        self.capture_stats['pending'] -= 1
+                        self.capture_stats['submitted'] -= 1
+                        if self._pending_stage_count == 0:
+                            self._stage_pending = False
+                            self._idle_event.set()
+                self._capture_slots.release()
+                raise
+            return self._current_status(geometry_stage)
 
         if not final:
             with self._lock:
+                projection_only_marker = False
                 pending_publication = (
                     None
                     if self._latest_stage_request is None
@@ -2018,7 +2177,13 @@ class AsyncProgressiveSemanticHook:
                         stage_boundaries=tuple(self._stage_boundaries),
                         publication_request=None,
                     )
-                    token = None
+                    # Keep the already queued map, but coalesce later projection
+                    # snapshots independently. Markers retain their original
+                    # queue positions relative to topology deltas.
+                    self._latest_projection_token += 1
+                    token = self._latest_projection_token
+                    self._latest_projection_request = request
+                    projection_only_marker = True
                     queued_product_key = pending_publication.product_key
                 elif (
                     publication_request is not None
@@ -2072,8 +2237,8 @@ class AsyncProgressiveSemanticHook:
                 self._stage_pending = True
                 self._idle_event.clear()
             future = self._executor.submit(
-                self._run_stage_marker if token is not None else self._run_stage,
-                token if token is not None else request,
+                self._run_projection_marker if projection_only_marker else self._run_stage_marker,
+                token,
             )
             future.add_done_callback(self._stage_done)
             status = self._current_status(geometry_stage)
@@ -2179,6 +2344,16 @@ class AsyncProgressiveSemanticHook:
             return None
         return self._run_stage(request)
 
+    def _run_projection_marker(self, token):
+        with self._lock:
+            if token != self._latest_projection_token:
+                return None
+            request = self._latest_projection_request
+            self._latest_projection_request = None
+        if request is not None:
+            return self._run_stage(request)
+        return None
+
     def _run_stage(self, request: _PendingStageRequest):
         result = self._execute_core(*request.core_args())
         if request.publication_status_override is not None:
@@ -2188,7 +2363,19 @@ class AsyncProgressiveSemanticHook:
             status_writer = getattr(self.core, "_write_sync_status", None)
             if callable(status_writer):
                 status_writer(result)
+        capture = getattr(request, 'on_synchronized', None)
+        if capture is not None:
+            # Same worker, before any later topology marker or stage: no copy
+            # of the large semantic state and no live trainer geometry reads.
+            self._execute_callable(capture, self.core,
+                                   request.snapshot, result)
         return result
+
+    def _capture_done(self, future):
+        with self._lock:
+            self.capture_stats['pending'] -= 1
+            self.capture_stats['completed'] += int(future.exception() is None)
+        self._capture_slots.release()
 
     def _execute_core(
         self,
@@ -2279,7 +2466,7 @@ class AsyncProgressiveSemanticHook:
             self._last_result is not None
             and self._last_result.geometry_stage == int(geometry_stage)
             and self._last_result.status
-            in {"exact_final", "exact_partial", "online_fallback"}
+            in {"exact_final", "exact_partial", "approx_final", "online_fallback"}
         ):
             status = self._last_result.status
         elif historical_stale or errors or lag > 1:

@@ -91,6 +91,31 @@ class PersistentOverlapTests(unittest.TestCase):
             snapshot,
         )
 
+    def test_partial_final_rebuild_uses_valid_views_after_invalid_metadata(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            hook = self._hook(root, max_group_size=1)
+            image_ids = ("000001", "000002", "000003")
+            stage = self._stage(root, 3, image_ids)
+            (root / "semantic" / "metadata" / "000002.json").write_text("{broken")
+            calls = []
+            class Projector:
+                def project(self, gaussians, camera, observation):
+                    calls.append(observation.key.image_id)
+                    return ProjectedObservation(torch.ones((1, 1)), torch.ones(1), torch.ones(1))
+            hook.projector = Projector()
+            result = hook.synchronize(3, [SimpleNamespace(image_name=i) for i in image_ids],
+                                      SimpleNamespace(get_xyz=torch.zeros(1, 3),
+                                          _xyz=torch.zeros(1, 3), _opacity=torch.zeros(1, 1),
+                                          _scaling=torch.zeros(1, 3), _rotation=torch.tensor([[1., 0., 0., 0.]])),
+                                      stage, final=True)
+            self.assertEqual(result.status, "exact_partial")
+            self.assertIn("000003", calls)
+            self.assertEqual(result.deferred_image_ids, ("000002",))
+            self.assertTrue(any("000002" in error for error in result.errors))
+            self.assertEqual({entry.image_id for entry in hook.orchestrator.ledger.entries},
+                             {"000001", "000003"})
+
     def test_partial_overlap_does_not_block_unrelated_persistent_camera(self):
         with TemporaryDirectory() as directory:
             root = Path(directory)

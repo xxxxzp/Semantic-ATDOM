@@ -12,10 +12,23 @@ from tools.train_progressive import (
     copy_dataset_context,
     resolve_semantic_render_palette,
     trainable_cameras,
+    semantic_online_required,
 )
 
 
 class TrainingWorkerContextTests(unittest.TestCase):
+    def test_online_finalization_updates_semantics_without_progress_video(self):
+        args = Namespace(enable_semantics=True, semantic_final_rebuild=False,
+            semantic_tdom_final_only=True, semantic_checkpoint_interval=0,
+            render_training_progress=False)
+        self.assertTrue(semantic_online_required(args))
+        args.semantic_final_rebuild = True
+        self.assertFalse(semantic_online_required(args))
+        args.render_training_progress = True
+        self.assertTrue(semantic_online_required(args))
+        args.enable_semantics = False
+        self.assertFalse(semantic_online_required(args))
+
     def test_invalid_optional_palette_has_one_consistent_fallback(self):
         with TemporaryDirectory() as directory:
             root = Path(directory)

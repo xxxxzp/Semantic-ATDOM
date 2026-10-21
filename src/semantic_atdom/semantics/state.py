@@ -25,7 +25,7 @@ class SemanticStateError(ValueError):
 class SemanticGaussianState:
     """Mutable sidecar tensors that are deliberately outside the RGB optimizer."""
 
-    SCHEMA_VERSION = 4
+    SCHEMA_VERSION = 5
     RECOVERY_SCHEMA_VERSION = 2
     RECOVERY_CONTEXT_KEYS = (
         "schema_version",
@@ -58,6 +58,7 @@ class SemanticGaussianState:
         open_semantic_supports: Optional[torch.Tensor] = None,
         historical_evidence_stale: bool = False,
         group_disagreement_available: bool = False,
+        group_disagreement_source: str = "online_estimate",
         active_projection_dirty: Optional[torch.Tensor] = None,
     ):
         self.alpha_raw = alpha_raw.detach()
@@ -122,6 +123,7 @@ class SemanticGaussianState:
         self.invalid_reason = None
         self.historical_evidence_stale = bool(historical_evidence_stale)
         self.group_disagreement_available = bool(group_disagreement_available)
+        self.group_disagreement_source = group_disagreement_source
         self._validate()
 
     @classmethod
@@ -327,34 +329,9 @@ class SemanticGaussianState:
                 "open-group count exceeds the stored group count"
             )
 
-        # Preserve exact streaming first/second moments of raw flight-group
-        # samples while replacing the provisional open group.  alpha_raw minus
-        # the prior is the weighted first moment; variance plus that mean lets
-        # us reconstruct the weighted second-moment sum without another N x K
-        # persistent tensor.
-        numerical_eps = torch.finfo(self.dtype).eps
-        current_first = (self.alpha_raw - self.prior()).clamp_min(0.0)
-        current_weight = current_first.sum(dim=1)
-        current_mean = current_first / (
-            current_weight.unsqueeze(1) + numerical_eps
-        )
-        current_second = current_weight.unsqueeze(1) * (
-            self.group_variance + current_mean.square()
-        )
-        previous_open_weight = self.open_raw_evidence.sum(dim=1)
-        previous_open_second = self.open_raw_evidence.square() / (
-            previous_open_weight.unsqueeze(1) + numerical_eps
-        )
-        new_open_weight = raw.sum(dim=1)
-        new_open_second = raw.square() / (
-            new_open_weight.unsqueeze(1) + numerical_eps
-        )
-        if commit_existing:
-            new_second = current_second + new_open_second
-        else:
-            new_second = (
-                current_second - previous_open_second
-            ).clamp_min(0.0) + new_open_second
+        # Diagnostic moments exclude the provisional group. Commit its raw
+        # first/second moments only when it actually becomes a closed group.
+        new_variance = self._closed_group_variance(commit_existing)
 
         changed = (
             (self.open_raw_evidence != raw).any(dim=1)
@@ -366,13 +343,6 @@ class SemanticGaussianState:
         new_alpha_raw = closed_raw + raw
         new_alpha_robust = closed_robust + robust
         new_group_count = closed_count + increment
-        new_first = (new_alpha_raw - self.prior()).clamp_min(0.0)
-        new_weight = new_first.sum(dim=1)
-        new_mean = new_first / (new_weight.unsqueeze(1) + numerical_eps)
-        new_variance = (
-            new_second / (new_weight.unsqueeze(1) + numerical_eps)
-            - new_mean.square()
-        ).clamp_min(0.0)
         new_semantic_support = self.semantic_support.clone()
         if support_increment is not None:
             new_semantic_support.add_(support_increment)
@@ -394,9 +364,10 @@ class SemanticGaussianState:
         self.alpha_raw = new_alpha_raw
         self.alpha_robust = new_alpha_robust
         self.group_variance = new_variance
+        self.group_disagreement_source = "online_estimate"
         self.group_disagreement_available = (
             not self.historical_evidence_stale
-            and bool((new_group_count >= 2).any())
+            and bool((closed_count >= 2).any())
         )
         self.group_count = new_group_count
         self.semantic_support = new_semantic_support
@@ -409,10 +380,31 @@ class SemanticGaussianState:
         self.dirty[changed] = True
         self._validate()
 
+    def _closed_group_variance(self, commit_open: bool) -> torch.Tensor:
+        eps = torch.finfo(self.dtype).eps
+        first = (self.alpha_raw - self.prior() - self.open_raw_evidence).clamp_min(0)
+        weight = first.sum(dim=1, keepdim=True)
+        mean = first / weight.clamp_min(eps)
+        second = weight * (self.group_variance + mean.square())
+        if commit_open:
+            open_weight = self.open_raw_evidence.sum(dim=1, keepdim=True)
+            second += self.open_raw_evidence.square() / open_weight.clamp_min(eps)
+            first += self.open_raw_evidence
+            weight = first.sum(dim=1, keepdim=True)
+            mean = first / weight.clamp_min(eps)
+        return (second / weight.clamp_min(eps) - mean.square()).clamp_min(0)
+
     @torch.no_grad()
     def close_open_group(self) -> None:
         """Commit the provisional contribution and forget its replacement data."""
         self._require_valid()
+        if self.open_distributions.shape[0] == 0:
+            return
+        self.group_variance = self._closed_group_variance(commit_open=True)
+        self.group_disagreement_available = (
+            not self.historical_evidence_stale and bool((self.group_count >= 2).any())
+        )
+        self.group_disagreement_source = "online_estimate"
         self.open_raw_evidence.zero_()
         self.open_robust_evidence.zero_()
         self.open_group_count.zero_()
@@ -688,6 +680,7 @@ class SemanticGaussianState:
             "active_projection_dirty": self.active_projection_dirty,
             "historical_evidence_stale": self.historical_evidence_stale,
             "group_disagreement_available": self.group_disagreement_available,
+            "group_disagreement_source": self.group_disagreement_source,
             "gaussian_ids": self.gaussian_ids,
         }
 
@@ -769,6 +762,7 @@ class SemanticGaussianState:
             "active_projection_dirty",
             "historical_evidence_stale",
             "group_disagreement_available",
+            "group_disagreement_source",
             "gaussian_ids",
             "prior_total",
             "topology_version",
@@ -847,6 +841,7 @@ class SemanticGaussianState:
                 open_supports=value.get("open_supports"),
                 open_semantic_supports=value.get("open_semantic_supports"),
                 historical_evidence_stale=value["historical_evidence_stale"],
+                group_disagreement_source=value["group_disagreement_source"],
                 group_disagreement_available=value[
                     "group_disagreement_available"
                 ],
@@ -1257,6 +1252,8 @@ class SemanticGaussianState:
             raise SemanticStateError("{} must be non-negative".format(name))
 
     def _validate(self) -> None:
+        if self.group_disagreement_source not in ("online_estimate", "exact_final"):
+            raise SemanticStateError("invalid group disagreement source")
         if self.alpha_raw.ndim != 2 or self.alpha_raw.shape[1] < 1:
             raise SemanticStateError("alpha_raw must have shape [N, K]")
         if not self.alpha_raw.is_floating_point():

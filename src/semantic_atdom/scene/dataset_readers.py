@@ -12,6 +12,7 @@
 import torch
 import torch.nn.functional as F
 import os
+import struct
 import sys
 from PIL import Image
 from typing import NamedTuple
@@ -28,6 +29,7 @@ from semantic_atdom.utils.camera_calibration import (
     rectify_points,
     rectification_valid_mask,
     rectified_pinhole_from_colmap,
+    projection_matches_retained,
 )
 from semantic_atdom.utils.image_identity import normalize_image_identity
 from semantic_atdom.scene.gaussian_model import BasicPointCloud
@@ -145,36 +147,25 @@ def getNerfppNorm(cam_info):
     return {"translate": translate, "radius": radius}
 
 def compute_barycentric_coords_torch(p, a, b, c):
+    """Screen-space weights without a cancellation-prone Gram determinant.
+
+    A few Delaunay cells are very thin. Evaluate their oriented areas in
+    float64 even when image/world tensors use float32, then let the sampler
+    return geometry in the input point dtype.
     """
-    输入：
-        p: (N, 2)
-        a, b, c: (N, 2)
-    输出：
-        bary_coords: (N, 3)
-    """
-    v0 = b - a  # (N, 2)
-    v1 = c - a
-    v2 = p - a
+    p, a, b, c = (value.to(dtype=torch.float64) for value in (p, a, b, c))
+    first, second, point = b - a, c - a, p - a
 
-    d00 = torch.sum(v0 * v0, dim=1)  # (N,)
-    d01 = torch.sum(v0 * v1, dim=1)
-    d11 = torch.sum(v1 * v1, dim=1)
-    d20 = torch.sum(v2 * v0, dim=1)
-    d21 = torch.sum(v2 * v1, dim=1)
+    def cross(left, right):
+        return left[:, 0] * right[:, 1] - left[:, 1] * right[:, 0]
 
-    denom = d00 * d11 - d01 * d01  # (N,)
+    denominator = cross(first, second)
+    denominator = torch.where(denominator != 0, denominator, float("nan"))
+    v = cross(point, second) / denominator
+    w = cross(first, point) / denominator
+    return torch.stack((1.0 - v - w, v, w), dim=1)
 
-    # 避免除以 0（退化三角形）
-    eps = 1e-8
-    denom = torch.where(denom == 0, torch.ones_like(denom) * eps, denom)
-
-    v = (d11 * d20 - d01 * d21) / denom
-    w = (d00 * d21 - d01 * d20) / denom
-    u = 1.0 - v - w
-
-    return torch.stack([u, v, w], dim=1)  # (N, 3)
-
-def Get_3D_Sampled_Points_GPU(sampled_points, Tri_IDs, tri_simplices, xys, corresponding_3d_points, corresponding_3d_points_rgb, sampled_corresponding_3d_points, sampled_corresponding_3d_points_rgb):
+def Get_3D_Sampled_Points_GPU(sampled_points, Tri_IDs, tri_simplices, xys, corresponding_3d_points, corresponding_3d_points_rgb, sampled_corresponding_3d_points=None, sampled_corresponding_3d_points_rgb=None, *, camera_depths=None):
     """
         使用 PyTorch 实现 GPU 加速的 3D 插值。
 
@@ -215,7 +206,21 @@ def Get_3D_Sampled_Points_GPU(sampled_points, Tri_IDs, tri_simplices, xys, corre
 
         # 计算重心坐标
         bary_coords = compute_barycentric_coords_torch(sampled_points, a2d, b2d, c2d)  # (M, 3)
-        bary_coords = bary_coords.to(dtype=torch.float32, device=device)
+        bary_coords = bary_coords.to(dtype=corresponding_3d_points.dtype, device=device)
+
+        if camera_depths is None:
+            raise ValueError("camera-space depths are required for perspective sampling")
+        depths = torch.as_tensor(camera_depths, device=device, dtype=corresponding_3d_points.dtype)[triangle_indices]
+        edges = triangle_xys[:, 1:] - triangle_xys[:, :1]
+        area = edges[:, 0, 0] * edges[:, 1, 1] - edges[:, 0, 1] * edges[:, 1, 0]
+        valid = (torch.isfinite(depths).all(dim=1) & (depths > 0).all(dim=1)
+                 & torch.isfinite(bary_coords).all(dim=1) & (area.abs() > 1e-12))
+        # Screen-space weights are linear in reciprocal camera depth.
+        weights = bary_coords[valid] / depths[valid]
+        weights = weights / weights.sum(dim=1, keepdim=True)
+        bary_coords = weights
+        a3d, b3d, c3d = a3d[valid], b3d[valid], c3d[valid]
+        a_rgb, b_rgb, c_rgb = a_rgb[valid], b_rgb[valid], c_rgb[valid]
 
         # 插值
         interpolated_3d = (
@@ -249,33 +254,20 @@ def Get_3D_Sampled_Points_GPU(sampled_points, Tri_IDs, tri_simplices, xys, corre
     return all_points_3d, all_colors
 
 def compute_barycentric_coords(p, a, b, c):
-    """
-    计算点 p 相对于三角形 abc 的重心坐标
-    p, a, b, c 都是 2D 点 (x, y)
-    返回 (w1, w2, w3) 重心权重
-    """
-    v0 = b - a
-    v1 = c - a
-    v2 = p - a
+    p, a, b, c = (np.asarray(value, dtype=np.float64) for value in (p, a, b, c))
+    first, second, point = b - a, c - a, p - a
 
-    d00 = np.dot(v0, v0)
-    d01 = np.dot(v0, v1)
-    d11 = np.dot(v1, v1)
-    d20 = np.dot(v2, v0)
-    d21 = np.dot(v2, v1)
+    def cross(left, right):
+        return left[0] * right[1] - left[1] * right[0]
 
-    denom = d00 * d11 - d01 * d01
-    if denom == 0:
-        # 退化三角形，返回默认值
-        return np.array([1.0, 0.0, 0.0])
+    denominator = cross(first, second)
+    if denominator == 0:
+        return np.full(3, np.nan)
+    v = cross(point, second) / denominator
+    w = cross(first, point) / denominator
+    return np.array((1.0 - v - w, v, w))
 
-    v = (d11 * d20 - d01 * d21) / denom
-    w = (d00 * d21 - d01 * d20) / denom
-    u = 1.0 - v - w
-
-    return np.array([u, v, w])
-
-def Get_3D_Sampled_Points(sampled_points, Tri_IDs, tri, xys, corresponding_3d_points, corresponding_3d_points_rgb, sampled_corresponding_3d_points, sampled_corresponding_3d_points_rgb):
+def Get_3D_Sampled_Points(sampled_points, Tri_IDs, tri, xys, corresponding_3d_points, corresponding_3d_points_rgb, sampled_corresponding_3d_points=None, sampled_corresponding_3d_points_rgb=None, *, camera_depths=None):
     time1 = time.time()
 
     # 输出采样点对应的3D坐标
@@ -296,6 +288,17 @@ def Get_3D_Sampled_Points(sampled_points, Tri_IDs, tri, xys, corresponding_3d_po
         # 计算该采样点在三角形中的重心坐标
         bary_coords = compute_barycentric_coords(sample_pt, a2d, b2d, c2d)
 
+        if camera_depths is None:
+            raise ValueError("camera-space depths are required for perspective sampling")
+        depths = np.asarray(camera_depths)[triangle]
+        edges = np.stack((b2d-a2d, c2d-a2d))
+        area = np.linalg.det(edges)
+        if not (np.isfinite(depths).all() and (depths > 0).all()
+                and np.isfinite(bary_coords).all() and abs(area) > 1e-12):
+            continue
+        bary_coords = bary_coords / depths
+        bary_coords /= bary_coords.sum()
+
         # 用重心坐标对3D点插值
         interpolated_point = (
                 bary_coords[0] * a3d +
@@ -313,18 +316,20 @@ def Get_3D_Sampled_Points(sampled_points, Tri_IDs, tri, xys, corresponding_3d_po
         interpolated_3d_points.append(interpolated_point)
         interpolated_colors.append(interpolated_color)
 
-    interpolated_3d_points = np.array(interpolated_3d_points)  # shape (M, 3)
-    interpolated_colors = np.array(interpolated_colors)
+    interpolated_3d_points = np.asarray(interpolated_3d_points).reshape(-1, 3)  # shape (M, 3)
+    interpolated_colors = np.asarray(interpolated_colors).reshape(-1, 3)
 
     time2 = time.time()
 
     print(f"3D Sample Points: {time2 - time1}s, Sampled Point Number: {interpolated_3d_points.shape[0]}")
 
     # 合并 3D 点
-    all_points_3d = np.vstack([sampled_corresponding_3d_points, interpolated_3d_points])  # shape (N+M, 3)
+    all_points_3d = (interpolated_3d_points if sampled_corresponding_3d_points is None
+                     else np.vstack([sampled_corresponding_3d_points, interpolated_3d_points]))
 
     # 合并颜色
-    all_colors = np.vstack([sampled_corresponding_3d_points_rgb, interpolated_colors])  # shape (N+M, 3)
+    all_colors = (interpolated_colors if sampled_corresponding_3d_points_rgb is None
+                  else np.vstack([sampled_corresponding_3d_points_rgb, interpolated_colors]))
 
     return all_points_3d, all_colors
 
@@ -748,7 +753,20 @@ def On_the_Fly_readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder, 
     sys.stdout.write('\n')
     return cam_infos
 
-def SingleImage_readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder, Do_Get_Tri_Mask=False, Image_Name="", CurrentImagesNames=[], Silence=False, No_Key_Region=False):
+_MASK_PREPARATION_STATS = {'retained_camera_masks_skipped': 0}
+
+
+def mask_preparation_statistics():
+    return dict(_MASK_PREPARATION_STATS)
+
+
+def SingleImage_readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder, Do_Get_Tri_Mask=False, Image_Name="", CurrentImagesNames=[], Silence=False, No_Key_Region=False, retained_camera_mappings=None):
+    """Read sparse metadata, optionally omitting unused retained-camera masks.
+
+    A supplied retained mapping uses the trainer's replacement predicate. When
+    it matches, callers must keep the existing RGB tensor/mask; this record
+    carries pose metadata only. Without it, the historical reader is unchanged.
+    """
     cam_infos = []
     point3D_ids_list = {}
     xys_list = {}
@@ -829,7 +847,10 @@ def SingleImage_readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder,
 
         else:
             image = None
-            if Do_Get_Tri_Mask:
+            previous = (None if retained_camera_mappings is None
+                        else retained_camera_mappings.get(image_name))
+            retained = projection_matches_retained(FovX, FovY, calibration, previous)
+            if Do_Get_Tri_Mask and not retained:
                 Tri_Mask = Get_Tri_Mask(
                     extr,
                     width,
@@ -839,7 +860,13 @@ def SingleImage_readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder,
                 )
             else:
                 Tri_Mask = None
-            Tri_Mask = _rectify_training_mask(Tri_Mask, calibration)
+            if retained:
+                # The trainer retains its existing RGB tensor and mask when
+                # this same predicate holds. This metadata-only camera carries
+                # new pose, not another full source-grid mask to discard.
+                _MASK_PREPARATION_STATS['retained_camera_masks_skipped'] += 1
+            else:
+                Tri_Mask = _rectify_training_mask(Tri_Mask, calibration)
 
 
         cam_info = CameraInfo(uid=uid, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
@@ -940,7 +967,7 @@ def On_the_Fly_readColmapSceneInfo(path, images, eval, CurrentImagesNames, llffh
                            ply_path=ply_path)
     return scene_info
 
-def SingleImage_readColmapSceneInfo_Part1(path, images, eval, llffhold=8, Image_Name="", CurrentImagesNames=[], Do_Get_Tri_Mask=False, Diary=None, Silence=False, No_Key_Region=False, NewInputFormat=False, Image_Folder_Path=""):
+def SingleImage_readColmapSceneInfo_Part1(path, images, eval, llffhold=8, Image_Name="", CurrentImagesNames=[], Do_Get_Tri_Mask=False, Diary=None, Silence=False, No_Key_Region=False, NewInputFormat=False, Image_Folder_Path="", retained_camera_mappings=None):
     time1 = time.time()
     if not NewInputFormat:
         try:
@@ -978,6 +1005,7 @@ def SingleImage_readColmapSceneInfo_Part1(path, images, eval, llffhold=8, Image_
                                                                               Do_Get_Tri_Mask=Do_Get_Tri_Mask,
                                                                               CurrentImagesNames=CurrentImagesNames,
                                                                               Silence=Silence,
+                                                                              retained_camera_mappings=retained_camera_mappings,
                                                                               No_Key_Region=No_Key_Region)
 
     time2 = time.time()
@@ -1032,8 +1060,12 @@ def SingleImage_readColmapSceneInfo_Part2(path, train_cam_infos, test_cam_infos,
         txt_path = os.path.join(path, "bin/points3D.txt")
     if Ply_Cache_Path:
         ply_path = os.fspath(Ply_Cache_Path)
+        if Path(ply_path).resolve().is_relative_to(Path(path).resolve()):
+            raise ValueError("point-cloud output cache must be outside source data")
+    else:
+        get_ply = False
 
-    if not os.path.exists(ply_path):
+    if not get_ply or not os.path.exists(ply_path):
         try:
             POINT3D_IDs, xyz, rgb, _ = read_points3D_ID_binary(bin_path)
         except:
@@ -1109,6 +1141,11 @@ def SingleImage_readColmapSceneInfo_Part2(path, train_cam_infos, test_cam_infos,
                 print(f"Find {corresponding_3d_points.shape} + {sampled_corresponding_3d_points.shape} 2D pts to 3D pts => {time2 - time1}s")
             Diary.write(f"Find {corresponding_3d_points.shape} + {sampled_corresponding_3d_points.shape} 2D pts to 3D pts => {time2 - time1}s\n")
 
+            camera_depths = None
+            if len(sampled_points):
+                camera_info = next(c for c in train_cam_infos if c.image_name == key)
+                camera_depths = (corresponding_3d_points @ camera_info.R + camera_info.T)[:, 2]
+
             # 获取用于初始化的稀疏点云
             if device == 'cuda':
                 time1 = time.time()
@@ -1143,7 +1180,8 @@ def SingleImage_readColmapSceneInfo_Part2(path, train_cam_infos, test_cam_infos,
                                                                       corresponding_3d_points,
                                                                       corresponding_3d_points_rgb,
                                                                       sampled_corresponding_3d_points,
-                                                                      sampled_corresponding_3d_points_rgb)
+                                                                      sampled_corresponding_3d_points_rgb,
+                                                                      camera_depths=camera_depths)
                 time2 = time.time()
                 if Tri_IDs is not None:
                     if not Silence:
@@ -1164,7 +1202,7 @@ def SingleImage_readColmapSceneInfo_Part2(path, train_cam_infos, test_cam_infos,
                 Diary.write(f"GPU_tensor to CPU_numpy: {time2 - time1}s\n")
             else:
                 # CPU方法
-                all_points_3d, all_colors = Get_3D_Sampled_Points(sampled_points, Tri_IDs, tri_list[key], xys_list[key], corresponding_3d_points, corresponding_3d_points_rgb, sampled_corresponding_3d_points, sampled_corresponding_3d_points_rgb)
+                all_points_3d, all_colors = Get_3D_Sampled_Points(sampled_points, Tri_IDs, tri_list[key], xys_list[key], corresponding_3d_points, corresponding_3d_points_rgb, sampled_corresponding_3d_points, sampled_corresponding_3d_points_rgb, camera_depths=camera_depths)
 
             if all_points_3d is not None and len(point3D_ids_list) >= 2:
                 all_points_3d_Stack.append(all_points_3d)
@@ -1228,6 +1266,7 @@ def SingleImage_readColmapSceneInfo_Part2(path, train_cam_infos, test_cam_infos,
     return scene_info
 
 def SingleImage_readColmapSceneInfo(path, images, eval, llffhold=8, get_ply=True, Do_Get_Tri_Mask=False, Image_Name="", points_per_triangle=4, device="cuda", CurrentImagesNames=[]):
+    get_ply = False  # Legacy reader has no output-cache parameter.
     try:
         cameras_extrinsic_file = os.path.join(path, "sparse/0", "images.bin")
         cameras_intrinsic_file = os.path.join(path, "sparse/0", "cameras.bin")
@@ -1268,7 +1307,7 @@ def SingleImage_readColmapSceneInfo(path, images, eval, llffhold=8, get_ply=True
     bin_path = os.path.join(path, "sparse/0/points3D.bin")
     txt_path = os.path.join(path, "sparse/0/points3D.txt")
 
-    if not os.path.exists(ply_path):
+    if not get_ply or not os.path.exists(ply_path):
         try:
             POINT3D_IDs, xyz, rgb, _ = read_points3D_ID_binary(bin_path)
         except:
@@ -1280,6 +1319,9 @@ def SingleImage_readColmapSceneInfo(path, images, eval, llffhold=8, get_ply=True
         # 依据三角网进行采样
         sampled_points, Tri_IDs = SamplePointsFromTri(xys, tri, points_per_triangle)
 
+        camera_info = train_cam_infos[0]
+        camera_depths = (corresponding_3d_points @ camera_info.R + camera_info.T)[:, 2]
+
         # 获取用于初始化的稀疏点云
         if device == 'cuda':
             # GPU方法
@@ -1290,20 +1332,20 @@ def SingleImage_readColmapSceneInfo(path, images, eval, llffhold=8, get_ply=True
             corresponding_3d_points = torch.tensor(corresponding_3d_points, dtype=torch.float32, device=device)
             corresponding_3d_points_rgb = torch.tensor(corresponding_3d_points_rgb, dtype=torch.float32, device=device)
 
-            all_points_3d, all_colors = Get_3D_Sampled_Points_GPU(sampled_points, Tri_IDs, tri_simplices, xys, corresponding_3d_points, corresponding_3d_points_rgb)
+            all_points_3d, all_colors = Get_3D_Sampled_Points_GPU(sampled_points, Tri_IDs, tri_simplices, xys, corresponding_3d_points, corresponding_3d_points_rgb, camera_depths=camera_depths)
 
             all_points_3d = all_points_3d.detach().cpu().numpy()
             all_colors = all_colors.detach().cpu().numpy()
         else:
             # CPU方法
-            all_points_3d, all_colors = Get_3D_Sampled_Points(sampled_points, Tri_IDs, tri, xys, corresponding_3d_points, corresponding_3d_points_rgb)
+            all_points_3d, all_colors = Get_3D_Sampled_Points(sampled_points, Tri_IDs, tri, xys, corresponding_3d_points, corresponding_3d_points_rgb, camera_depths=camera_depths)
 
         if get_ply:
             print("Converting point3d.bin to .ply, will happen only the first time you open the scene.")
             # storePly(ply_path, xyz, rgb)
             storePly(ply_path, all_points_3d, all_colors)
         else:
-            plydata = storePly(ply_path, xyz, rgb, False)
+            plydata = storePly(ply_path, all_points_3d, all_colors, False)
             vertices = plydata['vertex']
             positions = np.vstack([vertices['x'], vertices['y'], vertices['z']]).T
             colors = np.vstack([vertices['red'], vertices['green'], vertices['blue']]).T / 255.0
@@ -1368,33 +1410,31 @@ def readColmapSceneInfo(path, images, eval, llffhold=8, get_ply=True, Do_Get_Tri
         ply_path = os.path.join(path, "bin/points3D.ply")
         bin_path = os.path.join(path, "bin/points3D.bin")
         txt_path = os.path.join(path, "bin/points3D.txt")
+    # Source SfM is immutable. A derived PLY may only be written to an
+    # explicitly supplied output cache; otherwise keep the point cloud in RAM.
     if Ply_Cache_Path:
         ply_path = os.fspath(Ply_Cache_Path)
+        if Path(ply_path).resolve().is_relative_to(Path(path).resolve()):
+            raise ValueError("point-cloud output cache must be outside source data")
+    else:
+        get_ply = False
 
-    if not os.path.exists(ply_path):
+    if os.path.exists(ply_path):
+        pcd = fetchPly(ply_path)
+        if not get_ply:
+            ply_path = None
+    else:
         try:
             xyz, rgb, _ = read_points3D_binary(bin_path)
-        except:
+        except (OSError, ValueError, struct.error):
             xyz, rgb, _ = read_points3D_text(txt_path)
-
+        pcd = BasicPointCloud(points=xyz, colors=rgb / 255.0,
+                              normals=np.zeros_like(xyz))
         if get_ply:
-            print("Converting point3d.bin to .ply, will happen only the first time you open the scene.")
-            os.makedirs(os.path.dirname(ply_path), exist_ok=True)
+            os.makedirs(os.path.dirname(os.path.abspath(ply_path)), exist_ok=True)
             storePly(ply_path, xyz, rgb)
         else:
-            plydata = storePly(ply_path, xyz, rgb, False)
-            vertices = plydata['vertex']
-            positions = np.vstack([vertices['x'], vertices['y'], vertices['z']]).T
-            colors = np.vstack([vertices['red'], vertices['green'], vertices['blue']]).T / 255.0
-            normals = np.vstack([vertices['nx'], vertices['ny'], vertices['nz']]).T
-            pcd = BasicPointCloud(points=positions, colors=colors, normals=normals)
             ply_path = None
-
-    if get_ply:
-        try:
-            pcd = fetchPly(ply_path)
-        except:
-            pcd = None
 
     scene_info = SceneInfo(point_cloud=pcd,
                            train_cameras=train_cam_infos,

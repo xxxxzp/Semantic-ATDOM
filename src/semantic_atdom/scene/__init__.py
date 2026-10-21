@@ -14,7 +14,7 @@ import random
 import json
 from pathlib import Path
 from semantic_atdom.utils.system_utils import searchForMaxIteration
-from semantic_atdom.scene.dataset_readers import sceneLoadTypeCallbacks
+from semantic_atdom.scene.dataset_readers import sceneLoadTypeCallbacks, storePly
 from semantic_atdom.scene.gaussian_model import GaussianModel
 from semantic_atdom.utils.general_utils import PILtoTorch
 from semantic_atdom.scene.cameras import Camera
@@ -82,8 +82,13 @@ class Scene:
             assert False, "Could not recognize scene type!"
 
         if not self.loaded_iter:
-            with open(scene_info.ply_path, 'rb') as src_file, open(os.path.join(self.model_path, "input.ply") , 'wb') as dest_file:
-                dest_file.write(src_file.read())
+            input_path = os.path.join(self.model_path, "input.ply")
+            if scene_info.ply_path is not None:
+                with open(scene_info.ply_path, 'rb') as src_file, open(input_path, 'wb') as dest_file:
+                    dest_file.write(src_file.read())
+            else:
+                storePly(input_path, scene_info.point_cloud.points,
+                         scene_info.point_cloud.colors * 255.0)
             json_cams = []
             camlist = []
             if scene_info.test_cameras:

@@ -323,8 +323,9 @@ def validate_final_semantic_outputs(
     *,
     final_stage: int,
     require_map: bool,
+    require_exact: bool = True,
 ) -> Dict[str, Any]:
-    """Validate authoritative semantic outputs before a run is committed."""
+    """Validate final outputs against the requested semantic accuracy policy."""
 
     status_path = layout.semantic_work / "sync_status.json"
     if not status_path.is_file():
@@ -332,7 +333,8 @@ def validate_final_semantic_outputs(
     with status_path.open("r", encoding="utf-8") as stream:
         status = json.load(stream)
     failures = []
-    if status.get("status") != "exact_final":
+    expected_status = "exact_final" if require_exact else "approx_final"
+    if status.get("status") != expected_status:
         failures.append("status={!r}".format(status.get("status")))
     if status.get("geometry_stage") != int(final_stage):
         failures.append("geometry_stage={!r}".format(status.get("geometry_stage")))
@@ -344,7 +346,7 @@ def validate_final_semantic_outputs(
         failures.append(
             "deferred_image_ids={!r}".format(status.get("deferred_image_ids"))
         )
-    if status.get("historical_evidence_stale"):
+    if require_exact and status.get("historical_evidence_stale"):
         failures.append("historical_evidence_stale=true")
     if failures:
         raise RuntimeError(
@@ -385,7 +387,7 @@ def validate_final_semantic_outputs(
         pair_failures.append(
             "publication_status={!r}".format(pair.get("publication_status"))
         )
-    if pair.get("semantic_status") != "exact_final":
+    if pair.get("semantic_status") != expected_status:
         pair_failures.append(
             "semantic_status={!r}".format(pair.get("semantic_status"))
         )
@@ -554,7 +556,7 @@ def archive_semantic_state(layout: RunLayout) -> Dict[str, Any]:
             geometry_source, layout.semantic_model / "geometry.pt"
         ),
     }
-    for name in ("ledger.json", "sync_status.json", "final_rebuild_metrics.json"):
+    for name in ("ledger.json", "sync_status.json", "final_rebuild_metrics.json", "final_semantic_metadata.json"):
         candidate = source / name
         if candidate.is_file():
             records[name.removesuffix(".json")] = copy_file_verified(

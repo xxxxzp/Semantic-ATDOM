@@ -177,6 +177,7 @@ class FinalSemanticRebuilder:
         ).clamp_min(0.0)
         state.alpha_raw = raw
         state.alpha_robust = robust
+        state.group_disagreement_source = "exact_final"
         state.group_variance = disagreement
         state.group_count = group_count
         state.semantic_support = semantic_support

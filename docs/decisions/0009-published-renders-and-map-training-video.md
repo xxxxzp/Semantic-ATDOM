@@ -2,6 +2,7 @@
 status: accepted
 date: 2026-09-17
 supersedes: output naming and progressive-video sections of 0008
+amended_by: 0011-ordered-progress-capture-and-label-reuse
 ---
 
 # Publish explicit renders and one synchronized map-training video

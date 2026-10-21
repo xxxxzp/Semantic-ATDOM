@@ -2,6 +2,9 @@ import os
 import hashlib
 import csv
 from queue import Empty
+from semantic_atdom.utils.progress_capture import ProgressCapture
+from semantic_atdom.semantics.orchestrator import FrozenCameraSnapshot
+from semantic_atdom.utils.worker_supervision import WorkerGroup
 import random
 from pathlib import Path
 import torch
@@ -42,10 +45,12 @@ import math
 import time
 from semantic_atdom.scene.cameras import Camera, DummyCamera, DummyPipeline
 from semantic_atdom.utils.camera_utils import camera_to_JSON, resize_camera_mask, loadCam
+from semantic_atdom.utils.camera_calibration import projection_matches_retained
 from semantic_atdom.utils.pixel_grid import PIXEL_GRID_VERSION
 import json
 from semantic_atdom.scene.dataset_readers import (
     load_rectified_image,
+    mask_preparation_statistics,
     sceneLoadTypeCallbacks,
 )
 from semantic_atdom.scene.progressive_layout import (
@@ -118,21 +123,9 @@ TRAINING_PROGRESS_UPDATE_INTERVAL = 10
 def camera_image_mapping_changed(camera_info, previous):
     """Return whether a retained RGB tensor needs the new rectification map."""
 
-    return not (
-        math.isclose(
-            camera_info.FovX,
-            previous["FoVx"],
-            rel_tol=0.0,
-            abs_tol=1e-12,
-        )
-        and math.isclose(
-            camera_info.FovY,
-            previous["FoVy"],
-            rel_tol=0.0,
-            abs_tol=1e-12,
-        )
-        and camera_info.calibration == previous.get("calibration")
-    )
+    return not projection_matches_retained(
+        camera_info.FovX, camera_info.FovY, camera_info.calibration, previous)
+
 
 
 def trainable_cameras(cameras):
@@ -341,6 +334,8 @@ def GetArgs():
     parser.add_argument(
         "--training_progress_target_frames", type=int, default=120
     )
+    parser.add_argument("--worker_shutdown_timeout", type=float, default=300.0,
+                        help="Maximum seconds to drain each worker during shutdown.")
     parser.add_argument("--training_progress_fps", type=float, default=4.0)
     parser.add_argument(
         "--recovery_checkpoint_every_stages", type=int, default=0
@@ -360,6 +355,8 @@ def GetArgs():
         )
     '''以上是在构建参数配置器'''
 
+    if not math.isfinite(args.worker_shutdown_timeout) or args.worker_shutdown_timeout <= 0:
+        raise ValueError("--worker_shutdown_timeout must be positive and finite")
     if args.training_progress_target_frames < 3:
         raise ValueError(
             "--training_progress_target_frames must be at least 3"
@@ -373,6 +370,11 @@ def GetArgs():
     if args.render_training_progress and not args.enable_semantics:
         raise ValueError(
             "--render_training_progress requires --enable_semantics"
+        )
+    if (args.enable_semantics and args.semantic_tdom_planar_fallback_class.strip()
+            and not args.semantic_final_rebuild):
+        raise ValueError(
+            "--semantic_tdom_planar_fallback_class requires --semantic_final_rebuild"
         )
     if args.render_training_progress and not args.render_TDOM:
         raise ValueError(
@@ -449,7 +451,8 @@ def semantic_online_required(args):
     return bool(
         args.enable_semantics
         and (
-            not args.semantic_tdom_final_only
+            not getattr(args, "semantic_final_rebuild", False)
+            or not args.semantic_tdom_final_only
             or args.semantic_checkpoint_interval > 0
             or args.render_training_progress
         )
@@ -936,14 +939,19 @@ class DataPreProccesser(mp.Process):
 
     def _ensure_trainer_alive(self):
         """Fail promptly if the training child exited without a stop message."""
-        process = self.GaussianTrainer_process
-        if process is not None and not process.is_alive():
-            process.join(timeout=0)
-            raise RuntimeError(
-                "GaussianTrainer exited unexpectedly with code {}".format(
-                    process.exitcode
+        supervisor = getattr(self, "worker_group", None)
+        if supervisor is not None:
+            supervisor.check()
+            return
+        for name, process in (
+            ("GaussianTrainer", self.GaussianTrainer_process),
+            ("output", getattr(self, "DataSaver_process", None)),
+        ):
+            if process is not None and not process.is_alive():
+                process.join(timeout=0)
+                raise RuntimeError(
+                    f"{name} worker exited unexpectedly with code {process.exitcode}"
                 )
-            )
 
     def _wait_for_trainer_message(self, timeout=0.1):
         """Block without busy-spinning while retaining child health checks."""
@@ -991,7 +999,8 @@ class DataPreProccesser(mp.Process):
                 Silence=self.Silence,
                 No_Key_Region=self.args.No_Key,
                 NewInputFormat=NewInputFormat,
-                Image_Folder_Path=self.args.Image_Folder_Path)
+                Image_Folder_Path=self.args.Image_Folder_Path,
+                retained_camera_mappings=TrainCameras)
         elif os.path.exists(os.path.join(self.args.source_path_second, "bin")):
             NewInputFormat = True
             CurrentImagesNames = list(TrainCameras.keys())
@@ -1007,7 +1016,8 @@ class DataPreProccesser(mp.Process):
                 Silence=self.Silence,
                 No_Key_Region=self.args.No_Key,
                 NewInputFormat=NewInputFormat,
-                Image_Folder_Path=self.args.Image_Folder_Path)
+                Image_Folder_Path=self.args.Image_Folder_Path,
+                retained_camera_mappings=TrainCameras)
         else:
             assert False, "Could not recognize scene type!"
 
@@ -1529,6 +1539,10 @@ class GaussianTrainer(mp.Process):
                 save_probabilities=(
                     self.args.semantic_tdom_save_probabilities
                 ),
+                save_class_ids=self.args.semantic_tdom_save_class_ids,
+                save_masks=self.args.semantic_tdom_save_masks,
+                save_evidence=self.args.semantic_tdom_save_evidence,
+                save_entropy=self.args.semantic_tdom_save_entropy,
                 max_output_bytes=self.args.semantic_tdom_max_output_bytes,
                 min_free_cuda_bytes=(
                     self.args.semantic_tdom_min_free_cuda_bytes
@@ -1581,6 +1595,7 @@ class GaussianTrainer(mp.Process):
                 semantic_dataset_root=semantic_dataset_root,
                 publication_policy=self.semantic_publication_policy,
                 resume=not force_fresh,
+                final_rebuild=self.args.semantic_final_rebuild,
                 final_authoritative_complete=(
                     self.args.semantic_authoritative_exact_complete
                 ),
@@ -1655,6 +1670,10 @@ class GaussianTrainer(mp.Process):
                 "map publication request is invalid; semantic fusion "
                 "continues: {}".format(error)
             )
+        capture = None
+        capture_started = time.perf_counter()
+        if not final and self._training_progress_due(expected_training_type):
+            capture = self._make_training_progress_capture(expected_training_type)
         try:
             result = hook.synchronize(
                 geometry_stage=self.imagenum,
@@ -1663,7 +1682,16 @@ class GaussianTrainer(mp.Process):
                 snapshot_root=snapshot_root,
                 final=final,
                 publication_request=publication_request,
+                on_synchronized=capture,
             )
+            if capture is not None:
+                self._queued_progress_capture = (
+                    (int(self.imagenum), expected_training_type),
+                    dict(requested=True, asynchronous=True, semantic_wait_seconds=0.0,
+                         rgb_tdom_seconds=0.0, semantic_tdom_seconds=0.0,
+                         frame_enqueue_seconds=0.0,
+                         capture_submit_seconds=time.perf_counter()-capture_started,
+                         capture_backpressure_seconds=hook.last_capture_backpressure_seconds))
             self.last_semantic_sync_result = result
             print(
                 "Semantic sync [{}]: geometry={}, through={}, lag={}, map={}".format(
@@ -1687,6 +1715,10 @@ class GaussianTrainer(mp.Process):
             if final:
                 self.gaussians.set_topology_observer(None)
                 hook.close()
+                prepared = getattr(hook.core.projector, "prepared_labels", None)
+                write_json_atomic(Path(self.args.metrics_dir) / "semantic_pipeline.json",
+                    dict(schema_version=1, captures=dict(hook.capture_stats),
+                         prepared_labels=None if prepared is None else dict(prepared.stats)))
             return result
         except Exception as error:
             SemanticWarning(
@@ -1789,6 +1821,8 @@ class GaussianTrainer(mp.Process):
         self._run_semantic_hook("initialization")
         with torch.no_grad():
             self._capture_training_progress_tdom("Initialization")
+        if self.args.render_training_progress and self.semantic_hook is not None:
+            self.semantic_hook.wait_for_idle()
 
         # 向前端传递信息，表示初始训练已经完成，可以开始读取后续的影像
         self.SendImagePos_to_DataPreProccesser(True)
@@ -2046,61 +2080,10 @@ class GaussianTrainer(mp.Process):
             height,
         )
 
-    def _capture_training_progress_tdom(self, training_type, final=False):
-        timing = {
-            "requested": False,
-            "semantic_wait_seconds": 0.0,
-            "rgb_tdom_seconds": 0.0,
-            "semantic_tdom_seconds": 0.0,
-            "frame_enqueue_seconds": 0.0,
-        }
-        if not self._training_progress_due(training_type, final=final):
-            return timing
-        timing["requested"] = True
+    def _make_training_progress_capture(self, training_type, final=False):
         if self.TDOM_Cam is None or self.TDOM_alignment is None:
-            raise RuntimeError(
-                "training progress frame is due but its TDOM camera is missing"
-            )
-        if self.semantic_hook is None or self.last_semantic_sync_result is None:
-            raise RuntimeError(
-                "training progress frame requires a synchronized semantic state"
-            )
-        started = time.perf_counter()
-        self.semantic_hook.wait_for_idle()
-        timing["semantic_wait_seconds"] = time.perf_counter() - started
-        committed_status = self.semantic_hook.current_status(self.imagenum)
-        semantic_through = committed_status.semantic_through_image
-        if semantic_through is None or int(committed_status.lag_batches) != 0:
-            raise RuntimeError(
-                "training progress semantic state is not exact for stage {} "
-                "(through={}, lag={})".format(
-                    self.imagenum,
-                    semantic_through,
-                    committed_status.lag_batches,
-                )
-            )
-
+            raise RuntimeError("training progress frame is due but its TDOM camera is missing")
         camera = self._training_progress_camera()
-        started = time.perf_counter()
-        rendered = rasterize_rgb_tdom_striped(
-            self.gaussians,
-            camera,
-            self.background,
-            self.semantic_tdom_config,
-        )
-        rgb_output = tdom_to_uint8(rendered)
-        timing["rgb_tdom_seconds"] = time.perf_counter() - started
-        # The striped renderer has already copied the completed RGB map to the
-        # host.  Drop its CUDA working set before semantic TDOM sizes its own
-        # fixed buffers; otherwise the allocator cache can make reclaimable
-        # RGB binning memory look unavailable and fail a valid frame.
-        del rendered
-        torch.cuda.empty_cache()
-        started = time.perf_counter()
-        semantic_output = self._semantic_progress_frame(camera)
-        timing["semantic_tdom_seconds"] = time.perf_counter() - started
-        torch.cuda.empty_cache()
-
         cameras = sorted(
             self.scene.getTrainCameras(), key=self._camera_order_key
         )
@@ -2140,13 +2123,6 @@ class GaussianTrainer(mp.Process):
                     / float(denominator),
                 ),
             ),
-            "semantic_through_image": semantic_through,
-            "semantic_status": committed_status.status,
-            "semantic_lag_batches": int(committed_status.lag_batches),
-            "semantic_historical_evidence_stale": bool(
-                committed_status.historical_evidence_stale
-            ),
-            "semantic_errors": list(committed_status.errors),
             "window": self.TDOM_alignment["window"],
             "grid": grid,
             "map_downsample": TRAINING_PROGRESS_MAP_DOWNSAMPLE,
@@ -2154,41 +2130,37 @@ class GaussianTrainer(mp.Process):
             "row_plane_direction": row_direction,
             "trajectory_pixels": trajectory_pixels,
         }
-        started = time.perf_counter()
-        self.DataSaver_queue.put(
-            ["SaveTrainingProgress", rgb_output, semantic_output, metadata]
-        )
-        timing["frame_enqueue_seconds"] = time.perf_counter() - started
-        del rgb_output, semantic_output, camera
-        return timing
+        # Everything captured here belongs to this training boundary. No live
+        # trainer/model/camera references are read by the background callback.
+        return ProgressCapture(
+            FrozenCameraSnapshot(camera), self.background.detach().clone(),
+            self.semantic_tdom_config, copy.deepcopy(metadata), self.DataSaver_queue,
+            time.perf_counter())
 
-    def _semantic_progress_frame(self, camera):
-        if self.semantic_hook is None:
-            raise RuntimeError(
-                "semantic progress video requested without a valid semantic state"
-            )
+    def _capture_training_progress_tdom(self, training_type, final=False):
+        timing = dict(requested=False, semantic_wait_seconds=0.0,
+                      rgb_tdom_seconds=0.0, semantic_tdom_seconds=0.0,
+                      frame_enqueue_seconds=0.0, capture_backpressure_seconds=0.0,
+                      capture_submit_seconds=0.0, asynchronous=False)
+        if not self._training_progress_due(training_type, final=final):
+            return timing
+        if not final:
+            queued = getattr(self, "_queued_progress_capture", None)
+            if queued is None or queued[0] != (int(self.imagenum), training_type):
+                raise RuntimeError("training progress stage was not queued with semantic synchronization")
+            self._queued_progress_capture = None
+            return queued[1]
+        if self.semantic_hook is None or self.last_semantic_sync_result is None:
+            raise RuntimeError("training progress requires a synchronized semantic state")
+        started = time.perf_counter()
         self.semantic_hook.wait_for_idle()
-        core = self.semantic_hook.core
-        result = rasterize_semantic_tdom(
-            self.gaussians,
-            core.orchestrator.state,
-            camera,
-            core.dataset.class_spec,
-            config=self.semantic_tdom_config,
-        )
-        if result.colors is not None:
-            return result.colors.permute(1, 2, 0).detach().cpu().numpy()
-        palette = self.semantic_tdom_config.render_palette
-        if palette is None:
-            palette = tuple(
-                item.color for item in core.dataset.class_spec.classes
-            )
-        palette = np.asarray(palette, dtype=np.uint8)
-        class_ids = result.class_ids.detach().cpu().numpy().astype(np.int64)
-        colors = palette[np.clip(class_ids, 0, len(palette) - 1)]
-        unknown = result.unknown_mask.detach().cpu().numpy()
-        colors[unknown] = 0
-        return colors
+        timing['semantic_wait_seconds'] = time.perf_counter() - started
+        status = self.semantic_hook.current_status(self.imagenum)
+        capture = self._make_training_progress_capture(training_type, final=True)
+        measured = capture(self.semantic_hook.core, self.gaussians, status)
+        timing.update(requested=True, rgb_tdom_seconds=measured['rgb_tdom_seconds'],
+                      semantic_tdom_seconds=measured['semantic_tdom_seconds'])
+        return timing
 
     # 3DGS模型训练核心函数
     def Train_Gaussians(self, iteration, Training_Type):
@@ -2864,6 +2836,10 @@ class GaussianTrainer(mp.Process):
         random.seed(0)
         np.random.seed(0)
         torch.manual_seed(0)
+        # Configure this process before starting the semantic executor. Keep
+        # OpenCV preprocessing within the existing Torch/OMP CPU budget rather
+        # than changing its global thread policy inside concurrent projections.
+        cv2.setNumThreads(max(1, torch.get_num_threads()))
         torch.cuda.set_device(
             torch.device("cuda:{}".format(int(self.args.gpu)))
         )
@@ -3706,13 +3682,14 @@ class On_the_Fly_GS:
                 ),
                 "semantic_checkpoint_interval": args.semantic_checkpoint_interval,
                 "semantic_online": semantic_online_required(args),
+                "semantic_final_rebuild": bool(args.semantic_final_rebuild),
                 "skip_final_evaluation": bool(args.skip_final_evaluation),
             },
         )
         self.layout.write_config(vars(args))
         self.DataPreProccesser_queue = mp.Queue()
         self.GaussianTrainer_queue = mp.Queue()
-        self.DataSaver_queue = mp.Queue()
+        self.DataSaver_queue = mp.Queue(maxsize=2)
 
         self.DataPreProccesser = DataPreProccesser(args, lp, op, pp)
         self.DataPreProccesser.DataPreProccesser_queue = self.DataPreProccesser_queue
@@ -3772,41 +3749,34 @@ class On_the_Fly_GS:
 
         print("Start Thread...\n")
         self.GaussianTrainer_Thread = mp.Process(target=self.GaussianTrainer.run)
-        self.GaussianTrainer_Thread.start()
-        self.DataPreProccesser.GaussianTrainer_process = (
-            self.GaussianTrainer_Thread
-        )
         self.DataSaver_Thread = mp.Process(target=self.DataSaver.run)
-        self.DataSaver_Thread.start()
+        workers = WorkerGroup({
+            "trainer": self.GaussianTrainer_Thread,
+            "output": self.DataSaver_Thread,
+        }, timeout=args.worker_shutdown_timeout)
+        self.DataPreProccesser.worker_group = workers
+        self.DataPreProccesser.GaussianTrainer_process = self.GaussianTrainer_Thread
+        self.DataPreProccesser.DataSaver_process = self.DataSaver_Thread
         try:
+            self.GaussianTrainer_Thread.start()
+            self.DataSaver_Thread.start()
             self.DataPreProccesser.run()
+            write_json_atomic(Path(self.GaussianTrainer.args.metrics_dir) / "data_preprocessing.json",
+                              mask_preparation_statistics())
+            workers.stop("trainer", self.GaussianTrainer_queue)
+            workers.stop("output", self.DataSaver_queue)
         except BaseException:
-            if self.GaussianTrainer_Thread.is_alive():
-                self.GaussianTrainer_Thread.terminate()
-            self.GaussianTrainer_Thread.join()
-            self.DataSaver_queue.put(["stop"])
-            self.DataSaver_Thread.join(timeout=5)
-            if self.DataSaver_Thread.is_alive():
-                self.DataSaver_Thread.terminate()
-                self.DataSaver_Thread.join()
+            workers.abort()
             raise
-
-        self.GaussianTrainer_queue.put(["stop"])
-        self.GaussianTrainer_Thread.join()
-        if self.GaussianTrainer_Thread.exitcode != 0:
-            raise RuntimeError(
-                "Gaussian trainer exited with code {}".format(
-                    self.GaussianTrainer_Thread.exitcode
-                )
-            )
-        self.DataSaver_queue.put(["stop"])
-        self.DataSaver_Thread.join()
-        if self.DataSaver_Thread.exitcode != 0:
-            raise RuntimeError(
-                "output worker exited with code {}".format(
-                    self.DataSaver_Thread.exitcode
-                )
-            )
+        finally:
+            for queue in (
+                self.DataPreProccesser_queue,
+                self.GaussianTrainer_queue,
+                self.DataSaver_queue,
+            ):
+                # Never wait for an undrainable feeder during error cleanup.
+                queue.cancel_join_thread()
+                queue.close()
         artifacts, final_stage, optimizer_iteration = self._finalize_success()
         subprocess.run(
             [
@@ -3927,13 +3897,17 @@ class On_the_Fly_GS:
                 self.layout,
                 final_stage=final_stage,
                 require_map=bool(self.GaussianTrainer.args.render_TDOM),
+                require_exact=bool(self.GaussianTrainer.args.semantic_final_rebuild),
             )
             records["semantic_model"] = archive_semantic_state(self.layout)
-            schema_source = (
-                Path(self.GaussianTrainer.args.semantic_data_root)
-                / "semantic"
-                / "class_spec.json"
-            )
+            schema_source = self.layout.semantic_work / "validated_schema.json"
+            if not schema_source.is_file():
+                raise RuntimeError("validated final semantic schema is missing")
+            with (self.layout.semantic_work / "final_semantic_metadata.json").open() as stream:
+                final_semantic_metadata = json.load(stream)
+            if (SemanticClassSpec.load(schema_source).fingerprint
+                    != final_semantic_metadata.get("class_spec_sha256")):
+                raise RuntimeError("validated final semantic schema identity changed")
             if schema_source.is_file():
                 schema_destination = self.layout.semantic_model / "schema.json"
                 shutil.copy2(schema_source, schema_destination)
@@ -3968,6 +3942,7 @@ class On_the_Fly_GS:
             "semantic_rebuild": (
                 self.layout.semantic_model / "final_rebuild_metrics.json"
             ),
+            "semantic_finalization": self.layout.semantic_model / "final_semantic_metadata.json",
         }
         for key, path in sources.items():
             if path.is_file():

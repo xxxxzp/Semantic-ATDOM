@@ -348,7 +348,7 @@ class OnlineSemanticOrchestratorTests(unittest.TestCase):
     def test_online_group_disagreement_tracks_raw_group_moments(self):
         state = SemanticGaussianState.initialize(1, 2)
         runner = OnlineSemanticOrchestrator(
-            state, CLASS_SPEC, OnlineSemanticConfig(max_group_size=1)
+            state, CLASS_SPEC, OnlineSemanticConfig(max_group_size=4)
         )
         matrix = overlap(["000001", "000002"])
 
@@ -356,10 +356,23 @@ class OnlineSemanticOrchestratorTests(unittest.TestCase):
         self.assertFalse(state.group_disagreement_available)
         runner.ingest(observation("000002"), projection([0, 1], 1), matrix)
 
+        self.assertFalse(state.group_disagreement_available)
+        torch.testing.assert_close(state.group_variance, torch.zeros(1, 2))
+        runner.close_group()
         self.assertTrue(state.group_disagreement_available)
         torch.testing.assert_close(
             state.group_variance, torch.tensor([[0.25, 0.25]])
         )
+
+    def test_open_group_does_not_change_closed_group_diagnostic(self):
+        state = SemanticGaussianState.initialize(1, 2)
+        runner = OnlineSemanticOrchestrator(state, CLASS_SPEC, OnlineSemanticConfig(max_group_size=4))
+        matrix = overlap(["000001", "000002", "000003"])
+        runner.ingest(observation("000001"), projection([1, 0], 1), matrix)
+        runner.ingest(observation("000002"), projection([0, 1], 1), matrix)
+        runner.ingest(observation("000003"), projection([1, 0], 1), matrix)
+        self.assertTrue(state.group_disagreement_available)
+        torch.testing.assert_close(state.group_variance, torch.tensor([[.25, .25]]))
 
     def test_ledger_is_idempotent_and_rejects_changed_hash_for_same_key(self):
         state = SemanticGaussianState.initialize(1, 2)
@@ -502,6 +515,75 @@ class OnlineSemanticOrchestratorTests(unittest.TestCase):
 
 
 class ProgressiveSemanticHookTests(unittest.TestCase):
+    def test_final_online_preserves_closed_evidence_without_reprojection(self):
+        class Gaussians:
+            _xyz = torch.zeros((1, 3))
+            _features_dc = torch.zeros((1, 1, 3))
+            _features_rest = torch.zeros((1, 0, 3))
+            _opacity = torch.zeros((1, 1))
+            _scaling = torch.zeros((1, 3))
+            _rotation = torch.tensor([[1., 0., 0., 0.]])
+            @property
+            def get_xyz(self): return self._xyz
+
+        class Projector:
+            calls = 0
+            def project(self, gaussians, camera, item):
+                self.calls += 1
+                return projection([0., 1.], 1.)
+
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            semantic = root / "semantic"
+            (semantic / "labels").mkdir(parents=True)
+            (semantic / "metadata").mkdir()
+            (semantic / "class_spec.json").write_text(json.dumps(CLASS_SPEC_VALUE))
+            label = semantic / "labels/000001.png"
+            Image.fromarray(np.zeros((1, 1), dtype=np.uint8)).save(label)
+            metadata = observation("000001").metadata.copy()
+            metadata["label_sha256"] = sha256_file(label)
+            (semantic / "metadata/000001.json").write_text(json.dumps(metadata))
+            sparse = root / "1/sparse/0"
+            sparse.mkdir(parents=True)
+            (sparse / "imagesNames.txt").write_text("000001\n")
+            (sparse / "imageMatchMatrix.txt").write_text("100\n")
+            dataset = SemanticDataset(root)
+            runner = OnlineSemanticOrchestrator(
+                SemanticGaussianState.initialize(1, 2), CLASS_SPEC,
+                OnlineSemanticConfig(max_group_size=1),
+            )
+            projector = Projector()
+            hook = ProgressiveSemanticHook(dataset, runner, projector, root / "output")
+            hook.final_rebuild = False
+            model = Gaussians()
+            camera = type("Camera", (), {"image_name": "000001"})()
+            camera.image_name = "000001"
+            camera.image_height = camera.image_width = 1
+            camera.FoVx = camera.FoVy = 1.
+            camera.world_view_transform = camera.full_proj_transform = torch.eye(4)
+            camera.camera_center = torch.zeros(3)
+            asynchronous = AsyncProgressiveSemanticHook(hook)
+            self.addCleanup(asynchronous.close)
+            asynchronous.synchronize(1, [camera], model, root / "1")
+            asynchronous.wait_for_idle()
+            asynchronous.begin_final()
+            asynchronous.wait_for_idle()
+            before = hook.orchestrator.state.alpha_robust.clone()
+            model._xyz = model._xyz + .1
+            calls = projector.calls
+            (root / "output/final_rebuild_metrics.json").write_text('{"old_attempt": true}')
+            result = asynchronous.synchronize(2, [camera], model, root / "1", final=True)
+            self.assertEqual(result.status, "approx_final")
+            self.assertEqual(asynchronous.current_status(2).status, "approx_final")
+            self.assertEqual(result.errors, ())
+            self.assertEqual(projector.calls, calls)
+            torch.testing.assert_close(hook.orchestrator.state.alpha_robust, before)
+            self.assertTrue(result.historical_evidence_stale)
+            self.assertFalse((root / "output/final_rebuild_metrics.json").exists())
+            payload = json.loads((root / "output/final_semantic_metadata.json").read_text())
+            self.assertEqual(payload["mode"], "online")
+            self.assertEqual(payload["class_spec_sha256"], CLASS_SPEC.fingerprint)
+
     def test_online_config_declares_evidence_method_and_schema(self):
         payload = OnlineSemanticConfig().to_dict()
 

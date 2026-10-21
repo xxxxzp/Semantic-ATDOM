@@ -1,6 +1,7 @@
 ---
 status: accepted
 date: 2026-09-16
+amended_by: 0012 minimal default map products
 ---
 
 > The public naming and progressive-video sections are superseded by ADR 0009

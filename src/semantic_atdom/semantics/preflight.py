@@ -13,7 +13,7 @@ import numpy as np
 from PIL import Image
 
 from semantic_atdom.semantics.inputs import AcquisitionOverlap
-from semantic_atdom.semantics.schema import SemanticDataset, SemanticSchemaError, sha256_file
+from semantic_atdom.semantics.schema import SemanticDataset, SemanticSchemaError, sha256_file, generation_fingerprint
 from semantic_atdom.utils.image_identity import normalize_image_identity
 from semantic_atdom.utils.atomic_io import write_json_atomic
 
@@ -329,6 +329,8 @@ def run_dataset_preflight(
                 "image_id": image_id,
                 "label_version": observation.key.label_version,
                 "label_sha256": observation.metadata["label_sha256"],
+                "generation_sha256": generation_fingerprint(observation.metadata),
+                "score_sha256": observation.metadata.get("score_sha256"),
                 "rgb_sha256": rgb_hash,
                 "source_binding": (
                     "verified" if image_id in source_verified else "unverified"

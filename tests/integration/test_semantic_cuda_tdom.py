@@ -363,6 +363,19 @@ class SemanticCudaTdomTests(unittest.TestCase):
                 min_free_cuda_bytes=0, save_diagnostics=True
             ),
         )
+        self.assertEqual(result.metrics["group_disagreement_status"], "online_estimate")
+        state.group_disagreement_source = "exact_final"
+        exact = rasterize_semantic_tdom(
+            Gaussians(), state, camera, self._two_class_spec(),
+            config=SemanticTdomConfig(min_free_cuda_bytes=0, save_diagnostics=True),
+        )
+        self.assertEqual(exact.metrics["group_disagreement_status"], "exact_final")
+        state.open_group_count[0] = 1
+        provisional = rasterize_semantic_tdom(
+            Gaussians(), state, camera, self._two_class_spec(),
+            config=SemanticTdomConfig(min_free_cuda_bytes=0, save_diagnostics=True),
+        )
+        self.assertTrue(bool(torch.isnan(provisional.group_disagreement).all()))
         valid = torch.isfinite(result.group_disagreement)
 
         self.assertTrue(bool(valid.any()))

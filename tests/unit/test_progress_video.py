@@ -124,77 +124,44 @@ class ProgressVideoTests(unittest.TestCase):
                 450,
             )
 
-    def test_progress_frame_uses_striped_rgb_and_releases_before_semantics(self):
+    def test_progress_capture_renders_one_boundary_without_waiting_on_live_trainer(self):
+        from semantic_atdom.utils.progress_capture import ProgressCapture
+        from semantic_atdom.semantics.orchestrator import SemanticSyncResult
+        import time
+        queue = mock.Mock()
+        capture = ProgressCapture(object(), torch.zeros(3), object(),
+            dict(stage=1, iteration=100, phase="on_the_fly"), queue, time.perf_counter())
+        core = SimpleNamespace(orchestrator=SimpleNamespace(state=object()),
+                               dataset=SimpleNamespace(class_spec=object()))
+        status = SemanticSyncResult(1, "000001", (), (), 0, True, ())
+        geometry = object()
+        with mock.patch("semantic_atdom.utils.progress_capture.rasterize_rgb_tdom_striped",
+                        return_value=torch.zeros(3, 2, 2)) as rgb, mock.patch(
+            "semantic_atdom.utils.progress_capture.semantic_frame", return_value=np.zeros((2, 2, 3), dtype=np.uint8)) as semantic:
+            timing = capture(core, geometry, status)
+        rgb.assert_called_once_with(geometry, capture.camera, capture.background, capture.config)
+        semantic.assert_called_once_with(geometry, core.orchestrator.state, capture.camera,
+                                         core.dataset.class_spec, capture.config)
+        message = queue.put.call_args.args[0]
+        self.assertEqual(message[3]['stage'], 1)
+        self.assertEqual(message[3]['semantic_lag_batches'], 0)
+        self.assertGreaterEqual(timing['result_ready_seconds'], 0)
+
+    def test_queued_progress_capture_never_waits_on_semantic_worker(self):
         trainer = object.__new__(GaussianTrainer)
-        trainer.TDOM_Cam = object()
-        trainer.TDOM_alignment = {
-            "window": {"grid_id": "grid-a"},
-            "grid": {
-                "origin_world": [0.0, 0.0, 0.0],
-                "pixel_x_axis_world": [1.0, 0.0, 0.0],
-                "pixel_y_axis_world": [0.0, 1.0, 0.0],
-            },
-        }
-        status = SimpleNamespace(
-            semantic_through_image="camera-1",
-            lag_batches=0,
-            status="approx_online",
-            historical_evidence_stale=False,
-            errors=(),
-        )
-        trainer.semantic_hook = SimpleNamespace(
-            wait_for_idle=lambda: None,
-            current_status=lambda _stage: status,
-        )
-        trainer.last_semantic_sync_result = object()
         trainer.imagenum = 1
-        trainer.AlreadyTrainingIterations = 100
+        trainer.args = SimpleNamespace(render_training_progress=True)
         trainer.training_progress_stages = {1}
-        trainer.args = SimpleNamespace(
-            render_training_progress=True,
-            StartFromImageNo=1,
-            EndAtImageNo=2,
-        )
-        trainer.gaussians = object()
-        trainer.background = object()
-        trainer.semantic_tdom_config = object()
-        trainer.scene = SimpleNamespace(getTrainCameras=lambda: [])
-        trainer.DataSaver_queue = mock.Mock()
-        camera = object()
-        semantic_frame = np.zeros((2, 2, 3), dtype=np.uint8)
-
-        with mock.patch.object(
-            trainer, "_training_progress_camera", return_value=camera
-        ), mock.patch.object(
-            trainer,
-            "_project_world_points",
-            side_effect=[[], [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]]],
-        ), mock.patch.object(
-            trainer, "_semantic_progress_frame", return_value=semantic_frame
-        ) as semantic_render, mock.patch(
-            "tools.train_progressive.rasterize_rgb_tdom_striped",
-            return_value=torch.zeros((3, 2, 2)),
-        ) as striped_rgb, mock.patch(
-            "tools.train_progressive.render"
-        ) as full_frame_rgb, mock.patch(
-            "tools.train_progressive.torch.cuda.empty_cache"
-        ) as empty_cache:
-            timing = trainer._capture_training_progress_tdom("On_The_Fly")
-
-        striped_rgb.assert_called_once_with(
-            trainer.gaussians,
-            camera,
-            trainer.background,
-            trainer.semantic_tdom_config,
-        )
-        full_frame_rgb.assert_not_called()
-        semantic_render.assert_called_once_with(camera)
-        self.assertEqual(empty_cache.call_count, 2)
-        trainer.DataSaver_queue.put.assert_called_once()
-        self.assertTrue(timing["requested"])
-        self.assertGreaterEqual(timing["semantic_wait_seconds"], 0.0)
-        self.assertGreaterEqual(timing["rgb_tdom_seconds"], 0.0)
-        self.assertGreaterEqual(timing["semantic_tdom_seconds"], 0.0)
+        trainer.semantic_hook = mock.Mock()
+        trainer.semantic_hook.wait_for_idle.side_effect = RuntimeError('foreground waited')
+        trainer.TDOM_Cam = object()
+        trainer.TDOM_alignment = {}
+        trainer.last_semantic_sync_result = object()
+        trainer._queued_progress_capture = ((1, "On_The_Fly"),
+            dict(requested=True, asynchronous=True, semantic_wait_seconds=0.0))
+        result = trainer._capture_training_progress_tdom("On_The_Fly")
+        self.assertTrue(result['asynchronous'])
+        trainer.semantic_hook.wait_for_idle.assert_not_called()
 
     def test_rgb_and_semantic_maps_encode_one_auditable_h264_video(self):
         with TemporaryDirectory() as directory:

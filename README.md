@@ -251,6 +251,23 @@ and the retained preflight report in `<run>/provenance/dataset_preflight.json`.
 This contract does not imply that the historical GUI entry point supports the
 same flags. The standalone render reader still has a source-write issue (R03).
 
+Semantic training now updates the semantic field progressively and reuses it
+for the final map by default (`approx_final`). `--semantic_final_rebuild`
+explicitly enables full final-geometry reprojection and two-pass fusion
+(`exact_final` for a complete authoritative input). The semantic field is not
+a loss term for RGB geometry training. `--semantic_tdom_final_only` controls map
+publication, independently of online fusion.
+
+Default map rasters are `rgb/tdom.png` and `semantic/semantic_color.png`;
+small manifests, class definitions and the render palette accompany them.
+Optional rasters can be selected with `--semantic_tdom_save_class_ids`,
+`--semantic_tdom_save_masks`, `--semantic_tdom_save_evidence`, and
+`--semantic_tdom_save_entropy`. `--semantic_tdom_save_diagnostics` enables the
+full auxiliary set, and `--semantic_tdom_save_probabilities` enables the
+probability cube. Class IDs always remain categorical. See
+[ADR 0012](docs/decisions/0012-minimal-map-products-and-online-finalization.md)
+for policy, validation and compatibility details.
+
 <details>
 <summary><span style="font-weight: bold;">Necessary command Line Arguments for tools/train_gui.py</span></summary>
 

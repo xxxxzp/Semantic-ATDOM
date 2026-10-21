@@ -13,6 +13,7 @@ from semantic_atdom.semantics.schema import (
     SemanticDataset,
     SemanticSchemaError,
     sha256_file,
+    generation_fingerprint,
 )
 
 
@@ -101,6 +102,8 @@ class FinalPreflightBindingTests(unittest.TestCase):
                     "image_id": "000001",
                     "label_version": "labels-v1",
                     "label_sha256": metadata["label_sha256"],
+                    "generation_sha256": generation_fingerprint(metadata),
+                    "score_sha256": metadata.get("score_sha256"),
                     "rgb_sha256": metadata["source_image_sha256"],
                     "source_binding": "verified",
                 }
@@ -169,6 +172,60 @@ class FinalPreflightBindingTests(unittest.TestCase):
                     snapshot_root=stage,
                     geometry_stage=1,
                 )
+
+    def test_binding_rejects_generation_and_optional_score_drift(self):
+        changes = {
+            "model": "different-model",
+            "checkpoint_sha256": "b" * 64,
+            "prompt_config": {"prompt": "changed"},
+            "thresholds": {"confidence": 0.9},
+            "score_sha256": "add-score-file",
+        }
+        for field, value in changes.items():
+            with self.subTest(field=field), TemporaryDirectory() as directory:
+                dataset, stage, report, cameras, _, _ = self._fixture(Path(directory))
+                path = dataset.semantic_root / "metadata" / "000001.json"
+                metadata = json.loads(path.read_text())
+                if field == "score_sha256":
+                    scores = dataset.semantic_root / "scores"
+                    scores.mkdir()
+                    np.save(scores / "000001.npy", np.full((2, 2, 2), .5, dtype=np.float32))
+                    value = sha256_file(scores / "000001.npy")
+                metadata[field] = value
+                path.write_text(json.dumps(metadata))
+                with self.assertRaisesRegex(SemanticSchemaError, "generation|score"):
+                    validate_final_preflight_binding(report_path=report,
+                        expected_report_sha256=sha256_file(report), semantic_dataset=dataset,
+                        image_ids=("000001",), camera_by_id=cameras, snapshot_root=stage, geometry_stage=1)
+
+    def test_binding_accepts_formatting_and_presentation_only_changes(self):
+        with TemporaryDirectory() as directory:
+            dataset, stage, report, cameras, _, _ = self._fixture(Path(directory))
+            metadata_path = dataset.semantic_root / "metadata" / "000001.json"
+            metadata = json.loads(metadata_path.read_text())
+            metadata_path.write_text(json.dumps(metadata, indent=4, sort_keys=True))
+            spec_path = dataset.semantic_root / "class_spec.json"
+            spec = json.loads(spec_path.read_text())
+            spec["classes"][0]["color"] = [17, 18, 19]
+            spec_path.write_text(json.dumps(spec, indent=2))
+            binding = validate_final_preflight_binding(
+                report_path=report, expected_report_sha256=sha256_file(report),
+                semantic_dataset=dataset, image_ids=("000001",), camera_by_id=cameras,
+                snapshot_root=stage, geometry_stage=1,
+            )
+            self.assertEqual(binding.ontology_sha256, dataset.class_spec.ontology_fingerprint)
+
+    def test_binding_reloads_disk_ontology_instead_of_trusting_cached_spec(self):
+        with TemporaryDirectory() as directory:
+            dataset, stage, report, cameras, _, _ = self._fixture(Path(directory))
+            path = dataset.semantic_root / "class_spec.json"
+            spec = json.loads(path.read_text())
+            spec["classes"][0]["name"] = "different-class"
+            path.write_text(json.dumps(spec))
+            with self.assertRaisesRegex(SemanticSchemaError, "ontology|specification"):
+                validate_final_preflight_binding(report_path=report,
+                    expected_report_sha256=sha256_file(report), semantic_dataset=dataset,
+                    image_ids=("000001",), camera_by_id=cameras, snapshot_root=stage, geometry_stage=1)
 
 
 if __name__ == "__main__":

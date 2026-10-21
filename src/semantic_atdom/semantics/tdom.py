@@ -15,6 +15,7 @@ from PIL import Image
 import torch
 
 from semantic_atdom.semantics.schema import SemanticClassSpec, sha256_file
+from semantic_atdom.semantics.geometry_trust import trusted_geometry_mask as _trusted_geometry_mask
 from semantic_atdom.semantics.provenance import SEMANTIC_METHOD_VERSION
 from semantic_atdom.semantics.reference import evidence_conditioned_belief
 
@@ -43,6 +44,10 @@ class SemanticTdomConfig:
     eps: float = 1e-8
     save_probabilities: bool = False
     save_diagnostics: bool = False
+    save_class_ids: bool = False
+    save_masks: bool = False
+    save_evidence: bool = False
+    save_entropy: bool = False
     quantize_diagnostics: bool = True
     render_tile_rows: int = 0
     finalize_tile_rows: int = 256
@@ -114,6 +119,17 @@ class SemanticTdomConfig:
             self.render_palette_source, str
         ):
             raise ValueError("render_palette_source must be a string or None")
+
+    def export_options(self):
+        """Diagnostics retains the complete legacy auxiliary product set."""
+        return {
+            "class_ids": self.save_class_ids or self.save_diagnostics,
+            "masks": self.save_masks or self.save_diagnostics,
+            "evidence": self.save_evidence or self.save_diagnostics,
+            "entropy": self.save_entropy or self.save_diagnostics,
+            "diagnostics": self.save_diagnostics,
+            "probabilities": self.save_probabilities,
+        }
 
     def to_dict(self):
         payload = asdict(self)
@@ -242,48 +258,6 @@ class SemanticTdomResult(NamedTuple):
 
 def _empty_uncertainty(reference: torch.Tensor) -> torch.Tensor:
     return torch.full_like(reference, float("nan"))
-
-
-def _trusted_geometry_mask(
-    scales: torch.Tensor, max_scale_ratio: float
-) -> Tuple[torch.Tensor, Dict[str, object]]:
-    """Exclude detached scale outliers from Semantic TDOM support.
-
-    Progressive geometry can contain a small number of extremely large
-    Gaussians whose dark SH appearance is nearly invisible in RGB while their
-    opacity spreads one semantic class across the map border.  This mask only
-    bounds the read-only semantic render; it never mutates geometry or feeds
-    back into training.
-    """
-    if scales.ndim != 2 or scales.shape[1] != 3:
-        raise ValueError("Gaussian scales must have shape [N, 3]")
-    maximum_scales = scales.detach().max(dim=1).values
-    if not bool(torch.isfinite(maximum_scales).all()):
-        raise ValueError("Gaussian scales must be finite")
-    median_scale = (
-        float(maximum_scales.median().item())
-        if maximum_scales.numel()
-        else 0.0
-    )
-    enabled = max_scale_ratio > 0 and maximum_scales.numel() > 0
-    scale_limit = median_scale * max_scale_ratio if enabled else None
-    trusted = torch.ones_like(maximum_scales, dtype=torch.bool)
-    if enabled:
-        trusted &= maximum_scales <= scale_limit
-    input_count = int(maximum_scales.numel())
-    trusted_count = int(trusted.sum().item())
-    return trusted, {
-        "method": "max_world_scale_over_scene_median",
-        "enabled": bool(enabled),
-        "max_gaussian_scale_ratio": float(max_scale_ratio),
-        "median_max_world_scale": median_scale,
-        "max_trusted_world_scale": (
-            None if scale_limit is None else float(scale_limit)
-        ),
-        "input_gaussian_count": input_count,
-        "trusted_gaussian_count": trusted_count,
-        "excluded_gaussian_count": input_count - trusted_count,
-    }
 
 
 @torch.no_grad()
@@ -430,8 +404,13 @@ def _semantic_render_features(
     """Build the K+5 per-Gaussian values consumed by the CUDA renderer."""
     alpha = semantic_state.alpha_robust if use_robust else semantic_state.alpha_raw
     alpha = alpha.detach().to(device=device, dtype=torch.float32)
+    open_evidence = (semantic_state.open_robust_evidence if use_robust
+                     else semantic_state.open_raw_evidence).detach().to(device=device, dtype=torch.float32)
+    closed_alpha = alpha - open_evidence
+
     if gaussian_mask is not None:
         alpha = alpha[gaussian_mask]
+        closed_alpha = closed_alpha[gaussian_mask]
     belief = evidence_conditioned_belief(
         alpha, prior_total=semantic_state.prior_total, eps=eps
     )
@@ -444,7 +423,7 @@ def _semantic_render_features(
     group_disagreement = semantic_state.group_variance.detach().to(
         device=device, dtype=torch.float32
     )
-    group_count = semantic_state.group_count.detach().to(device=device)
+    group_count = (semantic_state.group_count - semantic_state.open_group_count).detach().to(device=device)
     if gaussian_mask is not None:
         group_disagreement = group_disagreement[gaussian_mask]
         group_count = group_count[gaussian_mask]
@@ -452,7 +431,10 @@ def _semantic_render_features(
     group_eligible = group_count >= 2
     if not semantic_state.group_disagreement_available:
         group_eligible = torch.zeros_like(group_eligible)
-    group_support = evidence_ratio * group_eligible.to(dtype=torch.float32)
+    closed_evidence_ratio = evidence_conditioned_belief(
+        closed_alpha, prior_total=semantic_state.prior_total, eps=eps
+    ).evidence_ratio
+    group_support = closed_evidence_ratio * group_eligible.to(dtype=torch.float32)
     prior_regularized_mean = alpha / (concentration.unsqueeze(1) + eps)
     prior_regularized_variance_proxy = (
         (1.0 - prior_regularized_mean.square().sum(dim=1)).clamp_min(0.0)
@@ -1034,7 +1016,7 @@ def rasterize_semantic_tdom(
             group_disagreement, float("nan")
         )
     updated_metrics["group_disagreement_status"] = (
-        "exact_rebuild"
+        semantic_state.group_disagreement_source
         if semantic_state.group_disagreement_available
         else "unavailable"
     )
@@ -1142,9 +1124,11 @@ def write_semantic_tdom(
         files[path.name] = sha256_file(path)
 
     class_ids = result.class_ids.detach().cpu().contiguous().numpy()
-    id_path = staging / "semantic_id.png"
-    _save_image_atomic(id_path, class_ids, "PNG")
-    record(id_path)
+    exports = config.export_options()
+    if exports["class_ids"]:
+        id_path = staging / "semantic_id.png"
+        _save_image_atomic(id_path, class_ids, "PNG")
+        record(id_path)
 
     palette_payload = _render_palette_payload(class_spec, config)
     palette = np.asarray(
@@ -1159,18 +1143,18 @@ def write_semantic_tdom(
     record(color_path)
     del color, safe_ids
 
-    unknown = result.unknown_mask.detach().cpu().contiguous().numpy()
-    unknown_path = staging / "unknown_mask.png"
-    _save_image_atomic(unknown_path, unknown.astype(np.uint8) * 255, "PNG")
-    record(unknown_path)
-    del unknown
-
     reason = result.unknown_reason.detach().cpu().contiguous()
-    reason_path = staging / "unknown_reason.png"
-    _save_image_atomic(reason_path, reason.numpy(), "PNG")
-    record(reason_path)
+    if exports["masks"]:
+        unknown = result.unknown_mask.detach().cpu().contiguous().numpy()
+        unknown_path = staging / "unknown_mask.png"
+        _save_image_atomic(unknown_path, unknown.astype(np.uint8) * 255, "PNG")
+        record(unknown_path)
+        del unknown
+        reason_path = staging / "unknown_reason.png"
+        _save_image_atomic(reason_path, reason.numpy(), "PNG")
+        record(reason_path)
 
-    if result.class_provenance is not None:
+    if exports["masks"] and result.class_provenance is not None:
         provenance = result.class_provenance.detach().cpu().contiguous()
         if provenance.shape != result.class_ids.shape:
             raise ValueError("class provenance shape must match class ids")
@@ -1183,10 +1167,11 @@ def write_semantic_tdom(
         record(provenance_path)
 
     tiff_writer = None
-    diagnostic_tensors = {
-        "pixel_evidence_support.tif": result.absolute_support,
-        "semantic_entropy.tif": result.entropy,
-    }
+    diagnostic_tensors = {}
+    if exports["evidence"]:
+        diagnostic_tensors["pixel_evidence_support.tif"] = result.absolute_support
+    if exports["entropy"]:
+        diagnostic_tensors["semantic_entropy.tif"] = result.entropy
     if config.save_diagnostics:
         diagnostic_tensors.update(
             {
@@ -1277,7 +1262,8 @@ def write_semantic_tdom(
     )
     payload.update(
         {
-            "schema_version": 3,
+            "schema_version": 4,
+            "export_options": exports,
             "semantic_method_version": SEMANTIC_METHOD_VERSION,
             "width": int(result.class_ids.shape[1]),
             "height": int(result.class_ids.shape[0]),
@@ -1299,7 +1285,7 @@ def write_semantic_tdom(
             },
             "class_provenance": (
                 None
-                if result.class_provenance is None
+                if not exports["masks"] or result.class_provenance is None
                 else {
                     "file": "class_provenance.png",
                     "codes": {

@@ -110,8 +110,11 @@ def _estimated_pair_output_bytes(
     pixels = int(request.camera.image_width) * int(request.camera.image_height)
     config = request.semantic_config
     diagnostic_bytes = 2 if config.quantize_diagnostics else 4
-    # RGB, semantic id/color, unknown mask/reason and two mandatory rasters.
-    bytes_per_pixel = 3 + 1 + 3 + 1 + 1 + 2 * diagnostic_bytes
+    exports = config.export_options()
+    # Only RGB and semantic color are mandatory image products.
+    bytes_per_pixel = 3 + 3
+    bytes_per_pixel += int(exports["class_ids"]) + 2 * int(exports["masks"])
+    bytes_per_pixel += (int(exports["evidence"]) + int(exports["entropy"])) * diagnostic_bytes
     if config.save_diagnostics:
         bytes_per_pixel += 8 * diagnostic_bytes
     if config.save_probabilities:
@@ -119,6 +122,7 @@ def _estimated_pair_output_bytes(
     if (
         request.planar_fallback_config is not None
         and request.planar_fallback_config.enabled
+        and exports["masks"]
     ):
         bytes_per_pixel += 1
     return pixels * bytes_per_pixel + 1024**2
@@ -135,15 +139,17 @@ def _fit_publication_output_budget(
     candidate = request
     estimated = _estimated_pair_output_bytes(candidate, num_classes)
     config = candidate.semantic_config
-    if estimated > max_output_bytes and (
-        config.save_diagnostics or config.save_probabilities
-    ):
+    if estimated > max_output_bytes and any(config.export_options().values()):
         candidate = replace(
             candidate,
             semantic_config=replace(
                 config,
                 save_diagnostics=False,
                 save_probabilities=False,
+                save_class_ids=False,
+                save_masks=False,
+                save_evidence=False,
+                save_entropy=False,
             ),
             diagnostics_degraded=True,
         )
@@ -942,6 +948,7 @@ class ProgressiveSemanticHook:
         final_authoritative_complete: bool = False,
         preflight_report_path: Optional[Path] = None,
         preflight_report_sha256: Optional[str] = None,
+        final_rebuild: bool = True,
     ):
         self.dataset = dataset
         self.orchestrator = orchestrator
@@ -949,6 +956,9 @@ class ProgressiveSemanticHook:
         self.output_root = Path(output_root)
         self.publication_policy = publication_policy or MapPublicationPolicy()
         self.final_authoritative_complete = bool(final_authoritative_complete)
+        # Preserve the direct hook API's exact-rebuild contract. The trainer
+        # explicitly selects its default online finalization policy.
+        self.final_rebuild = bool(final_rebuild)
         if (preflight_report_path is None) != (preflight_report_sha256 is None):
             raise ValueError(
                 "preflight report path and SHA-256 must be supplied together"
@@ -976,6 +986,7 @@ class ProgressiveSemanticHook:
         final_authoritative_complete: bool = False,
         preflight_report_path: Optional[Path] = None,
         preflight_report_sha256: Optional[str] = None,
+        final_rebuild: bool = True,
     ) -> "ProgressiveSemanticHook":
         config = config or OnlineSemanticConfig()
         dataset = SemanticDataset(semantic_dataset_root or dataset_root)
@@ -1123,6 +1134,7 @@ class ProgressiveSemanticHook:
             final_authoritative_complete=final_authoritative_complete,
             preflight_report_path=preflight_report_path,
             preflight_report_sha256=preflight_report_sha256,
+            final_rebuild=final_rebuild,
         )
         status_path = output_root / "sync_status.json"
         if resume and status_path.is_file():
@@ -1345,7 +1357,8 @@ class ProgressiveSemanticHook:
                         # independently; one malformed file must not hide
                         # valid later views. Strict binding failures above
                         # still prevent any authoritative final rebuild.
-                        self.dataset.load_observation(image_id)
+                        if self.final_rebuild or image_id not in ledger_images:
+                            self.dataset.load_observation(image_id)
                     except (SemanticSchemaError, OSError, ValueError) as error:
                         final_missing.append(image_id)
                         errors.append("final invalid observation {}: {}".format(image_id, error))
@@ -1354,7 +1367,7 @@ class ProgressiveSemanticHook:
                 else:
                     final_missing.append(image_id)
             deferred = list(dict.fromkeys(deferred + final_missing))
-            if final_ready and not input_binding_error:
+            if self.final_rebuild and final_ready and not input_binding_error:
                 try:
                     rebuilt = FinalSemanticRebuilder(
                         self.dataset,
@@ -1447,7 +1460,7 @@ class ProgressiveSemanticHook:
                     )
                 except Exception as error:
                     errors.append("final exact rebuild: {}".format(error))
-            elif not input_binding_error:
+            elif self.final_rebuild and not input_binding_error:
                 errors.append("final exact rebuild has no valid observations")
 
         through_index = 0
@@ -1471,6 +1484,12 @@ class ProgressiveSemanticHook:
         )
         if exact_rebuilt:
             status = "exact_final" if exact_complete else "exact_partial"
+        elif final and not self.final_rebuild:
+            status = (
+                "approx_final"
+                if online_usable and not errors and not deferred and lag == 0
+                else "failed"
+            )
         elif final:
             status = (
                 "online_fallback"
@@ -1494,6 +1513,37 @@ class ProgressiveSemanticHook:
             status,
             historical_stale,
         )
+        if final and result.status in {"exact_final", "exact_partial", "approx_final"}:
+            try:
+                if not self.final_rebuild and self.final_input_binding is not None:
+                    validate_final_preflight_binding(
+                        report_path=self.preflight_report_path,
+                        expected_report_sha256=self.preflight_report_sha256,
+                        semantic_dataset=self.dataset,
+                        image_ids=all_ordered,
+                        camera_by_id=camera_by_id,
+                        snapshot_root=snapshot_root,
+                        geometry_stage=geometry_stage,
+                    )
+                if not self.final_rebuild:
+                    # A resumed run may retain metrics from a previous final
+                    # attempt; do not archive them as evidence for online reuse.
+                    (self.output_root / "final_rebuild_metrics.json").unlink(missing_ok=True)
+                self._save_json_atomic(self.output_root / "validated_schema.json",
+                                       self.dataset.class_spec.to_dict())
+                self._save_json_atomic(self.output_root / "final_semantic_metadata.json", {
+                    "schema_version": 1,
+                    "mode": "rebuild" if self.final_rebuild else "online",
+                    "status": result.status,
+                    "geometry_stage": geometry_stage,
+                    "class_spec_sha256": self.dataset.class_spec.fingerprint,
+                    "projection_geometry_hash": semantic_projection_sha256(_projection_attributes(gaussians)),
+                    "historical_evidence_stale": historical_stale,
+                    "input_binding": None if self.final_input_binding is None else self.final_input_binding.to_dict(),
+                })
+            except Exception as error:
+                errors.append("final semantic metadata: {}".format(error))
+                result = result._replace(errors=tuple(errors), status="failed")
         checkpoint = None
         if self.orchestrator.state.is_valid and self.checkpoint_required(
             geometry_stage,
@@ -2416,7 +2466,7 @@ class AsyncProgressiveSemanticHook:
             self._last_result is not None
             and self._last_result.geometry_stage == int(geometry_stage)
             and self._last_result.status
-            in {"exact_final", "exact_partial", "online_fallback"}
+            in {"exact_final", "exact_partial", "approx_final", "online_fallback"}
         ):
             status = self._last_result.status
         elif historical_stale or errors or lag > 1:

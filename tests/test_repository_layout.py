@@ -125,6 +125,7 @@ class RepositoryLayoutTests(unittest.TestCase):
                 "0009-published-renders-and-map-training-video.md",
                 "0010-bounded-planar-semantic-fallback.md",
                 "0011-ordered-progress-capture-and-label-reuse.md",
+                "0012-minimal-map-products-and-online-finalization.md",
             },
             {path.name for path in decisions.glob("*.md")},
         )

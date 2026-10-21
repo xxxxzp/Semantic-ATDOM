@@ -372,7 +372,7 @@ class SemanticTdomTests(unittest.TestCase):
             for name in expected:
                 self.assertEqual(payload["files"][name], sha256_file(root / name))
             self.assertEqual(payload["geometry_stage"], 31)
-            self.assertEqual(payload["schema_version"], 3)
+            self.assertEqual(payload["schema_version"], 4)
             self.assertEqual(
                 payload["semantic_method_version"], "g1-evidence-v2"
             )
@@ -449,7 +449,7 @@ class SemanticTdomTests(unittest.TestCase):
             self.assertFalse(root.with_name(root.name + ".publishing").exists())
             self.assertFalse(root.with_name(root.name + ".previous").exists())
 
-    def test_writer_defaults_to_core_product_without_full_diagnostics(self):
+    def test_writer_defaults_to_color_and_metadata_without_auxiliary_rasters(self):
         config = SemanticTdomConfig()
         result = finalize_semantic_tdom(
             torch.tensor([[[0.8]], [[0.1]], [[0.9]]]),
@@ -463,10 +463,37 @@ class SemanticTdomTests(unittest.TestCase):
                 result, root, CLASS_SPEC, {}, config
             )
             payload = json.loads(manifest_path.read_text(encoding="utf-8"))
-            self.assertEqual(
-                set(payload["raster_encodings"]),
-                {"pixel_evidence_support.tif", "semantic_entropy.tif"},
-            )
+            self.assertEqual(set(payload["files"]), {
+                "semantic_color.png", "class_spec.json", "render_palette.json",
+            })
+            self.assertEqual(payload["raster_encodings"], {})
+            self.assertIsNone(payload["tiff_writer"])
+
+    def test_writer_exports_only_explicitly_selected_auxiliary_rasters(self):
+        selections = {
+            "save_class_ids": {"semantic_id.png"},
+            "save_masks": {"unknown_mask.png", "unknown_reason.png", "class_provenance.png"},
+            "save_evidence": {"pixel_evidence_support.tif"},
+            "save_entropy": {"semantic_entropy.tif"},
+        }
+        for option, expected in selections.items():
+            with self.subTest(option=option), TemporaryDirectory() as directory:
+                config = SemanticTdomConfig(**{option: True})
+                result = finalize_semantic_tdom(
+                    torch.tensor([[[0.8]], [[0.1]], [[0.9]]]),
+                    torch.tensor([[0.95]]), CLASS_SPEC, config,
+                )._replace(class_provenance=torch.tensor([[2]], dtype=torch.uint8))
+                root = Path(directory)
+                payload = json.loads(write_semantic_tdom(
+                    result, root, CLASS_SPEC, {}, config,
+                ).read_text())
+                self.assertEqual(set(payload["files"]), expected | {
+                    "semantic_color.png", "class_spec.json", "render_palette.json",
+                })
+                for name, digest in payload["files"].items():
+                    self.assertEqual(digest, sha256_file(root / name))
+                if option != "save_masks":
+                    self.assertIsNone(payload["class_provenance"])
 
     def test_channel_count_must_match_class_spec(self):
         with self.assertRaisesRegex(ValueError, "num_classes"):

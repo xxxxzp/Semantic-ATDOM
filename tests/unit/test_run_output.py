@@ -454,6 +454,27 @@ class RunOutputTests(unittest.TestCase):
                 status,
             )
 
+    def test_online_finalization_accepts_stale_history_but_requires_complete_inputs(self):
+        with TemporaryDirectory() as directory:
+            layout = RunLayout.from_root(Path(directory) / "run")
+            layout.semantic_work.mkdir(parents=True)
+            status = {"status": "approx_final", "geometry_stage": 20,
+                "lag_batches": 0, "errors": [], "deferred_image_ids": [],
+                "historical_evidence_stale": True}
+            path = layout.semantic_work / "sync_status.json"
+            path.write_text(json.dumps(status))
+            self.assertEqual(validate_final_semantic_outputs(
+                layout, final_stage=20, require_map=False, require_exact=False), status)
+            with self.assertRaisesRegex(RuntimeError, "not authoritative"):
+                validate_final_semantic_outputs(layout, final_stage=20, require_map=False)
+            for field, value in [("lag_batches", 1), ("errors", ["broken input"]),
+                                 ("deferred_image_ids", ["000020"])]:
+                with self.subTest(field=field):
+                    path.write_text(json.dumps(dict(status, **{field: value})))
+                    with self.assertRaises(RuntimeError):
+                        validate_final_semantic_outputs(layout, final_stage=20,
+                            require_map=False, require_exact=False)
+
 
 if __name__ == "__main__":
     unittest.main()

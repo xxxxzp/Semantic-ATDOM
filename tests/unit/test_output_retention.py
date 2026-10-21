@@ -21,13 +21,14 @@ class OutputRetentionTests(unittest.TestCase):
         self.assertEqual(args.semantic_checkpoint_interval, 0)
         self.assertTrue(args.semantic_tdom_final_only)
 
-    def test_final_only_rgb_outputs_defer_semantics_until_final_boundary(self):
+    def test_explicit_final_rebuild_defers_semantics_without_online_products(self):
         parser = ArgumentParser()
         OptimizationParams(parser)
         args = parser.parse_args([])
         args.enable_semantics = True
         args.render_training_progress = False
 
+        args.semantic_final_rebuild = True
         self.assertFalse(semantic_online_required(args))
 
         args.render_training_progress = True

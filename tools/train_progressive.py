@@ -371,6 +371,11 @@ def GetArgs():
         raise ValueError(
             "--render_training_progress requires --enable_semantics"
         )
+    if (args.enable_semantics and args.semantic_tdom_planar_fallback_class.strip()
+            and not args.semantic_final_rebuild):
+        raise ValueError(
+            "--semantic_tdom_planar_fallback_class requires --semantic_final_rebuild"
+        )
     if args.render_training_progress and not args.render_TDOM:
         raise ValueError(
             "--render_training_progress requires --render_TDOM"
@@ -446,7 +451,8 @@ def semantic_online_required(args):
     return bool(
         args.enable_semantics
         and (
-            not args.semantic_tdom_final_only
+            not getattr(args, "semantic_final_rebuild", False)
+            or not args.semantic_tdom_final_only
             or args.semantic_checkpoint_interval > 0
             or args.render_training_progress
         )
@@ -1533,6 +1539,10 @@ class GaussianTrainer(mp.Process):
                 save_probabilities=(
                     self.args.semantic_tdom_save_probabilities
                 ),
+                save_class_ids=self.args.semantic_tdom_save_class_ids,
+                save_masks=self.args.semantic_tdom_save_masks,
+                save_evidence=self.args.semantic_tdom_save_evidence,
+                save_entropy=self.args.semantic_tdom_save_entropy,
                 max_output_bytes=self.args.semantic_tdom_max_output_bytes,
                 min_free_cuda_bytes=(
                     self.args.semantic_tdom_min_free_cuda_bytes
@@ -1585,6 +1595,7 @@ class GaussianTrainer(mp.Process):
                 semantic_dataset_root=semantic_dataset_root,
                 publication_policy=self.semantic_publication_policy,
                 resume=not force_fresh,
+                final_rebuild=self.args.semantic_final_rebuild,
                 final_authoritative_complete=(
                     self.args.semantic_authoritative_exact_complete
                 ),
@@ -3671,6 +3682,7 @@ class On_the_Fly_GS:
                 ),
                 "semantic_checkpoint_interval": args.semantic_checkpoint_interval,
                 "semantic_online": semantic_online_required(args),
+                "semantic_final_rebuild": bool(args.semantic_final_rebuild),
                 "skip_final_evaluation": bool(args.skip_final_evaluation),
             },
         )
@@ -3885,12 +3897,13 @@ class On_the_Fly_GS:
                 self.layout,
                 final_stage=final_stage,
                 require_map=bool(self.GaussianTrainer.args.render_TDOM),
+                require_exact=bool(self.GaussianTrainer.args.semantic_final_rebuild),
             )
             records["semantic_model"] = archive_semantic_state(self.layout)
             schema_source = self.layout.semantic_work / "validated_schema.json"
             if not schema_source.is_file():
                 raise RuntimeError("validated final semantic schema is missing")
-            with (self.layout.semantic_work / "final_rebuild_metrics.json").open() as stream:
+            with (self.layout.semantic_work / "final_semantic_metadata.json").open() as stream:
                 final_semantic_metadata = json.load(stream)
             if (SemanticClassSpec.load(schema_source).fingerprint
                     != final_semantic_metadata.get("class_spec_sha256")):
@@ -3929,6 +3942,7 @@ class On_the_Fly_GS:
             "semantic_rebuild": (
                 self.layout.semantic_model / "final_rebuild_metrics.json"
             ),
+            "semantic_finalization": self.layout.semantic_model / "final_semantic_metadata.json",
         }
         for key, path in sources.items():
             if path.is_file():

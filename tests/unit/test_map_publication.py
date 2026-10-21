@@ -266,7 +266,10 @@ class PairPublisherTests(unittest.TestCase):
                 pair["product_files"]["rgb/tdom.png"],
                 sha256_file(output / "rgb" / "tdom.png"),
             )
-            self.assertIn("semantic/semantic_id.png", pair["product_files"])
+            self.assertEqual(
+                {name for name in pair["product_files"] if name.endswith((".png", ".tif", ".npy"))},
+                {"rgb/tdom.png", "semantic/semantic_color.png"},
+            )
             self.assertEqual(latest["pair_manifest_sha256"], sha256_file(manifest_path))
             self.assertFalse(Path(str(output) + ".publishing").exists())
 

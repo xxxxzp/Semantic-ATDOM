@@ -44,6 +44,10 @@ class SemanticTdomConfig:
     eps: float = 1e-8
     save_probabilities: bool = False
     save_diagnostics: bool = False
+    save_class_ids: bool = False
+    save_masks: bool = False
+    save_evidence: bool = False
+    save_entropy: bool = False
     quantize_diagnostics: bool = True
     render_tile_rows: int = 0
     finalize_tile_rows: int = 256
@@ -115,6 +119,17 @@ class SemanticTdomConfig:
             self.render_palette_source, str
         ):
             raise ValueError("render_palette_source must be a string or None")
+
+    def export_options(self):
+        """Diagnostics retains the complete legacy auxiliary product set."""
+        return {
+            "class_ids": self.save_class_ids or self.save_diagnostics,
+            "masks": self.save_masks or self.save_diagnostics,
+            "evidence": self.save_evidence or self.save_diagnostics,
+            "entropy": self.save_entropy or self.save_diagnostics,
+            "diagnostics": self.save_diagnostics,
+            "probabilities": self.save_probabilities,
+        }
 
     def to_dict(self):
         payload = asdict(self)
@@ -1109,9 +1124,11 @@ def write_semantic_tdom(
         files[path.name] = sha256_file(path)
 
     class_ids = result.class_ids.detach().cpu().contiguous().numpy()
-    id_path = staging / "semantic_id.png"
-    _save_image_atomic(id_path, class_ids, "PNG")
-    record(id_path)
+    exports = config.export_options()
+    if exports["class_ids"]:
+        id_path = staging / "semantic_id.png"
+        _save_image_atomic(id_path, class_ids, "PNG")
+        record(id_path)
 
     palette_payload = _render_palette_payload(class_spec, config)
     palette = np.asarray(
@@ -1126,18 +1143,18 @@ def write_semantic_tdom(
     record(color_path)
     del color, safe_ids
 
-    unknown = result.unknown_mask.detach().cpu().contiguous().numpy()
-    unknown_path = staging / "unknown_mask.png"
-    _save_image_atomic(unknown_path, unknown.astype(np.uint8) * 255, "PNG")
-    record(unknown_path)
-    del unknown
-
     reason = result.unknown_reason.detach().cpu().contiguous()
-    reason_path = staging / "unknown_reason.png"
-    _save_image_atomic(reason_path, reason.numpy(), "PNG")
-    record(reason_path)
+    if exports["masks"]:
+        unknown = result.unknown_mask.detach().cpu().contiguous().numpy()
+        unknown_path = staging / "unknown_mask.png"
+        _save_image_atomic(unknown_path, unknown.astype(np.uint8) * 255, "PNG")
+        record(unknown_path)
+        del unknown
+        reason_path = staging / "unknown_reason.png"
+        _save_image_atomic(reason_path, reason.numpy(), "PNG")
+        record(reason_path)
 
-    if result.class_provenance is not None:
+    if exports["masks"] and result.class_provenance is not None:
         provenance = result.class_provenance.detach().cpu().contiguous()
         if provenance.shape != result.class_ids.shape:
             raise ValueError("class provenance shape must match class ids")
@@ -1150,10 +1167,11 @@ def write_semantic_tdom(
         record(provenance_path)
 
     tiff_writer = None
-    diagnostic_tensors = {
-        "pixel_evidence_support.tif": result.absolute_support,
-        "semantic_entropy.tif": result.entropy,
-    }
+    diagnostic_tensors = {}
+    if exports["evidence"]:
+        diagnostic_tensors["pixel_evidence_support.tif"] = result.absolute_support
+    if exports["entropy"]:
+        diagnostic_tensors["semantic_entropy.tif"] = result.entropy
     if config.save_diagnostics:
         diagnostic_tensors.update(
             {
@@ -1244,7 +1262,8 @@ def write_semantic_tdom(
     )
     payload.update(
         {
-            "schema_version": 3,
+            "schema_version": 4,
+            "export_options": exports,
             "semantic_method_version": SEMANTIC_METHOD_VERSION,
             "width": int(result.class_ids.shape[1]),
             "height": int(result.class_ids.shape[0]),
@@ -1266,7 +1285,7 @@ def write_semantic_tdom(
             },
             "class_provenance": (
                 None
-                if result.class_provenance is None
+                if not exports["masks"] or result.class_provenance is None
                 else {
                     "file": "class_provenance.png",
                     "codes": {

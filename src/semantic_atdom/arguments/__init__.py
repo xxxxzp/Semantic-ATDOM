@@ -186,7 +186,12 @@ class OptimizationParams(ParamGroup):
         self.semantic_tdom_finalize_tile_rows = 256
         self.semantic_tdom_save_diagnostics = False
         self.semantic_tdom_save_probabilities = False
+        self.semantic_tdom_save_class_ids = False
+        self.semantic_tdom_save_masks = False
+        self.semantic_tdom_save_evidence = False
+        self.semantic_tdom_save_entropy = False
         self.semantic_tdom_final_only = True
+        self.semantic_final_rebuild = False
         self.semantic_tdom_max_output_bytes = 8 * 1024**3
         self.semantic_tdom_min_free_cuda_bytes = 512 * 1024**2
         self.semantic_tdom_max_gaussian_scale_ratio = 14.0

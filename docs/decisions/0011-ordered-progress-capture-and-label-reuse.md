@@ -2,6 +2,7 @@
 status: accepted
 date: 2026-10-21
 amends: 0009 training-progress execution and 0006 resource bounds
+amended_by: 0012 optional final rebuild and minimal map exports
 ---
 
 # Queue frozen video boundaries and reuse prepared label rasters

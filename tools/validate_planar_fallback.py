@@ -223,6 +223,13 @@ def main() -> int:
         ),
         map_location="cpu",
     )
+    if not (run_root / "model/semantic/final_rebuild_metrics.json").is_file():
+        raise ValueError("planar validation requires a run with --semantic_final_rebuild")
+    if not all((release / "semantic" / name).is_file()
+               for name in ("semantic_id.png", "unknown_reason.png")):
+        raise ValueError(
+            "planar validation requires --semantic_tdom_save_class_ids and --semantic_tdom_save_masks"
+        )
     groups = _read_json(
         run_root / "model" / "semantic" / "final_rebuild_metrics.json"
     )["groups"]
